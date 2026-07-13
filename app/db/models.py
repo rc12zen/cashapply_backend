@@ -312,6 +312,32 @@ class RowStatusHistory(Base):
 
 # ── App1: Rule definitions ────────────────────────────────────────────────────
 
+class AiUsageLog(Base):
+    """
+    One row per Claude API call made during Layer 2B AI extraction (see
+    extraction/layer_2b_ai.py). Model + per-token cost are read from
+    Settings at call time (CLAUDE_MODEL / AI_COST_PER_INPUT_TOKEN /
+    AI_COST_PER_OUTPUT_TOKEN — all overridable via .env), and the actual
+    rate used is stored alongside the token counts on each row so historical
+    cost figures stay accurate even if pricing is changed later.
+    """
+    __tablename__ = "ai_usage_logs"
+
+    id             = Column(BigInteger, primary_key=True, autoincrement=True)
+    run_id         = Column(Integer, ForeignKey("analysis_runs.run_id"), index=True, nullable=True)
+    call_type      = Column(String(20), nullable=False)   # "batch" | "single" (see layer_2b_ai.py)
+    batch_ref      = Column(String(50), nullable=True)     # e.g. OU/chunk ref, for debugging
+    model          = Column(String(100), nullable=False)   # Settings.CLAUDE_MODEL at call time
+    input_tokens   = Column(Integer, nullable=False, default=0)
+    output_tokens  = Column(Integer, nullable=False, default=0)
+    cost_per_input_token  = Column(Float, nullable=False)  # rate actually applied, not just current setting
+    cost_per_output_token = Column(Float, nullable=False)
+    cost_usd       = Column(Float, nullable=False, default=0.0)
+    latency_ms     = Column(Integer, nullable=True)
+    succeeded      = Column(Boolean, nullable=False, default=True)
+    created_at     = Column(DateTime, default=dt.datetime.utcnow, index=True)
+
+
 class RuleDefinition(Base):
     __tablename__ = "rule_definitions"
 

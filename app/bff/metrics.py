@@ -107,7 +107,7 @@ def _category_for_row(r: LineItem) -> str:
 
 def _base_query(db: Session, run_id: int | None, date_from: str | None, date_to: str | None,
                  bank_name: str | None = None, business_unit: str | None = None,
-                 approved_by: str | None = None):
+                 run_by: str | None = None):
     q = db.query(LineItem)
     if run_id:
         q = q.filter(LineItem.run_id == run_id)
@@ -137,30 +137,34 @@ def _base_query(db: Session, run_id: int | None, date_from: str | None, date_to:
         q = q.filter(LineItem.bank_name == bank_name)
     if business_unit:
         q = q.filter(LineItem.business_unit == business_unit)
-    if approved_by:
-        # RowStatusHistory.triggered_by is the acting user's email, recorded
-        # on every spoc_approve / spoc_reject transition (see hitl/service.py
-        # and bff/hitl_routes.py). There's no approved_by column on LineItem
-        # itself, so this scopes to line items with a matching history row.
-        matching_ids = (
-            db.query(RowStatusHistory.line_item_id)
-            .filter(RowStatusHistory.triggered_by == approved_by)
+    if run_by:
+        # PATCH: was RowStatusHistory.triggered_by ("approved_by") — that
+        # only exists once a human has actually clicked Approve/Reject on
+        # at least one row, so the User dropdown stayed empty for every
+        # run until someone did HITL work on it. AnalysisRun.triggered_by
+        # (the run STARTER's email — set at /api/run/start, see
+        # bff/run_routes.py) is known the instant a run exists, no waiting
+        # required. Matches the same field Analysis History's "Started By"
+        # filter already uses (bff/run_routes.py's get_run_history).
+        matching_run_ids = (
+            db.query(AnalysisRun.run_id)
+            .filter(AnalysisRun.triggered_by == run_by)
             .subquery()
         )
-        q = q.filter(LineItem.id.in_(matching_ids))
+        q = q.filter(LineItem.run_id.in_(matching_run_ids))
     return q
 
 
 def compute_metrics(db: Session, run_id: int | None = None, date_from: str | None = None,
                      date_to: str | None = None, bank_name: str | None = None,
-                     business_unit: str | None = None, approved_by: str | None = None) -> dict:
+                     business_unit: str | None = None, run_by: str | None = None) -> dict:
     """
     Dashboard-wide KPIs. Legacy field names are KEPT here for backward
     compatibility with any existing consumer of this endpoint. New grouped
     counts are added under `groups` for callers that want the merged,
     unambiguous buckets instead.
     """
-    q = _base_query(db, run_id, date_from, date_to, bank_name, business_unit, approved_by)
+    q = _base_query(db, run_id, date_from, date_to, bank_name, business_unit, run_by)
     rows = q.all()
 
     def count(pred):

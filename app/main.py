@@ -19,7 +19,7 @@ from .audit.middleware import ActivityLogMiddleware
 from .bff import (
     run_routes, results_routes, hitl_routes, config_routes, filters_routes,
     executive_summary, config_builder_routes, auth_routes, admin_routes,
-    activity_log_routes,
+    activity_log_routes, ai_usage_routes,
 )
 
 app = FastAPI(title="CashApply Backend", version="1.1.0")
@@ -91,3 +91,4 @@ app.include_router(executive_summary.router, prefix="/api/executive-summary", ta
 app.include_router(auth_routes.router,         prefix="/api/auth",          tags=["auth"])
 app.include_router(admin_routes.router,        prefix="/api/admin",         tags=["admin"])
 app.include_router(activity_log_routes.router, prefix="/api/activity-log",  tags=["activity-log"])
+app.include_router(ai_usage_routes.router,     prefix="/api/ai-usage",      tags=["ai-usage"])

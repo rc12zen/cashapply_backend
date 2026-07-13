@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -313,6 +314,7 @@ def _call_claude_batch(
         dbg_block(run_id, "2B", batch_ref, "BATCH PROMPT SENT",
                    [_SYSTEM_PROMPT_BATCH, "---", user_msg])
 
+        _t0 = time.monotonic()
         response = client.messages.create(
             model=s.CLAUDE_MODEL,
             max_tokens=max_tokens,
@@ -320,6 +322,16 @@ def _call_claude_batch(
             system=_SYSTEM_PROMPT_BATCH,
             messages=[{"role": "user", "content": user_msg}],
         )
+        _latency_ms = int((time.monotonic() - _t0) * 1000)
+
+        from ..ai_usage.tracker import record_usage
+        record_usage(
+            run_id=run_id, call_type="batch", batch_ref=batch_ref,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            latency_ms=_latency_ms, succeeded=True, model=s.CLAUDE_MODEL,
+        )
+
         raw = response.content[0].text.strip()
         dbg_block(run_id, "2B", batch_ref, "BATCH RAW RESPONSE", [raw])
 
@@ -341,6 +353,16 @@ def _call_claude_batch(
     except Exception as exc:
         dbg(run_id, "2B", batch_ref, f"BATCH AI call FAILED: {exc}")
         logger.warning("Layer 2B batch AI call failed: %s", exc)
+        try:
+            from ..ai_usage.tracker import record_usage
+            from ..db.settings import get_settings
+            record_usage(
+                run_id=run_id, call_type="batch", batch_ref=batch_ref,
+                input_tokens=0, output_tokens=0, succeeded=False,
+                model=get_settings().CLAUDE_MODEL,
+            )
+        except Exception:
+            pass
         return None, raw
 
 
@@ -381,6 +403,7 @@ def _call_claude_single(
         dbg_block(run_id, "2B", row_ref, "FALLBACK SINGLE-ROW PROMPT SENT",
                    [_SYSTEM_PROMPT_SINGLE, "---", user_msg])
 
+        _t0 = time.monotonic()
         response = client.messages.create(
             model=s.CLAUDE_MODEL,
             max_tokens=400,
@@ -388,6 +411,16 @@ def _call_claude_single(
             system=_SYSTEM_PROMPT_SINGLE,
             messages=[{"role": "user", "content": user_msg}],
         )
+        _latency_ms = int((time.monotonic() - _t0) * 1000)
+
+        from ..ai_usage.tracker import record_usage
+        record_usage(
+            run_id=run_id, call_type="single", batch_ref=row_ref,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            latency_ms=_latency_ms, succeeded=True, model=s.CLAUDE_MODEL,
+        )
+
         raw = response.content[0].text.strip()
         dbg_block(run_id, "2B", row_ref, "FALLBACK RAW RESPONSE", [raw])
 
@@ -403,6 +436,16 @@ def _call_claude_single(
     except Exception as exc:
         dbg(run_id, "2B", row_ref, f"FALLBACK AI call FAILED: {exc}")
         logger.warning("Layer 2B fallback AI call failed: %s", exc)
+        try:
+            from ..ai_usage.tracker import record_usage
+            from ..db.settings import get_settings
+            record_usage(
+                run_id=run_id, call_type="single", batch_ref=row_ref,
+                input_tokens=0, output_tokens=0, succeeded=False,
+                model=get_settings().CLAUDE_MODEL,
+            )
+        except Exception:
+            pass
         return {}, raw
 
 

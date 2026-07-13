@@ -15,11 +15,11 @@ router = APIRouter()
 @router.get("/metrics")
 def get_metrics(run_id: int | None = None, date_from: str | None = None,
                  date_to: str | None = None, bank_name: str | None = None,
-                 business_unit: str | None = None, approved_by: str | None = None,
+                 business_unit: str | None = None, run_by: str | None = None,
                  db: Session = Depends(get_db)):
     return compute_metrics(db, run_id=run_id, date_from=date_from, date_to=date_to,
                             bank_name=bank_name, business_unit=business_unit,
-                            approved_by=approved_by)
+                            run_by=run_by)
 
 
 @router.get("/run-summary/{run_id}")

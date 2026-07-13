@@ -45,7 +45,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from ..db.models import LineItem, RowStatusHistory, User
+from ..db.models import AnalysisRun, LineItem
 from ..deps import get_db
 from .metrics import (
     GROUP_CONFLICT_EXCEPTION, GROUP_NEEDS_REMITTANCE, GROUP_POST_FAILED,
@@ -55,22 +55,24 @@ from .metrics import (
 router = APIRouter()
 
 
-def _apply_approved_by(q, approved_by: Optional[str]):
+def _apply_run_by(q, run_by: Optional[str]):
     """
     Shared by both _base_query (posted) and _non_posted_base_query.
-    Same approach as bff/metrics.py's compute_metrics: RowStatusHistory.
-    triggered_by is the acting user's email, recorded on every
-    spoc_approve/spoc_reject transition — there's no approved_by column on
-    LineItem itself.
+    PATCH: was RowStatusHistory.triggered_by ("approved_by") — that only
+    exists once a human has actually approved/rejected a row, so this
+    stayed unusable for any run nobody had done HITL work on yet. Uses
+    AnalysisRun.triggered_by instead (who STARTED the run — known
+    immediately, same field bff/metrics.py and Analysis History's
+    "Started By" filter now use).
     """
-    if not approved_by:
+    if not run_by:
         return q
-    matching_ids = (
-        q.session.query(RowStatusHistory.line_item_id)
-        .filter(RowStatusHistory.triggered_by == approved_by)
+    matching_run_ids = (
+        q.session.query(AnalysisRun.run_id)
+        .filter(AnalysisRun.triggered_by == run_by)
         .subquery()
     )
-    return q.filter(LineItem.id.in_(matching_ids))
+    return q.filter(LineItem.run_id.in_(matching_run_ids))
 
 
 # ── POSTED — the only 3 real audit categories ────────────────────────────────
@@ -105,7 +107,7 @@ def _base_query(
     date_from: Optional[str],
     date_to: Optional[str],
     run_id: Optional[int],
-    approved_by: Optional[str] = None,
+    run_by: Optional[str] = None,
 ):
     q = db.query(LineItem).filter(LineItem.oracle_post_status == "success")
     if run_id:
@@ -120,7 +122,7 @@ def _base_query(
         q = q.filter(LineItem.oracle_posted_at >= date_from)
     if date_to:
         q = q.filter(LineItem.oracle_posted_at <= date_to)
-    q = _apply_approved_by(q, approved_by)
+    q = _apply_run_by(q, run_by)
     return q
 
 
@@ -174,20 +176,17 @@ def get_executive_filters(mode: str = "posted", db: Session = Depends(get_db)):
     bus = sorted({v for (v,) in q.with_entities(LineItem.business_unit).distinct() if v})
     pills = POSTED_PILL_DEFINITIONS if mode == "posted" else NON_POSTED_PILL_DEFINITIONS
 
-    # Same approach as bff/filters_routes.py's get_filter_options — join
-    # against the real users table so only genuine registered people show
-    # up (RowStatusHistory is also written by the rule engine's own
-    # automatic categorization with triggered_by="system", which is not a
-    # real user).
+    # "users" — sourced from AnalysisRun.triggered_by (who STARTED the run
+    # that produced these line items), not RowStatusHistory (who
+    # approved/rejected a row) — known immediately for every run, no
+    # waiting on HITL activity. Same field bff/filters_routes.py and
+    # Analysis History's "Started By" filter use.
+    run_ids_subq = q.with_entities(LineItem.run_id).distinct().subquery()
     uq = (
-        db.query(RowStatusHistory.triggered_by)
-        .join(User, User.email == RowStatusHistory.triggered_by)
-        .join(LineItem, LineItem.id == RowStatusHistory.line_item_id)
+        db.query(AnalysisRun.triggered_by)
+        .filter(AnalysisRun.run_id.in_(db.query(run_ids_subq.c.run_id)))
+        .filter(AnalysisRun.triggered_by.isnot(None))
     )
-    if mode == "posted":
-        uq = uq.filter(LineItem.oracle_post_status == "success")
-    else:
-        uq = uq.filter(or_(LineItem.oracle_post_status.is_(None), LineItem.oracle_post_status != "success"))
     users = sorted({u for (u,) in uq.distinct() if u})
 
     return {"banks": banks, "business_units": bus, "pills": pills, "users": users}
@@ -201,10 +200,10 @@ def get_executive_summary(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     run_id: Optional[int] = None,
-    approved_by: Optional[str] = None,
+    run_by: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
-    rows = _base_query(db, bank_name, business_unit, ou_number, date_from, date_to, run_id, approved_by).all()
+    rows = _base_query(db, bank_name, business_unit, ou_number, date_from, date_to, run_id, run_by).all()
 
     pill_counts = {p["key"]: 0 for p in POSTED_PILL_DEFINITIONS}
     total_amount = 0.0
@@ -255,12 +254,12 @@ def get_executive_records(
     date_to: Optional[str] = None,
     run_id: Optional[int] = None,
     category: Optional[str] = None,
-    approved_by: Optional[str] = None,
+    run_by: Optional[str] = None,
     page: int = 1,
     page_size: int = 50,
     db: Session = Depends(get_db),
 ):
-    q = _base_query(db, bank_name, business_unit, ou_number, date_from, date_to, run_id, approved_by)
+    q = _base_query(db, bank_name, business_unit, ou_number, date_from, date_to, run_id, run_by)
     q = q.order_by(LineItem.oracle_posted_at.desc())
     rows = q.all()
 
@@ -288,13 +287,13 @@ def export_executive_csv(
     date_to: Optional[str] = None,
     run_id: Optional[int] = None,
     category: Optional[str] = None,
-    approved_by: Optional[str] = None,
+    run_by: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
     """Streams a CSV of every posted record matching the current filters —
     same filter contract as /records, so what the user sees on screen is
     exactly what they download."""
-    q = _base_query(db, bank_name, business_unit, ou_number, date_from, date_to, run_id, approved_by)
+    q = _base_query(db, bank_name, business_unit, ou_number, date_from, date_to, run_id, run_by)
     q = q.order_by(LineItem.oracle_posted_at.desc())
     rows = q.all()
 
@@ -352,7 +351,7 @@ def _non_posted_base_query(
     date_from: Optional[str],
     date_to: Optional[str],
     run_id: Optional[int],
-    approved_by: Optional[str] = None,
+    run_by: Optional[str] = None,
 ):
     # NOTE: oracle_post_status is NULL for every row that hasn't gone through
     # Oracle posting yet (the vast majority of "non-posted" rows). Plain
@@ -380,7 +379,7 @@ def _non_posted_base_query(
     if date_to:
         end_of_day = dt.datetime.strptime(date_to, "%Y-%m-%d") + dt.timedelta(days=1) - dt.timedelta(microseconds=1)
         q = q.filter(LineItem.created_at <= end_of_day)
-    q = _apply_approved_by(q, approved_by)
+    q = _apply_run_by(q, run_by)
     return q
 
 
@@ -415,10 +414,10 @@ def get_non_posted_summary(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     run_id: Optional[int] = None,
-    approved_by: Optional[str] = None,
+    run_by: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
-    rows = _non_posted_base_query(db, bank_name, business_unit, ou_number, date_from, date_to, run_id, approved_by).all()
+    rows = _non_posted_base_query(db, bank_name, business_unit, ou_number, date_from, date_to, run_id, run_by).all()
 
     pill_counts = {g: 0 for g in NON_POSTED_GROUPS}
 
@@ -445,12 +444,12 @@ def get_non_posted_records(
     date_to: Optional[str] = None,
     run_id: Optional[int] = None,
     category: Optional[str] = None,
-    approved_by: Optional[str] = None,
+    run_by: Optional[str] = None,
     page: int = 1,
     page_size: int = 50,
     db: Session = Depends(get_db),
 ):
-    rows = _non_posted_base_query(db, bank_name, business_unit, ou_number, date_from, date_to, run_id, approved_by).all()
+    rows = _non_posted_base_query(db, bank_name, business_unit, ou_number, date_from, date_to, run_id, run_by).all()
 
     if category:
         rows = [r for r in rows if _category_for_row(r) == category]

@@ -48,6 +48,15 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str | None = None
     CLAUDE_MODEL: str = "claude-sonnet-4-6"
 
+    # ── AI usage / cost tracking (app.ai_usage) ──────────────────────────────
+    # Per-token USD rates for whatever CLAUDE_MODEL currently points at.
+    # Defaults below are Claude Sonnet-class pricing at time of writing —
+    # update these (or override in .env) if CLAUDE_MODEL is changed to a
+    # different tier, since cost-per-token varies by model and isn't
+    # something this app can look up automatically.
+    AI_COST_PER_INPUT_TOKEN: float = 0.000003   # $3.00 / million input tokens
+    AI_COST_PER_OUTPUT_TOKEN: float = 0.000015  # $15.00 / million output tokens
+
     # ── Oracle Fusion (App1) ─────────────────────────────────────────────────
     # SECURITY: no hardcoded default — must come from .env / real environment.
     # A previous revision shipped live UAT credentials as class defaults; removed.
