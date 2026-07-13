@@ -26,6 +26,8 @@ PATCH NOTES:
 """
 from __future__ import annotations
 
+import datetime as dt
+
 from sqlalchemy.orm import Session
 
 from ..db.models import LineItem
@@ -39,9 +41,13 @@ def compute_shortage_summary(db: Session, run_id: int | None = None,
     if run_id:
         q = q.filter(LineItem.run_id == run_id)
     if date_from:
-        q = q.filter(LineItem.statement_date >= date_from)
+        # PATCH: was LineItem.statement_date (the bank transaction's own
+        # date) — same fix as bff/metrics.py: the timeline pills mean
+        # "when did we process this", not "what date is on the statement".
+        q = q.filter(LineItem.created_at >= date_from)
     if date_to:
-        q = q.filter(LineItem.statement_date <= date_to)
+        end_of_day = dt.datetime.strptime(date_to, "%Y-%m-%d") + dt.timedelta(days=1) - dt.timedelta(microseconds=1)
+        q = q.filter(LineItem.created_at <= end_of_day)
     if bank_name:
         q = q.filter(LineItem.bank_name == bank_name)
     if business_unit:

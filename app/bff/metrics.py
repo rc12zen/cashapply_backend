@@ -35,6 +35,8 @@ PATCH NOTES (this revision):
 """
 from __future__ import annotations
 
+import datetime as dt
+
 from sqlalchemy.orm import Session
 
 from ..db.models import AnalysisRun, LineItem, RowStatusHistory, SourceFile
@@ -110,9 +112,27 @@ def _base_query(db: Session, run_id: int | None, date_from: str | None, date_to:
     if run_id:
         q = q.filter(LineItem.run_id == run_id)
     if date_from:
-        q = q.filter(LineItem.statement_date >= date_from)
+        # PATCH: was LineItem.statement_date — the date PRINTED ON the bank
+        # statement (i.e. the transaction's own date, which for e.g. an
+        # "Apr-2026.xlsx" file is in April regardless of when it was
+        # uploaded/processed). The frontend's Today/Yesterday/WTD/MTD pills
+        # compute date ranges relative to *now*, so filtering on
+        # statement_date meant clicking "Today" almost always returned
+        # nothing — it was asking "was this bank transaction dated today",
+        # not "did we process this today". created_at (set when the row
+        # was inserted during an analysis run) is the axis that actually
+        # matches what those pills mean, and matches how Analysis History's
+        # own date filter already works (AnalysisRun.started_at — see
+        # bff/run_routes.py's get_run_history).
+        q = q.filter(LineItem.created_at >= date_from)
     if date_to:
-        q = q.filter(LineItem.statement_date <= date_to)
+        # created_at has a real time-of-day component (unlike the old
+        # statement_date, which lands on midnight for most parsed
+        # statements) — a bare "<= date_to" would only match rows created
+        # before midnight on that date, silently excluding almost the
+        # entire day. Push the boundary to end-of-day instead.
+        end_of_day = dt.datetime.strptime(date_to, "%Y-%m-%d") + dt.timedelta(days=1) - dt.timedelta(microseconds=1)
+        q = q.filter(LineItem.created_at <= end_of_day)
     if bank_name:
         q = q.filter(LineItem.bank_name == bank_name)
     if business_unit:

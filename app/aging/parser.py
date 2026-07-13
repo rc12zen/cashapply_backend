@@ -111,7 +111,8 @@ def refresh_aging_map(db: Session, source_file: SourceFile) -> dict:
     raw_rows = parse_aging_file(local_path)
     aging_map = AgingMap.build(raw_rows)   # build() only needs attribute access — works unchanged
 
-    aging_store.set_aging_map(aging_map, filename=source_file.filename, row_count=len(raw_rows))
+    aging_store.set_aging_map(aging_map, filename=source_file.filename, row_count=len(raw_rows),
+                               raw_rows=raw_rows)
 
     return {
         "row_count": len(raw_rows),

@@ -518,7 +518,11 @@ class ActivityLog(Base):
     user_id      = Column(Integer, ForeignKey("users.id"), nullable=True)  # null = system/background action
     action       = Column(String(100), nullable=False)                     # "statement.upload", "run.start", ...
     entity_type  = Column(String(50), nullable=True)                       # "SourceFile", "AnalysisRun", ...
-    entity_id    = Column(String(50), nullable=True)
+    entity_id    = Column(String(255), nullable=True)  # widened from 50 — statement.delete
+                                                          # logs the whole FILENAME here, not
+                                                          # just a small integer ID like every
+                                                          # other caller, and filenames routinely
+                                                          # exceed 50 chars
     status       = Column(String(20), nullable=False, default="success")   # "success" | "failure"
     ip_address   = Column(String(64), nullable=True)
     log_metadata = Column(JSON, nullable=True)
