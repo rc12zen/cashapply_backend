@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
-from ..db.models import AnalysisRun, RunStatus, SourceFile, User
+from ..db.models import AnalysisRun, LineItem, RunStatus, SourceFile, User
 from ..storage.client import get_storage_client
 from ..deps import get_db
 from ..auth import require_permission
@@ -208,6 +208,8 @@ def reset_run(request: Request, db: Session = Depends(get_db),
 def get_run_history(
     page: int = 1, page_size: int = 50,
     date_from: str | None = None, date_to: str | None = None,
+    bank_name: str | None = None, business_unit: str | None = None,
+    triggered_by: str | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("run:view")),
 ):
@@ -216,10 +218,38 @@ def get_run_history(
         q = q.filter(AnalysisRun.started_at >= date_from)
     if date_to:
         q = q.filter(AnalysisRun.started_at <= date_to)
+    if triggered_by:
+        # "User" filter for the Analysis History page — who STARTED the
+        # run (a run-level concept), as distinct from the Home dashboard's
+        # user filter (who approved/rejected individual rows within a run,
+        # via RowStatusHistory.triggered_by — a row-level concept). Both
+        # happen to be named "triggered_by" in their respective tables but
+        # answer different questions.
+        q = q.filter(AnalysisRun.triggered_by == triggered_by)
+    if bank_name or business_unit:
+        # AnalysisRun itself has no bank/BU column (a run can span multiple
+        # files/banks) — filter to runs that have AT LEAST ONE line item
+        # matching, via the same LineItem table everything else filters on.
+        line_item_q = db.query(LineItem.run_id)
+        if bank_name:
+            line_item_q = line_item_q.filter(LineItem.bank_name == bank_name)
+        if business_unit:
+            line_item_q = line_item_q.filter(LineItem.business_unit == business_unit)
+        q = q.filter(AnalysisRun.run_id.in_(line_item_q.distinct().subquery()))
     total = q.count()
     rows = q.order_by(desc(AnalysisRun.run_id)).offset((page - 1) * page_size).limit(page_size).all()
     data = [compute_run_summary_row(db, r) for r in rows]
     return {"data": data, "total": total, "page": page, "page_size": page_size}
+
+
+@router.get("/history/filter-options")
+def get_run_history_filter_options(db: Session = Depends(get_db),
+                                    user: User = Depends(require_permission("run:view"))):
+    """Distinct 'Started By' values for the Analysis History page's user pill row."""
+    users = sorted({
+        v for (v,) in db.query(AnalysisRun.triggered_by).distinct() if v
+    })
+    return {"users": users}
 
 
 @router.get("/file-preview/{filename}")
