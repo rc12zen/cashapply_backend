@@ -41,6 +41,7 @@ from sqlalchemy.orm import Session
 
 from ..db.models import AnalysisRun, LineItem, RowStatusHistory, SourceFile
 from ..aging import aging_store
+from .date_range import parse_date_from, parse_date_to
 
 
 # ── Category / group mapping — SINGLE SOURCE OF TRUTH ────────────────────────
@@ -124,15 +125,9 @@ def _base_query(db: Session, run_id: int | None, date_from: str | None, date_to:
         # matches what those pills mean, and matches how Analysis History's
         # own date filter already works (AnalysisRun.started_at — see
         # bff/run_routes.py's get_run_history).
-        q = q.filter(LineItem.created_at >= date_from)
+        q = q.filter(LineItem.created_at >= parse_date_from(date_from))
     if date_to:
-        # created_at has a real time-of-day component (unlike the old
-        # statement_date, which lands on midnight for most parsed
-        # statements) — a bare "<= date_to" would only match rows created
-        # before midnight on that date, silently excluding almost the
-        # entire day. Push the boundary to end-of-day instead.
-        end_of_day = dt.datetime.strptime(date_to, "%Y-%m-%d") + dt.timedelta(days=1) - dt.timedelta(microseconds=1)
-        q = q.filter(LineItem.created_at <= end_of_day)
+        q = q.filter(LineItem.created_at <= parse_date_to(date_to))
     if bank_name:
         q = q.filter(LineItem.bank_name == bank_name)
     if business_unit:
@@ -177,9 +172,18 @@ def compute_metrics(db: Session, run_id: int | None = None, date_from: str | Non
         run_obj = db.query(AnalysisRun).filter(AnalysisRun.run_id == run_id).first()
         total_statements = len(run_obj.selected_files) if run_obj and run_obj.selected_files else 0
     else:
-        total_statements = db.query(SourceFile).filter(
-            SourceFile.kind == "bank_statement", SourceFile.archived.is_(False)
-        ).count()
+        # PATCH: was also filtering archived.is_(False) — but the normal
+        # "remove file from list" action always archives a SourceFile once
+        # its run completes, so that filter made this count permanently 0.
+        # "statements uploaded in this period" is a historical fact, not
+        # "currently active in the upload list" — scope by upload date
+        # instead, same as every other period-scoped KPI on this page.
+        statements_q = db.query(SourceFile).filter(SourceFile.kind == "bank_statement")
+        if date_from:
+            statements_q = statements_q.filter(SourceFile.uploaded_at >= parse_date_from(date_from))
+        if date_to:
+            statements_q = statements_q.filter(SourceFile.uploaded_at <= parse_date_to(date_to))
+        total_statements = statements_q.count()
 
     return {
         # ── Legacy fields — unchanged, kept for backward compatibility ──────

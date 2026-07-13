@@ -32,4 +32,4 @@ def get_filter_options(run_id: int | None = None, db: Session = Depends(get_db))
         uq = uq.filter(AnalysisRun.run_id == run_id)
     users = sorted({u for (u,) in uq.distinct() if u})
 
-    return {"banks": banks, "business_units": bus, "users": users}s
+    return {"banks": banks, "business_units": bus, "users": users}

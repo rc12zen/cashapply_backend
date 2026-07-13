@@ -33,6 +33,7 @@ from ..ingestion.ingest_service import handle_statement_upload_v2
 from ..tasks.analysis_tasks import run_analysis_task
 from ..bank_statement.preview import preview_bank_file
 from .metrics import compute_run_summary_row
+from .date_range import parse_date_from, parse_date_to
 
 router = APIRouter()
 
@@ -209,15 +210,20 @@ def get_run_history(
     page: int = 1, page_size: int = 50,
     date_from: str | None = None, date_to: str | None = None,
     bank_name: str | None = None, business_unit: str | None = None,
-    triggered_by: str | None = None,
+    triggered_by: str | None = None, status: str | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("run:view")),
 ):
     q = db.query(AnalysisRun)
     if date_from:
-        q = q.filter(AnalysisRun.started_at >= date_from)
+        q = q.filter(AnalysisRun.started_at >= parse_date_from(date_from))
     if date_to:
-        q = q.filter(AnalysisRun.started_at <= date_to)
+        q = q.filter(AnalysisRun.started_at <= parse_date_to(date_to))
+    if status:
+        # page=1&page_size=1&status=completed is also how "most recent
+        # completed run" (Home's "Last Analysis" pill, and any future page
+        # needing the same lookup) is fetched — no separate endpoint needed.
+        q = q.filter(AnalysisRun.status == RunStatus(status))
     if triggered_by:
         # "User" filter for the Analysis History page — who STARTED the
         # run (a run-level concept), as distinct from the Home dashboard's
@@ -237,7 +243,7 @@ def get_run_history(
             line_item_q = line_item_q.filter(LineItem.business_unit == business_unit)
         q = q.filter(AnalysisRun.run_id.in_(line_item_q.distinct().subquery()))
     total = q.count()
-    rows = q.order_by(desc(AnalysisRun.run_id)).offset((page - 1) * page_size).limit(page_size).all()
+    rows = q.order_by(desc(AnalysisRun.started_at)).offset((page - 1) * page_size).limit(page_size).all()
     data = [compute_run_summary_row(db, r) for r in rows]
     return {"data": data, "total": total, "page": page, "page_size": page_size}
 
