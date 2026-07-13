@@ -1,0 +1,21 @@
+{
+  "DEFAULT": {
+    "_description": "Zensar 7-Bucket Debtors Aging Report — OU specific export",
+    "sheet_name": "Sheet1",
+    "header_row": 3,
+    "columns": {
+      "customer_number":    "CUSTOMER  NUMBER",
+      "customer_name":      "CUSTOMER NAME",
+      "invoice_number":     "INV NO",
+      "invoice_type":       "INV TYPE",
+      "invoice_amount":     "INV AMT ",
+      "invoice_currency":   "INV CURR CODE",
+      "outstanding_amount": "INV AMT UNPAID",
+      "invoice_date":       "INVOICE DATE",
+      "due_date":           "DUE DATE",
+      "ou_number":          "SEGMENT1"
+    },
+    "date_formats": ["DD-MON-YYYY"],
+    "notes": "Aging report contains OPEN/PENDING invoices only — closed/paid invoices are never present in this export. invoice_number is NOT globally unique; uniqueness key is (invoice_number, ou_number)."
+  }
+}

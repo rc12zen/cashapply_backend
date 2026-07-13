@@ -1,0 +1,27 @@
+{
+  "_comment": "Rowwise OU resolution: full account number -> { ou_number, business_unit }. Independent of config matching; used during parsing so multi-account files map each row's account to its OU. Keys starting with '_' are ignored by the loader.",
+  "01250858301": {
+    "ou_number": "312",
+    "business_unit": "SCB GBP UK"
+  },
+  "914031244": {
+    "ou_number": "111",
+    "business_unit": "HSBC US Southern California"
+  },
+  "316097347": {
+    "ou_number": "421",
+    "business_unit": "ANZ Australia"
+  },
+  "00130833000200016033": {
+    "ou_number": "273",
+    "business_unit": "BBVA Colombia Main"
+  },
+  "000274178": {
+    "ou_number": "224",
+    "business_unit": "HSBC Checking (Zensar INC)"
+  },
+  "083009060": {
+    "ou_number": "111",
+    "business_unit": "Pune(111)"
+  }
+}

@@ -1,0 +1,3132 @@
+{
+  "_comment": "Currency-pair -> Oracle GL Daily Rates ConversionRateType lookup, built from Zensar_GL_Daily_Rates_Extract__3_.txt (234,260 historical rate rows, 2012-01-04 to 2026-06-11). fx_service.py currently hardcodes ConversionRateType=Corporate on every Oracle GL query -- that is now WRONG for almost all pairs.",
+  "_finding": "'Corporate' accounts for only 24 of 234,260 rows and was last used 2023-06-05 -- it is a retired/legacy rate type. 'MRC Daily' (raw Oracle type code 300000007815001) is the active daily rate type, used in 221,542 rows (94.6% of the file) up through 2026-06-11 (the most recent date present). 'Period Average' and 'Period End' are month-end close rates, not daily transaction rates, and should not be used for receipt-time FX conversion. 184 of 214 currency pairs have all of MRC Daily/Period Average/Period End on record; none have Corporate as their only type. Recommendation: query ConversionRateType='MRC Daily' (code 300000007815001) by default for all pairs, not 'Corporate'.",
+  "_type_code_map": {
+    "Corporate": "Corporate",
+    "MRC Daily": "300000007815001",
+    "Period Average": "300000007815003",
+    "Period End": "300000007815004",
+    "Spot": "Spot"
+  },
+  "_default_conversion_rate_type": "MRC Daily",
+  "_default_conversion_rate_type_code": "300000007815001",
+  "_fallback_order": [
+    "MRC Daily",
+    "Period Average",
+    "Period End",
+    "Spot",
+    "Corporate"
+  ],
+  "pairs": {
+    "AED_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "AED_SAR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "AED_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2060
+    },
+    "AED_ZAR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "ARS_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2024-08-23",
+        "Period Average": "2024-08-31",
+        "Period End": "2024-08-31"
+      },
+      "row_count": 8
+    },
+    "AUD_CNY": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "AUD_EUR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1933
+    },
+    "AUD_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 611
+    },
+    "AUD_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2127
+    },
+    "AUD_SGD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "AUD_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2060
+    },
+    "AUD_ZAR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 71
+    },
+    "BDT_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 135
+    },
+    "BDT_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2056
+    },
+    "BRL_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2024-08-23",
+        "Period Average": "2024-08-31",
+        "Period End": "2024-08-31"
+      },
+      "row_count": 8
+    },
+    "CAD_EUR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 820
+    },
+    "CAD_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 359
+    },
+    "CAD_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "CAD_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2060
+    },
+    "CHF_EUR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1998
+    },
+    "CHF_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "CHF_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "CHF_SGD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 88
+    },
+    "CHF_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2060
+    },
+    "CNY_AUD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "CNY_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "CNY_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2053
+    },
+    "COP_EUR": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 337
+    },
+    "COP_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 672
+    },
+    "COP_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 1740
+    },
+    "COP_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1680
+    },
+    "COP_ZAR": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2024-06-27"
+      },
+      "row_count": 3
+    },
+    "CZK_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "CZK_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2056
+    },
+    "DKK_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 197
+    },
+    "DKK_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 139
+    },
+    "EUR_AUD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1933
+    },
+    "EUR_CAD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 820
+    },
+    "EUR_CHF": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1998
+    },
+    "EUR_COP": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 337
+    },
+    "EUR_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2131
+    },
+    "EUR_HKD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "EUR_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "EUR_KES": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "EUR_KRW": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "EUR_MXN": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-02-07"
+      },
+      "row_count": 11
+    },
+    "EUR_NOK": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1264
+    },
+    "EUR_PLN": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1288
+    },
+    "EUR_RSD": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 156
+    },
+    "EUR_SGD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 86
+    },
+    "EUR_TRY": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1264
+    },
+    "EUR_USD": {
+      "types_seen": [
+        "Corporate",
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "Corporate": "2023-06-05",
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2069
+    },
+    "EUR_ZAR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1255
+    },
+    "EUR_ZMW": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 11
+    },
+    "GBP_AUD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 611
+    },
+    "GBP_BDT": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 135
+    },
+    "GBP_CAD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 359
+    },
+    "GBP_CHF": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "GBP_COP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 672
+    },
+    "GBP_CZK": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "GBP_EUR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2131
+    },
+    "GBP_HKD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2056
+    },
+    "GBP_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End",
+        "Spot"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31",
+        "Spot": "2024-09-30"
+      },
+      "row_count": 2120
+    },
+    "GBP_LKR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 135
+    },
+    "GBP_MXN": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 1258
+    },
+    "GBP_NOK": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 1322
+    },
+    "GBP_PLN": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "GBP_RSD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 168
+    },
+    "GBP_SGD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2112
+    },
+    "GBP_TRY": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 1322
+    },
+    "GBP_USD": {
+      "types_seen": [
+        "Corporate",
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "Corporate": "2022-09-02",
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2119
+    },
+    "GBP_ZAR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 1002
+    },
+    "GBP_ZMW": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 11
+    },
+    "HKD_EUR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "HKD_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2056
+    },
+    "HKD_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2056
+    },
+    "HKD_SGD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "IDR_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "ILS_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2024-08-23",
+        "Period Average": "2024-08-31",
+        "Period End": "2024-08-31"
+      },
+      "row_count": 8
+    },
+    "INR_AED": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "INR_ARS": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2024-08-23",
+        "Period Average": "2024-08-31",
+        "Period End": "2024-08-31"
+      },
+      "row_count": 8
+    },
+    "INR_AUD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2127
+    },
+    "INR_BDT": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2056
+    },
+    "INR_BRL": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2024-08-23",
+        "Period Average": "2024-08-31",
+        "Period End": "2024-08-31"
+      },
+      "row_count": 8
+    },
+    "INR_CAD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "INR_CHF": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "INR_CNY": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "INR_COP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 1740
+    },
+    "INR_CZK": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2056
+    },
+    "INR_DKK": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 197
+    },
+    "INR_EUR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "INR_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End",
+        "Spot"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31",
+        "Spot": "2024-09-30"
+      },
+      "row_count": 2120
+    },
+    "INR_HKD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2056
+    },
+    "INR_IDR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "INR_ILS": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2024-08-23",
+        "Period Average": "2024-08-31",
+        "Period End": "2024-08-31"
+      },
+      "row_count": 8
+    },
+    "INR_JPY": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "INR_KES": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2120
+    },
+    "INR_LKR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2056
+    },
+    "INR_MXN": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "INR_MYR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "INR_NOK": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 1322
+    },
+    "INR_NZD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "INR_PHP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 197
+    },
+    "INR_PLN": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2119
+    },
+    "INR_RSD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 205
+    },
+    "INR_RUB": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2024-08-23",
+        "Period Average": "2024-08-31",
+        "Period End": "2024-08-31"
+      },
+      "row_count": 8
+    },
+    "INR_SAR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 734
+    },
+    "INR_SEK": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 839
+    },
+    "INR_SGD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2119
+    },
+    "INR_THB": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2119
+    },
+    "INR_TRY": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 1322
+    },
+    "INR_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End",
+        "Spot"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31",
+        "Spot": "2024-09-28"
+      },
+      "row_count": 2124
+    },
+    "INR_ZAR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End",
+        "Spot"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31",
+        "Spot": "2024-09-30"
+      },
+      "row_count": 2142
+    },
+    "INR_ZMW": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 11
+    },
+    "JPY_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "JPY_SGD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "JPY_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2053
+    },
+    "KES_EUR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "KES_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2120
+    },
+    "KES_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2060
+    },
+    "KES_ZAR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "KRW_EUR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "KRW_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 139
+    },
+    "LKR_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 135
+    },
+    "LKR_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2056
+    },
+    "LKR_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 139
+    },
+    "MXN_EUR": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-02-07"
+      },
+      "row_count": 11
+    },
+    "MXN_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 1258
+    },
+    "MXN_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "MXN_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2061
+    },
+    "MYR_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "MYR_SGD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "MYR_USD": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 482
+    },
+    "NOK_EUR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1264
+    },
+    "NOK_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 1322
+    },
+    "NOK_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 1322
+    },
+    "NOK_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1264
+    },
+    "NZD_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "PHP_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 197
+    },
+    "PHP_USD": {
+      "types_seen": [
+        "Period End"
+      ],
+      "recommended_type": "Period End",
+      "recommended_type_code": "300000007815004",
+      "last_seen_date_by_type": {
+        "Period End": "2023-06-30"
+      },
+      "row_count": 31
+    },
+    "PLN_EUR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1288
+    },
+    "PLN_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2118
+    },
+    "PLN_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2119
+    },
+    "PLN_RSD": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-21"
+      },
+      "row_count": 7
+    },
+    "PLN_USD": {
+      "types_seen": [
+        "Corporate",
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "Corporate": "2022-09-01",
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2063
+    },
+    "PLN_ZAR": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31"
+      },
+      "row_count": 28
+    },
+    "RSD_EUR": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 156
+    },
+    "RSD_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 168
+    },
+    "RSD_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 205
+    },
+    "RSD_PLN": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-21"
+      },
+      "row_count": 7
+    },
+    "RSD_USD": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 156
+    },
+    "RSD_ZAR": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 156
+    },
+    "RUB_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2024-08-23",
+        "Period Average": "2024-08-31",
+        "Period End": "2024-08-31"
+      },
+      "row_count": 8
+    },
+    "SAR_AED": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "SAR_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 734
+    },
+    "SAR_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 677
+    },
+    "SEK_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 839
+    },
+    "SEK_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2024-09-30",
+        "Period End": "2023-06-30"
+      },
+      "row_count": 33
+    },
+    "SGD_AUD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "SGD_CHF": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 88
+    },
+    "SGD_EUR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 86
+    },
+    "SGD_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2112
+    },
+    "SGD_HKD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "SGD_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2119
+    },
+    "SGD_JPY": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "SGD_MYR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "SGD_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2061
+    },
+    "THB_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2119
+    },
+    "TRY_EUR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1264
+    },
+    "TRY_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 1322
+    },
+    "TRY_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 1322
+    },
+    "TRY_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1264
+    },
+    "USD_AED": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2060
+    },
+    "USD_AUD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2060
+    },
+    "USD_CAD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2060
+    },
+    "USD_CHF": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2060
+    },
+    "USD_CNY": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2053
+    },
+    "USD_COP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1680
+    },
+    "USD_DKK": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 139
+    },
+    "USD_EUR": {
+      "types_seen": [
+        "Corporate",
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "Corporate": "2023-06-05",
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2069
+    },
+    "USD_GBP": {
+      "types_seen": [
+        "Corporate",
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "Corporate": "2022-09-02",
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 2119
+    },
+    "USD_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End",
+        "Spot"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31",
+        "Spot": "2024-09-28"
+      },
+      "row_count": 2124
+    },
+    "USD_JPY": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2053
+    },
+    "USD_KES": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2060
+    },
+    "USD_KRW": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 139
+    },
+    "USD_LKR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 139
+    },
+    "USD_MXN": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2061
+    },
+    "USD_MYR": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 482
+    },
+    "USD_NOK": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1264
+    },
+    "USD_PHP": {
+      "types_seen": [
+        "Period End"
+      ],
+      "recommended_type": "Period End",
+      "recommended_type_code": "300000007815004",
+      "last_seen_date_by_type": {
+        "Period End": "2023-06-30"
+      },
+      "row_count": 31
+    },
+    "USD_PLN": {
+      "types_seen": [
+        "Corporate",
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "Corporate": "2022-09-01",
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2063
+    },
+    "USD_RSD": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 156
+    },
+    "USD_SAR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 677
+    },
+    "USD_SEK": {
+      "types_seen": [
+        "MRC Daily",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2024-09-30",
+        "Period End": "2023-06-30"
+      },
+      "row_count": 33
+    },
+    "USD_SGD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2061
+    },
+    "USD_TRY": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1264
+    },
+    "USD_ZAR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2061
+    },
+    "USD_ZMW": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 11
+    },
+    "ZAR_AED": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "ZAR_AUD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 71
+    },
+    "ZAR_COP": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2024-06-27"
+      },
+      "row_count": 3
+    },
+    "ZAR_EUR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 1255
+    },
+    "ZAR_GBP": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31"
+      },
+      "row_count": 1002
+    },
+    "ZAR_INR": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End",
+        "Spot"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2026-05-31",
+        "Period End": "2026-05-31",
+        "Spot": "2024-09-30"
+      },
+      "row_count": 2142
+    },
+    "ZAR_KES": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 77
+    },
+    "ZAR_PLN": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-05-31"
+      },
+      "row_count": 28
+    },
+    "ZAR_RSD": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 156
+    },
+    "ZAR_USD": {
+      "types_seen": [
+        "MRC Daily",
+        "Period Average",
+        "Period End"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11",
+        "Period Average": "2023-12-31",
+        "Period End": "2023-12-31"
+      },
+      "row_count": 2061
+    },
+    "ZAR_ZMW": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 11
+    },
+    "ZMW_EUR": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 11
+    },
+    "ZMW_GBP": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 11
+    },
+    "ZMW_INR": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 11
+    },
+    "ZMW_USD": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 11
+    },
+    "ZMW_ZAR": {
+      "types_seen": [
+        "MRC Daily"
+      ],
+      "recommended_type": "MRC Daily",
+      "recommended_type_code": "300000007815001",
+      "last_seen_date_by_type": {
+        "MRC Daily": "2026-06-11"
+      },
+      "row_count": 11
+    }
+  }
+}

@@ -1,0 +1,114 @@
+"""
+cashapply_shared.settings
+==========================
+Single source of truth for environment configuration. Both App1 and App2
+import this. Behavior switches between "local" and "azure" purely via
+env vars — no code branching needed at the call site (see storage.py).
+"""
+from __future__ import annotations
+
+from functools import lru_cache
+from typing import Literal
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    # ── Environment switch ──────────────────────────────────────────────────
+    ENVIRONMENT: Literal["local", "azure"] = "local"
+
+    # ── Database (shared by App1 + App2) ────────────────────────────────────
+    DATABASE_URL: str = "postgresql+psycopg2://cashapply:cashapply@localhost:5432/cashapply"
+
+    # ── Local storage root (used when ENVIRONMENT=local) ────────────────────
+    LOCAL_STORAGE_ROOT: str = "./storage"
+
+    # ── Azure Blob Storage (used when ENVIRONMENT=azure) ────────────────────
+    AZURE_STORAGE_CONNECTION_STRING: str | None = None
+    AZURE_STORAGE_ACCOUNT_URL: str | None = None  # used with AAD/Managed Identity instead of conn string
+    AZURE_CONTAINER_BANK_STATEMENTS: str = "bank-statements"
+    AZURE_CONTAINER_AGING_REPORTS: str = "aging-reports"
+    AZURE_CONTAINER_REMITTANCE_INBOX: str = "remittance-inbox"
+
+    # ── Remittance fetch source (App2) ──────────────────────────────────────
+    REMITTANCE_SOURCE: Literal["local_folder", "graph_api"] = "local_folder"
+    REMITTANCE_LOCAL_FOLDER: str = "./remittance_inbox_local"
+
+    # Microsoft Graph (used when REMITTANCE_SOURCE=graph_api)
+    GRAPH_TENANT_ID: str | None = None
+    GRAPH_CLIENT_ID: str | None = None
+    GRAPH_CLIENT_SECRET: str | None = None
+    GRAPH_MAILBOX_USER: str | None = None  # e.g. zensar.ar@zensar.com
+
+    # ── Anthropic / Claude (App2) ────────────────────────────────────────────
+    # SECURITY: no hardcoded default — must come from .env / real environment.
+    # A previous revision shipped a live key as the class default; removed.
+    ANTHROPIC_API_KEY: str | None = None
+    CLAUDE_MODEL: str = "claude-sonnet-4-6"
+
+    # ── Oracle Fusion (App1) ─────────────────────────────────────────────────
+    # SECURITY: no hardcoded default — must come from .env / real environment.
+    # A previous revision shipped live UAT credentials as class defaults; removed.
+    ORACLE_FUSION_BASE_URL: str = "https://fa-etvl-test-saasfaprod1.fa.ocs.oraclecloud.com/fscmRestApi/resources/latest/standardReceipts"
+    ORACLE_AUTH_MODE: Literal["basic", "oauth"] = "basic"
+    ORACLE_BASIC_USERNAME: str | None = None
+    ORACLE_BASIC_PASSWORD: str | None = None
+    ORACLE_OAUTH_TOKEN_URL: str | None = None
+    ORACLE_OAUTH_CLIENT_ID: str | None = None
+    ORACLE_OAUTH_CLIENT_SECRET: str | None = None
+
+    # ── Auth: Microsoft Entra ID (Azure AD) SSO ──────────────────────────────
+    AZURE_TENANT_ID: str | None = None
+    AZURE_CLIENT_ID: str | None = None          # backend API's App Registration client id (token audience)
+    AZURE_JWKS_CACHE_SECONDS: int = 3600
+
+    # Dev/test SSO bypass — see app/auth/bypass.py. Only ever reachable when
+    # ENVIRONMENT == "local"; the bypass module is not imported otherwise.
+    # Comma-separated list of emails allowed to use the `X-Dev-User` header.
+    DEV_SSO_BYPASS_EMAILS: str = ""
+    # Role auto-assigned to a brand-new user on first successful SSO login
+    # (JIT provisioning). Deliberately the lowest-privilege role, not Admin —
+    # see design doc §1.2.
+    DEFAULT_NEW_USER_ROLE: str = "Viewer"
+
+    # ── Background task queue (procrastinate — Postgres-backed, no Redis) ───
+    # Reuses DATABASE_URL; no separate connection string needed.
+    PROCRASTINATE_APP_NAME: str = "cashapply"
+
+    # ── Aging report auto-detection ──────────────────────────────────────────
+    AGING_SOURCE: str = "local_folder"              # "local_folder" | "sftp" (future)
+    AGING_WATCH_FOLDER: str = "./aging_watch"       # folder scanned for new aging files
+    AGING_POLL_INTERVAL_SECONDS: int = 30           # how often to re-scan
+
+    # ── Rule engine tolerances (overridable; mirrors Config screen) ────────
+    SHORT_PAYMENT_TOLERANCE_PCT: float = 12.0
+    BANK_CHARGE_SPOC_AUTHORITY: float = 50.0
+    CUSTOMER_FUZZY_MATCH_MIN_PCT: float = 40.0
+
+    # ── Chunk / threading configuration (extraction pipeline) ───────────────
+    # How many credit rows go into one parallel work unit.
+    CHUNK_SIZE: int = 15
+    # ThreadPoolExecutor size for dispatch_chunks() — how many chunks run
+    # concurrently. Each chunk thread makes its own AI calls sequentially,
+    # so this is also the ceiling on how many AI network calls are ever
+    # in flight across the whole run at once.
+    CHUNK_MAX_WORKERS: int = 4
+
+    # ── Layer 2B AI batching configuration ───────────────────────────────────
+    # How many unresolved rows (sharing one OU) go into a single Claude
+    # prompt. Higher = fewer network round-trips but a bigger prompt and
+    # more rows at risk if one batch response is garbled.
+    AI_BATCH_SIZE: int = 10
+    # How many batches run concurrently INSIDE one chunk's Layer 2B step
+    # (nested inside the chunk-level ThreadPoolExecutor). Total AI calls
+    # that can be in flight across the whole run at once is roughly
+    # CHUNK_MAX_WORKERS * AI_BATCH_MAX_CONCURRENCY — watch your Anthropic
+    # org's rate limits before raising both at the same time.
+    AI_BATCH_MAX_CONCURRENCY: int = 4
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
