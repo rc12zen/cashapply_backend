@@ -51,6 +51,7 @@ from .metrics import (
     GROUP_CONFLICT_EXCEPTION, GROUP_NEEDS_REMITTANCE, GROUP_POST_FAILED,
     GROUP_REJECTED, GROUP_UNIDENTIFIED, GROUP_LABELS, _category_for_row,
 )
+from .date_range import parse_date_from, parse_date_to
 
 router = APIRouter()
 
@@ -119,9 +120,9 @@ def _base_query(
     if ou_number:
         q = q.filter(LineItem.ou_number == ou_number)
     if date_from:
-        q = q.filter(LineItem.oracle_posted_at >= date_from)
+        q = q.filter(LineItem.oracle_posted_at >= parse_date_from(date_from))
     if date_to:
-        q = q.filter(LineItem.oracle_posted_at <= date_to)
+        q = q.filter(LineItem.oracle_posted_at <= parse_date_to(date_to))
     q = _apply_run_by(q, run_by)
     return q
 
@@ -375,10 +376,9 @@ def _non_posted_base_query(
         # date) — same fix as bff/metrics.py: a Today/Yesterday/WTD/MTD-
         # style pill means "when did we process this", not "what date is
         # on the statement".
-        q = q.filter(LineItem.created_at >= date_from)
+        q = q.filter(LineItem.created_at >= parse_date_from(date_from))
     if date_to:
-        end_of_day = dt.datetime.strptime(date_to, "%Y-%m-%d") + dt.timedelta(days=1) - dt.timedelta(microseconds=1)
-        q = q.filter(LineItem.created_at <= end_of_day)
+        q = q.filter(LineItem.created_at <= parse_date_to(date_to))
     q = _apply_run_by(q, run_by)
     return q
 

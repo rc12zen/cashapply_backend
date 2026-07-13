@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from ..db.models import ActivityLog, User
 from ..deps import get_db
 from ..auth import require_permission
+from .date_range import parse_date_from, parse_date_to
 
 router = APIRouter()
 
@@ -56,9 +57,9 @@ def get_activity_log(
     if entity_id:
         q = q.filter(ActivityLog.entity_id == entity_id)
     if date_from:
-        q = q.filter(ActivityLog.created_at >= date_from)
+        q = q.filter(ActivityLog.created_at >= parse_date_from(date_from))
     if date_to:
-        q = q.filter(ActivityLog.created_at <= date_to)
+        q = q.filter(ActivityLog.created_at <= parse_date_to(date_to))
     if category and category in _CATEGORY_ACTION_LIKE:
         patterns = _CATEGORY_ACTION_LIKE[category]
         q = q.filter(or_(*(ActivityLog.action.like(p) for p in patterns)))
