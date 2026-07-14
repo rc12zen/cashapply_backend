@@ -365,11 +365,14 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
         reload_account_configs()
         raise HTTPException(400, f"Config invalid, not saved: {e}")
 
-    if created or not overwritten:
-        # New account, or a new format recipe added to an existing account —
-        # both are "a config was created". A recipe *replace* (overwritten) is not.
-        log_activity(db, user, action="config.create", entity_type="AccountConfig",
-                     entity_id=acct, metadata={"display_name": body.display_name})
+    # Audit. A new account or a brand-new format recipe is a "create"; adding a
+    # further version to an existing format is an update. (The old `overwritten`
+    # variable no longer exists in the versioned save — appends never replace.)
+    if user is not None:
+        action = "config.create" if (created or format_created) else "config.version_added"
+        log_activity(db, user, action=action, entity_type="AccountConfig",
+                     entity_id=acct,
+                     metadata={"display_name": body.display_name, "format": fmt, "version": next_version})
         db.commit()  # log_activity rides caller txn; builder_save has no other DB commit
 
     # ── OU mapping — bank_ou_mapping.json (last-4 keyed, the file
