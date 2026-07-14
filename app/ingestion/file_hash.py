@@ -24,6 +24,15 @@ def check_duplicate_file(db: Session, file_hash: str) -> dict | None:
     """
     Returns a duplicate-info dict if this exact file was already uploaded,
     else None. Does not mutate anything — safe to call speculatively.
+
+    PATCH: now includes `existing_file_archived` — the original version
+    never checked this, so re-uploading the exact same bytes as a file
+    that had been archived (removed via ✕) was permanently blocked as a
+    "duplicate" forever, with no way back — GET /api/run/files filters
+    archived=False, so that file could never appear in the Account
+    Statements list again, yet the duplicate banner claimed it was
+    "still sitting in your list." Callers should treat archived=True as
+    "restore it," not "block it" — see handle_statement_upload_v2().
     """
     existing = db.query(StatementFileHash).filter_by(file_hash=file_hash).first()
     if existing is None:
@@ -53,6 +62,7 @@ def check_duplicate_file(db: Session, file_hash: str) -> dict | None:
         "uploaded_by": uploader.display_name or uploader.email if uploader else "unknown",
         "uploaded_at": existing.uploaded_at.isoformat() if existing.uploaded_at else None,
         "existing_source_file_id": existing.source_file_id,
+        "existing_file_archived": bool(source.archived) if source else False,
         "existing_run_id": prior_run.run_id if prior_run else None,
         "history_link": (
             f"/analysis-history/row/{prior_run.run_id}" if prior_run else "/analysis-history"

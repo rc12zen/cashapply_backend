@@ -92,6 +92,7 @@ from .state_machine import apply_transition
 from .remittance_lookup import build_remittance_view
 from .fx_service import FxService, get_functional_currency
 from .ou_resolver import resolve_ou_status
+from ..oracle.receipt_creation import create_receipt_for_line_item
 
 STATEMENT_BUCKET = "bank-statements"
 
@@ -539,6 +540,8 @@ def _run_analysis(run_id: int, selected_files: list[str]) -> None:
             )
 
             all_credit_rows: list[CreditRowSchema] = []
+            seen_row_ids: set[int] = set()  # avoid double-adding a row if two
+            # selected filenames resolve to the same bank_account_id
 
             # ── Step 2: Load credit rows for all selected bank statement files ─
             #
@@ -548,6 +551,18 @@ def _run_analysis(run_id: int, selected_files: list[str]) -> None:
             # upload time, already deduplicated across separate uploads.
             # This is what makes "upload today's statement, tomorrow's has
             # 80% overlapping rows" cheap: only genuinely-new rows land here.
+            #
+            # Scoped by BANK ACCOUNT, not by the specific SourceFile the row
+            # happened to be ingested under. Row-level dedup (the row's
+            # UNIQUE(bank_account_id, row_hash) constraint) is already
+            # account-scoped, so a row that first landed under an earlier
+            # upload for this account — even one later archived via the
+            # frontend's "remove" (✕) button, which only sets
+            # SourceFile.archived and never touches these rows — is still
+            # reachable by any later run against the same account. Scoping
+            # by source_file_id instead (the previous behavior) meant those
+            # rows became permanently unconsumable the moment their original
+            # file was archived, even though they were never processed.
             #
             # LEGACY FALLBACK: a SourceFile that predates the ingestion split
             # (ingest_status is NULL) or hasn't finished ingesting yet falls
@@ -563,15 +578,27 @@ def _run_analysis(run_id: int, selected_files: list[str]) -> None:
                     continue
 
                 if source.ingest_status == "ready":
-                    unconsumed = (
-                        db.query(StatementTransactionRow)
-                        .filter(
+                    if source.bank_account_id is not None:
+                        row_query = db.query(StatementTransactionRow).filter(
+                            StatementTransactionRow.bank_account_id == source.bank_account_id,
+                            StatementTransactionRow.consumed_by_run_id.is_(None),
+                        )
+                    else:
+                        # No bank account could be resolved at ingest time
+                        # (e.g. account number missing from the statement) —
+                        # fall back to the old file-scoped query rather than
+                        # risk pulling in unrelated rows under a shared
+                        # NULL bucket.
+                        row_query = db.query(StatementTransactionRow).filter(
                             StatementTransactionRow.source_file_id == source.id,
                             StatementTransactionRow.consumed_by_run_id.is_(None),
                         )
-                        .all()
-                    )
+
+                    unconsumed = row_query.all()
                     for row in unconsumed:
+                        if row.id in seen_row_ids:
+                            continue
+                        seen_row_ids.add(row.id)
                         all_credit_rows.append(CreditRowSchema(
                             run_id=run_id,
                             source_filename=filename,
@@ -694,6 +721,44 @@ def _run_analysis(run_id: int, selected_files: list[str]) -> None:
                     _mark_row_consumed(db, orig, run_id)
 
                 db.commit()
+
+            # ── Step 4.5: Create a bare Oracle receipt for EVERY credit row ────
+            # in this run — regardless of category (unidentified,
+            # needs_remittance, ready_for_oracle, conflict_exception, all of
+            # it). This is the "Receipt Creation" half of the new two-step
+            # flow: no longer gated on ready_for_oracle / SPOC approval, and
+            # deliberately sent WITHOUT remittanceReferences (see
+            # oracle.fusion_client.build_receipt_creation_payload). Invoice
+            # mapping (attaching remittanceReferences to this same receipt)
+            # happens later, only for ready_for_oracle rows, at SPOC-approval
+            # time — see hitl/service.py.
+            #
+            # Runs synchronously here (this whole function already executes
+            # inside the background worker, so a per-row HTTP call to Oracle
+            # doesn't block the user) and commits after each row so a
+            # mid-loop failure doesn't lose progress already made.
+            all_line_items_this_run = (
+                db.query(LineItem).filter(LineItem.run_id == run_id).all()
+            )
+            dbg(run_id, "ORACLE", "batch", f"Step 4.5: creating receipts for {len(all_line_items_this_run)} row(s)...")
+            receipt_success_count = 0
+            receipt_failed_count = 0
+            for li in all_line_items_this_run:
+                try:
+                    result = create_receipt_for_line_item(db, li)
+                    if result.get("success"):
+                        receipt_success_count += 1
+                        dbg(run_id, "ORACLE", f"row={li.id}", f"Receipt created — StandardReceiptId={li.standard_receipt_id} ReceiptNumber={li.oracle_ref_no}")
+                    else:
+                        receipt_failed_count += 1
+                        dbg(run_id, "ORACLE", f"row={li.id}", f"Receipt creation FAILED — {li.post_message}")
+                except Exception as receipt_exc:
+                    receipt_failed_count += 1
+                    li.oracle_post_status = "failed"
+                    li.post_message = f"Receipt creation raised: {receipt_exc}"
+                    dbg(run_id, "ORACLE", f"row={li.id}", f"Receipt creation RAISED — {receipt_exc}")
+                db.commit()
+            dbg(run_id, "ORACLE", "batch", f"Step 4.5 complete: {receipt_success_count} succeeded, {receipt_failed_count} failed out of {len(all_line_items_this_run)} row(s).")
 
             # ── Step 5: Mark run complete ─────────────────────────────────────
             run = db.query(AnalysisRun).get(run_id)

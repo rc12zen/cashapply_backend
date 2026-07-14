@@ -148,10 +148,24 @@ def select_aging_source(source_file_id: int, db: Session = Depends(get_db)):
         SourceFile.id != source_file_id,
     ).update({"archived": True})
     target.archived = False
+
+    # PATCH: this used to commit here, BEFORE refresh_aging_map() below —
+    # same bug as aging/watcher.py's _process_file() (see that file's
+    # PATCH note). If refresh_aging_map() failed, FastAPI would return a
+    # 500 to the user (visible, at least), but the archived-flag changes
+    # were already durable — leaving a file marked "(active)" in the
+    # aging-history dropdown whose data never actually loaded into
+    # aging_store. Now commits only after a successful reload, and rolls
+    # back cleanly on failure so a broken file never silently becomes the
+    # "active" one.
+    try:
+        result = refresh_aging_map(db, target)
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(400, f"Could not load that aging snapshot: {exc}")
+
     db.commit()
     db.refresh(target)
-
-    result = refresh_aging_map(db, target)
     return {
         "loaded": True,
         "row_count": result["row_count"],

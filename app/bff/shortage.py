@@ -38,7 +38,12 @@ def compute_shortage_summary(db: Session, run_id: int | None = None,
                               date_from: str | None = None, date_to: str | None = None,
                               bank_name: str | None = None,
                               business_unit: str | None = None) -> dict:
-    q = db.query(LineItem).filter(LineItem.oracle_post_status == "success")
+    # PATCH (two-step Oracle receipt flow): was LineItem.oracle_post_status
+    # == "success" — that now means only "a bare receipt was created
+    # during Bank Reconciliation" (every row gets one). Shortage/full-
+    # payment audit should only include rows that actually completed
+    # invoice mapping — reference_status is that outcome.
+    q = db.query(LineItem).filter(LineItem.reference_status == "success")
     if run_id:
         q = q.filter(LineItem.run_id == run_id)
     if date_from:

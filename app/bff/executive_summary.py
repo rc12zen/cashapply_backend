@@ -3,10 +3,25 @@ app.bff.executive_summary  —  /api/executive-summary/*
 ========================================================
 Executive Summary Dashboard.
 
-POSTED VIEW
+PATCH NOTE (two-step Oracle receipt flow):
+  A bare Oracle receipt is now created for EVERY credit row during Bank
+  Reconciliation (rule_engine/orchestrator.py's Step 4.5), regardless of
+  category — tracked via LineItem.oracle_post_status. Invoice mapping
+  (attaching remittanceReferences to that receipt) still only happens for
+  ready_for_oracle rows at SPOC-approval time, tracked via the separate
+  LineItem.reference_status. "Posted" in this file always means
+  reference_status == "success" — a row having a bare receipt
+  (oracle_post_status == "success") is NOT sufficient, since every row
+  gets one of those regardless of whether it's actually been reviewed.
+  Dates in this file (the "Posted Date" column, date_from/date_to filters)
+  are reference_added_at (when invoice mapping happened), not
+  oracle_posted_at (when the bare receipt was created — every row, not
+  meaningful for an audit view of what's actually been posted).
+
+POSTED VIEW  ("Invoice Mapped" conceptually — see PATCH note above)
 -----------
-Only rows where LineItem.oracle_post_status == "success" — i.e. rows that
-have actually been posted to Oracle Fusion. There are exactly THREE
+Only rows where LineItem.reference_status == "success" — i.e. rows that
+have actually completed invoice mapping in Oracle Fusion. There are exactly THREE
 categories of row that ever reach Oracle (confirmed against the rule
 engine / state machine):
     - Full Payment              (credited == outstanding)
@@ -110,7 +125,11 @@ def _base_query(
     run_id: Optional[int],
     run_by: Optional[str] = None,
 ):
-    q = db.query(LineItem).filter(LineItem.oracle_post_status == "success")
+    # PATCH: was oracle_post_status == "success" — that now means only "a
+    # bare receipt was created during reconciliation" (every row gets
+    # one). "Posted" means invoice mapping actually completed —
+    # reference_status is that outcome.
+    q = db.query(LineItem).filter(LineItem.reference_status == "success")
     if run_id:
         q = q.filter(LineItem.run_id == run_id)
     if bank_name:
@@ -120,9 +139,12 @@ def _base_query(
     if ou_number:
         q = q.filter(LineItem.ou_number == ou_number)
     if date_from:
-        q = q.filter(LineItem.oracle_posted_at >= parse_date_from(date_from))
+        # PATCH: was oracle_posted_at (receipt-creation time — every row
+        # has one). reference_added_at is when invoice mapping happened,
+        # which is what "Posted Date" means for this audit view.
+        q = q.filter(LineItem.reference_added_at >= parse_date_from(date_from))
     if date_to:
-        q = q.filter(LineItem.oracle_posted_at <= parse_date_to(date_to))
+        q = q.filter(LineItem.reference_added_at <= parse_date_to(date_to))
     q = _apply_run_by(q, run_by)
     return q
 
@@ -152,7 +174,13 @@ def _serialize_record(r: LineItem) -> dict:
         "oracle_ref_no": r.oracle_ref_no,
         "oracle_status_code": r.oracle_status_code,
         "standard_receipt_id": r.standard_receipt_id,
-        "oracle_posted_at": r.oracle_posted_at.isoformat() if r.oracle_posted_at else None,
+        # PATCH: was r.oracle_posted_at (bare receipt-creation time — set
+        # for every row regardless of category). This key name is kept for
+        # frontend compatibility, but now sources reference_added_at (when
+        # invoice mapping completed), which is what "Posted Date" means
+        # for this specific audit view.
+        "oracle_posted_at": r.reference_added_at.isoformat() if r.reference_added_at else None,
+        "receipt_created_at": r.oracle_posted_at.isoformat() if r.oracle_posted_at else None,
         "tags": tags,
         "tags_label": ", ".join(next(p["label"] for p in POSTED_PILL_DEFINITIONS if p["key"] == t) for t in tags),
     }
@@ -170,9 +198,10 @@ def get_executive_filters(mode: str = "posted", db: Session = Depends(get_db)):
     """
     q = db.query(LineItem)
     if mode == "posted":
-        q = q.filter(LineItem.oracle_post_status == "success")
+        # PATCH: was oracle_post_status — see module PATCH note at top of file
+        q = q.filter(LineItem.reference_status == "success")
     else:
-        q = q.filter(or_(LineItem.oracle_post_status.is_(None), LineItem.oracle_post_status != "success"))
+        q = q.filter(or_(LineItem.reference_status.is_(None), LineItem.reference_status != "success"))
     banks = sorted({v for (v,) in q.with_entities(LineItem.bank_name).distinct() if v})
     bus = sorted({v for (v,) in q.with_entities(LineItem.business_unit).distinct() if v})
     pills = POSTED_PILL_DEFINITIONS if mode == "posted" else NON_POSTED_PILL_DEFINITIONS
@@ -261,7 +290,7 @@ def get_executive_records(
     db: Session = Depends(get_db),
 ):
     q = _base_query(db, bank_name, business_unit, ou_number, date_from, date_to, run_id, run_by)
-    q = q.order_by(LineItem.oracle_posted_at.desc())
+    q = q.order_by(LineItem.reference_added_at.desc())  # PATCH: was oracle_posted_at — see _base_query note
     rows = q.all()
 
     if category:
@@ -295,7 +324,7 @@ def export_executive_csv(
     same filter contract as /records, so what the user sees on screen is
     exactly what they download."""
     q = _base_query(db, bank_name, business_unit, ou_number, date_from, date_to, run_id, run_by)
-    q = q.order_by(LineItem.oracle_posted_at.desc())
+    q = q.order_by(LineItem.reference_added_at.desc())  # PATCH: was oracle_posted_at — see _base_query note
     rows = q.all()
 
     if category:
@@ -354,14 +383,15 @@ def _non_posted_base_query(
     run_id: Optional[int],
     run_by: Optional[str] = None,
 ):
-    # NOTE: oracle_post_status is NULL for every row that hasn't gone through
-    # Oracle posting yet (the vast majority of "non-posted" rows). Plain
-    # `!= "success"` would silently exclude all of those, since SQL's NULL
-    # comparison semantics make `NULL != 'success'` evaluate to UNKNOWN, not
-    # TRUE — so the WHERE clause would only ever match explicit non-success
-    # strings like "failed". Explicitly OR in the NULL case.
+    # NOTE: reference_status is NULL for every row that hasn't been
+    # invoice-mapped yet (the vast majority of "non-posted" rows — includes
+    # rows with a bare receipt already created, since that's a separate
+    # field now — see module PATCH note). Plain `!= "success"` would
+    # silently exclude all of those, since SQL's NULL comparison semantics
+    # make `NULL != 'success'` evaluate to UNKNOWN, not TRUE. Explicitly OR
+    # in the NULL case.
     q = db.query(LineItem).filter(
-        or_(LineItem.oracle_post_status.is_(None), LineItem.oracle_post_status != "success")
+        or_(LineItem.reference_status.is_(None), LineItem.reference_status != "success")
     )
     if run_id:
         q = q.filter(LineItem.run_id == run_id)

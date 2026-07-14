@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
-from ..db.models import AnalysisRun, LineItem, RunStatus, SourceFile, User
+from ..db.models import AnalysisRun, BankAccount, LineItem, RunStatus, SourceFile, StatementTransactionRow, User
 from ..storage.client import get_storage_client
 from ..deps import get_db
 from ..auth import require_permission
@@ -33,7 +33,6 @@ from ..ingestion.ingest_service import handle_statement_upload_v2
 from ..tasks.analysis_tasks import run_analysis_task
 from ..bank_statement.preview import preview_bank_file
 from .metrics import compute_run_summary_row
-from .date_range import parse_date_from, parse_date_to
 
 router = APIRouter()
 
@@ -67,6 +66,7 @@ def get_files(db: Session = Depends(get_db), user: User = Depends(require_permis
             "filename": r.filename,
             "bank_name": r.bank_config_key or "Unknown",
             "size_mb": size_mb,
+            "bank_account_id": r.bank_account_id,
             "business_unit": r.business_unit or "",
             "ou_number": r.ou_number or "",
             "source_file_id": r.id,
@@ -75,6 +75,70 @@ def get_files(db: Session = Depends(get_db), user: User = Depends(require_permis
             "duplicate_row_count": r.duplicate_row_count,
         })
     return {"files": out}
+
+
+@router.get("/pending-by-account")
+def get_pending_by_account(db: Session = Depends(get_db), user: User = Depends(require_permission("run:view"))):
+    """
+    Groups every currently-listed (non-archived) bank statement file by
+    the bank account it belongs to, with a LIVE count of unconsumed rows
+    for that account (queried fresh from StatementTransactionRow, not the
+    per-file new_row_count snapshot taken at upload time — a prior run
+    may have already consumed some of an account's rows since then,
+    across possibly-different files, so the file-level number alone can
+    be stale/misleading).
+
+    Backs the dashboard's account-level "include in next run" checkboxes:
+    the orchestrator already resolves and consumes rows by
+    bank_account_id, not by file (see rule_engine/orchestrator.py) — this
+    endpoint exposes that same grouping so the UI's selection unit matches
+    what actually happens when a run executes, instead of offering
+    file-level checkboxes that would silently not match real behavior.
+    """
+    files = (
+        db.query(SourceFile)
+        .filter(SourceFile.kind == "bank_statement", SourceFile.archived.is_(False))
+        .all()
+    )
+
+    groups: dict[int | None, dict] = {}
+    for f in files:
+        key = f.bank_account_id
+        if key not in groups:
+            account = db.query(BankAccount).get(key) if key is not None else None
+            groups[key] = {
+                "bank_account_id": key,
+                "account_number": account.account_number if account else None,
+                "bank_name": (account.bank_name if account else None) or f.bank_config_key or "Unknown",
+                "business_unit": f.business_unit or "",
+                "ou_number": f.ou_number or "",
+                "files": [],
+                "pending_row_count": 0,
+            }
+        groups[key]["files"].append({
+            "filename": f.filename,
+            "source_file_id": f.id,
+            "ingest_status": f.ingest_status,
+            "new_row_count": f.new_row_count,
+        })
+
+    for key, group in groups.items():
+        if key is not None:
+            group["pending_row_count"] = (
+                db.query(StatementTransactionRow)
+                .filter(
+                    StatementTransactionRow.bank_account_id == key,
+                    StatementTransactionRow.consumed_by_run_id.is_(None),
+                )
+                .count()
+            )
+        else:
+            # No resolved account (e.g. account number missing at ingest) —
+            # fall back to summing the per-file snapshot, same fallback
+            # rule the orchestrator itself uses for these files.
+            group["pending_row_count"] = sum(fi["new_row_count"] or 0 for fi in group["files"])
+
+    return {"accounts": list(groups.values())}
 
 
 @router.post("/upload")
@@ -210,20 +274,15 @@ def get_run_history(
     page: int = 1, page_size: int = 50,
     date_from: str | None = None, date_to: str | None = None,
     bank_name: str | None = None, business_unit: str | None = None,
-    triggered_by: str | None = None, status: str | None = None,
+    triggered_by: str | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("run:view")),
 ):
     q = db.query(AnalysisRun)
     if date_from:
-        q = q.filter(AnalysisRun.started_at >= parse_date_from(date_from))
+        q = q.filter(AnalysisRun.started_at >= date_from)
     if date_to:
-        q = q.filter(AnalysisRun.started_at <= parse_date_to(date_to))
-    if status:
-        # page=1&page_size=1&status=completed is also how "most recent
-        # completed run" (Home's "Last Analysis" pill, and any future page
-        # needing the same lookup) is fetched — no separate endpoint needed.
-        q = q.filter(AnalysisRun.status == RunStatus(status))
+        q = q.filter(AnalysisRun.started_at <= date_to)
     if triggered_by:
         # "User" filter for the Analysis History page — who STARTED the
         # run (a run-level concept), as distinct from the Home dashboard's
@@ -243,7 +302,7 @@ def get_run_history(
             line_item_q = line_item_q.filter(LineItem.business_unit == business_unit)
         q = q.filter(AnalysisRun.run_id.in_(line_item_q.distinct().subquery()))
     total = q.count()
-    rows = q.order_by(desc(AnalysisRun.started_at)).offset((page - 1) * page_size).limit(page_size).all()
+    rows = q.order_by(desc(AnalysisRun.run_id)).offset((page - 1) * page_size).limit(page_size).all()
     data = [compute_run_summary_row(db, r) for r in rows]
     return {"data": data, "total": total, "page": page, "page_size": page_size}
 

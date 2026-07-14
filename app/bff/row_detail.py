@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from ..db.models import LineItem, RemittanceExtraction
 from ..bff.metrics import _category_for_row, GROUP_LABELS, GROUP_READY_FOR_ORACLE
-from ..oracle.fusion_client import build_standard_receipt_payload
+from ..oracle.fusion_client import build_receipt_creation_payload, build_remittance_reference_payloads
 from ..rule_engine.fx_service import get_ou_display_name
 
 
@@ -48,9 +48,13 @@ def _build_pipeline(r: LineItem) -> list[dict]:
     nodes.append({"key": "spoc_review", "label": "SPOC Review", "status": hitl_status,
                   "detail": r.hitl_status or "Awaiting review"})
 
-    post_status = {"success": "passed", "failed": "failed"}.get(r.oracle_post_status, "pending")
-    nodes.append({"key": "oracle_post", "label": "Oracle Posting", "status": post_status,
-                  "detail": r.post_message or r.oracle_ref_no or "Not yet posted"})
+    receipt_status = {"success": "passed", "failed": "failed"}.get(r.oracle_post_status, "pending")
+    nodes.append({"key": "receipt_creation", "label": "Receipt Creation", "status": receipt_status,
+                  "detail": r.post_message or r.oracle_ref_no or "Not yet created — happens automatically after reconciliation"})
+
+    reference_status = {"success": "passed", "failed": "failed"}.get(r.reference_status, "pending")
+    nodes.append({"key": "invoice_mapping", "label": "Invoice Mapping", "status": reference_status,
+                  "detail": r.reference_message or "Awaiting SPOC approval"})
 
     return nodes
 
@@ -92,16 +96,16 @@ def build_row_detail(db: Session, record_id: int) -> dict:
     _cat = _category_for_row(r)
 
     # ── Oracle payload preview ────────────────────────────────────────────────
-    # r.oracle_payload is only ever set by hitl.service._post_to_oracle_and_update
-    # AFTER approval, so a row sitting in "Ready for Oracle" always showed an
-    # empty payload here before. Build a preview (never posted, just computed)
-    # so SPOCs can review Amount/Currency/ConversionRate/receipt-method warnings
-    # before they click Approve, not after.
+    # r.oracle_payload is set by rule_engine/orchestrator.py's Step 4.5 for
+    # EVERY row right after reconciliation — so by the time this endpoint
+    # is hit, it should already be populated for virtually every row. The
+    # fallback preview below only matters if that step somehow never ran
+    # for this row (e.g. data from before this flow existed).
     oracle_payload = r.oracle_payload
     is_preview = False
-    if not oracle_payload and _cat == GROUP_READY_FOR_ORACLE:
+    if not oracle_payload:
         try:
-            oracle_payload = build_standard_receipt_payload(r, invoice_breakup=None)
+            oracle_payload = build_receipt_creation_payload(r)
             is_preview = True
         except Exception as exc:
             # Never let a broken preview take down the row-detail page —
@@ -110,6 +114,22 @@ def build_row_detail(db: Session, record_id: int) -> dict:
             # itself emits.
             oracle_payload = {"_preview_error": f"Could not build payload preview: {exc}"}
             is_preview = True
+
+    # ── Invoice-mapping (reference) payload preview ──────────────────────────
+    # r.reference_payload is only set once a SPOC actually approves a
+    # ready_for_oracle row (hitl/service.py). For a row currently SITTING
+    # in ready_for_oracle awaiting approval, preview what WOULD be sent to
+    # Oracle's remittanceReferences child collection, same idea as the
+    # receipt-payload preview above.
+    reference_payload = r.reference_payload
+    reference_is_preview = False
+    if not reference_payload and _cat == GROUP_READY_FOR_ORACLE:
+        try:
+            reference_payload = build_remittance_reference_payloads(r, invoice_breakup=None)
+            reference_is_preview = True
+        except Exception as exc:
+            reference_payload = [{"_preview_error": f"Could not build reference preview: {exc}"}]
+            reference_is_preview = True
 
     return {
         "id":                r.id,
@@ -154,12 +174,36 @@ def build_row_detail(db: Session, record_id: int) -> dict:
             "is_preview": is_preview,
             "remittance_scenario": r.reason_code,
             "hitl_status": r.hitl_status,
-            "post_status": r.oracle_post_status,
+            # PATCH: was r.oracle_post_status — the frontend
+            # (analysis-history/row/[id]/page.tsx) reads oracle.post_status
+            # to mean "did this row fully complete" (category derivation +
+            # retry-button gating). oracle_post_status now only means "a
+            # bare receipt was created during reconciliation" — every row
+            # gets one regardless of approval. reference_status (the
+            # invoice-mapping outcome) is what "fully complete" actually
+            # means now.
+            "post_status": r.reference_status,
+            "receipt_creation_status": r.oracle_post_status,
+            "reference_status": r.reference_status,
+            "reference_message": r.reference_message,
+            "reference_added_at": r.reference_added_at.isoformat() if r.reference_added_at else None,
+            "reference_payload": reference_payload or [],
+            "reference_is_preview": reference_is_preview,
             "oracle_ref_no": r.oracle_ref_no,
             "oracle_status_code": r.oracle_status_code,
             "standard_receipt_id": r.standard_receipt_id,
             "oracle_posted_at": r.oracle_posted_at.isoformat() if r.oracle_posted_at else None,
             "post_message": r.post_message,
+            # NEW: the actual "receipt created" output from Oracle — was
+            # discarded before (only a few extracted fields were kept).
+            # None until create_receipt_for_line_item() has actually run
+            # for this row (i.e. right after Bank Reconciliation, for
+            # every row — see rule_engine/orchestrator.py's Step 4.5).
+            "receipt_response_raw": r.oracle_response_raw,
+            # NEW: raw response(s) from the invoice-mapping (remittance
+            # reference) POST(s) — a list, one per matched invoice. None
+            # until a SPOC has actually approved this row.
+            "reference_response_raw": r.reference_response_raw,
         },
         "remittance": remittance,
     }

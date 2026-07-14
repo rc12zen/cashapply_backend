@@ -219,6 +219,15 @@ class AgingMap:
                 seen[v.customer_name] = None
         return list(seen.keys())[:limit]
 
+    def invoices_for_customer(self, customer_name: str) -> list[AgingInvoiceView]:
+        """All open invoices for an exact customer name (case-insensitive).
+        Used by hitl/manual_mapping.py's SPOC invoice picker — once a
+        customer is known (either auto-identified or manually searched),
+        this is every invoice+outstanding_amount the picker offers."""
+        if not customer_name:
+            return []
+        return self._name_to_rows.get(customer_name.strip().upper(), [])
+
     # ── Utility ───────────────────────────────────────────────────────────────
 
     @property

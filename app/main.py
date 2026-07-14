@@ -12,6 +12,9 @@ See cashapply-platform-hardening-design.md for the full design.
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .common.logging_config import configure_logging
+configure_logging()  # must run before any other app import that grabs a logger at module load time
+
 from .db.session import init_db
 from .db.settings import get_settings
 from .aging.watcher import start_watcher

@@ -25,13 +25,13 @@ OU functional currency:
 from __future__ import annotations
 
 import datetime as dt
-import json
 import logging
-from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
 import httpx
+
+from ..common.json_cache import load_json_cached
 
 logger = logging.getLogger(__name__)
 
@@ -99,11 +99,14 @@ _STATIC_RATE_MAP: dict[str, float] = {
 }
 
 
-@lru_cache(maxsize=1)
 def _load_ou_functional_currency() -> dict:
+    # PATCH: was @lru_cache(maxsize=1) — same cross-process staleness bug
+    # as bank_statement/configs/account_loader.py (see that file's PATCH
+    # note for the full explanation). A newly-onboarded OU's functional
+    # currency would never be seen by the worker process until it was
+    # manually restarted. Now mtime-based via app.common.json_cache.
     path = _HERE / "configs" / "ou_functional_currency.json"
-    with open(path) as f:
-        return json.load(f)
+    return load_json_cached(path)
 
 
 def get_functional_currency(ou_number: str | None) -> Optional[str]:
@@ -141,11 +144,9 @@ def get_ou_display_name(ou_number: str | None) -> Optional[str]:
     return entry.get("ou") if entry else None
 
 
-@lru_cache(maxsize=1)
 def _load_fx_conversion_type_map() -> dict:
     path = _HERE / "configs" / "fx_conversion_type_map.json"
-    with open(path) as f:
-        return json.load(f)
+    return load_json_cached(path)
 
 
 def get_conversion_rate_type(from_ccy: str, to_ccy: str) -> tuple[str, str]:

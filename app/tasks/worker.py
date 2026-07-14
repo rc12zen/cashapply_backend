@@ -16,6 +16,9 @@ there rather than in this file.)
 """
 from __future__ import annotations
 
+from ..common.logging_config import configure_logging
+configure_logging()  # must run before any task module import that grabs a logger at load time
+
 # Registers the tasks on procrastinate_app via their @procrastinate_app.task
 # decorators — required so the worker knows about them.
 from . import analysis_tasks, ingestion_tasks  # noqa: F401

@@ -15,12 +15,25 @@ Provides:
   reload_account_configs()— clear caches + rebuild (hot reload after save/delete)
 
 Keys beginning with "_" (e.g. "_comment") are ignored everywhere.
+
+PATCH (cross-process staleness fix): this used to cache via a bare
+`@lru_cache(maxsize=1)` — a pure in-process cache. The API server and the
+background worker are always separate OS processes; saving a new account
+via the Config Builder Wizard hit the API process and called
+reload_account_configs() there, which never touched the worker's own
+cache — so a newly-onboarded bank account detected as UNKNOWN in every
+analysis run (which executes in the worker) until the worker was
+manually restarted. Now cached by (path, mtime) via
+app.common.json_cache — every process independently notices the file
+changed on its next call, no manual reload/restart required. See
+app/common/json_cache.py for the full rationale.
 """
 from __future__ import annotations
 
-import json
-from functools import lru_cache
 from pathlib import Path
+import json
+
+from ...common.json_cache import load_json_cached
 
 _HERE = Path(__file__).parent
 _CONFIGS_PATH = _HERE / "account_configs.json"
@@ -80,17 +93,14 @@ def _normalize_account(value: str) -> str:
     return "".join(ch for ch in s.upper() if ch.isalnum())
 
 
-@lru_cache(maxsize=1)
 def load_account_configs() -> dict:
     """Load + validate account_configs.json. Returns {account_number: entry}."""
-    with open(_CONFIGS_PATH, encoding="utf-8") as f:
-        raw = json.load(f)
+    raw = load_json_cached(_CONFIGS_PATH)
     entries = _strip_private(raw)
     _validate(entries)
     return entries
 
 
-@lru_cache(maxsize=1)
 def load_bank_ou_mapping() -> dict:
     """
     Load bank_ou_mapping.json — keyed by last-4 account suffix.
@@ -101,8 +111,7 @@ def load_bank_ou_mapping() -> dict:
     """
     if not _OU_MAP_PATH.exists():
         return {}
-    with open(_OU_MAP_PATH, encoding="utf-8") as f:
-        raw = json.load(f)
+    raw = load_json_cached(_OU_MAP_PATH)
     return _strip_private(raw)
 
 
@@ -110,21 +119,22 @@ def load_bank_ou_mapping() -> dict:
 load_account_ou_map = load_bank_ou_mapping
 
 
-@lru_cache(maxsize=1)
 def ou_index() -> dict:
     """
     Build {last4_suffix: entry} from bank_ou_mapping.json for O(1) rowwise
-    OU lookup.  The map is already keyed by last-4 so this is a direct pass-
-    through with leading-zero preservation (keys kept as-is, no normalization).
+    OU lookup. Not cached beyond load_bank_ou_mapping()'s own mtime-based
+    cache — this dict() copy is cheap enough to rebuild on every call, and
+    doing so means it can never go stale independently of the source file.
     """
     return dict(load_bank_ou_mapping())
 
 
-@lru_cache(maxsize=1)
 def last4_index() -> dict:
     """Build {last4: [account_number, …]} from the registry for fast matching.
     Multiple accounts can share a last4 — that's the collision case resolved by
-    the full account number at detection time."""
+    the full account number at detection time. Not cached beyond
+    load_account_configs()'s own mtime-based cache, for the same reason as
+    ou_index() above."""
     index: dict[str, list[str]] = {}
     for acct, entry in load_account_configs().items():
         last4 = entry.get("account_last4") or _normalize_account(acct)[-4:]
@@ -134,12 +144,13 @@ def last4_index() -> dict:
 
 
 def reload_account_configs() -> dict:
-    """Clear caches and reload. Returns a summary for a /reload response."""
-    load_account_configs.cache_clear()
-    load_bank_ou_mapping.cache_clear()
-    last4_index.cache_clear()
-    ou_index.cache_clear()
-
+    """
+    Returns a summary for a /reload response. No longer needs to clear any
+    cache — load_json_cached() already re-reads automatically the moment a
+    file's mtime changes, in every process independently — but kept as a
+    named entrypoint since bff/config_builder_routes.py calls it after
+    every save, and it's a convenient place to report a fresh count.
+    """
     configs = load_account_configs()
     ou_map = load_bank_ou_mapping()
     return {

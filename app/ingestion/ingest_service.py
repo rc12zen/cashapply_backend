@@ -81,6 +81,29 @@ def handle_statement_upload_v2(db: Session, filename: str, data: bytes, uploaded
 
     dup = check_duplicate_file(db, file_hash)
     if dup is not None:
+        if dup["existing_file_archived"]:
+            # PATCH: was an unconditional block. If the matched file had
+            # been archived (removed via ✕), it could never come back —
+            # GET /api/run/files filters archived=False, so re-uploading
+            # the identical bytes was a dead end: blocked as a duplicate,
+            # yet invisible in the Account Statements list either way.
+            # Un-archive it instead and let the caller treat this as a
+            # restore, not a rejection.
+            source = db.query(SourceFile).get(dup["existing_source_file_id"])
+            source.archived = False
+            log_activity(db, uploaded_by, action="statement.restore",
+                         entity_type="SourceFile", entity_id=source.id,
+                         metadata={"file_hash": file_hash, "filename": filename})
+            db.commit()
+            db.refresh(source)
+            return {
+                "duplicate": False,
+                "restored": True,
+                "source_file_id": source.id,
+                "filename": source.filename,
+                "ingest_status": source.ingest_status,
+                "message": f'"{filename}" was previously removed but is now restored to your Account Statements list.',
+            }
         log_activity(db, uploaded_by, action="statement.upload_rejected_duplicate",
                      entity_type="SourceFile", entity_id=dup["existing_source_file_id"],
                      status="failure", metadata={"file_hash": file_hash, "filename": filename})

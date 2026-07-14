@@ -108,8 +108,24 @@ def _process_file(filepath: Path) -> bool:
                 SourceFile.filename != filename,
             ).update({"archived": True})
 
-            db.commit()
-            db.refresh(source_file)
+            # PATCH: this used to call db.commit() + db.refresh(source_file)
+            # right here, BEFORE refresh_aging_map() below. session_scope()
+            # is built to commit ONCE at the end of the `with` block and
+            # roll EVERYTHING back together if any exception occurs inside
+            # it — that early commit defeated that guarantee. If
+            # refresh_aging_map() throws for any reason (a parse error, a
+            # snapshot-write failure, anything), this function's own broad
+            # `except Exception` below swallows it and just logs — but the
+            # archived-flag flip had ALREADY been made durable by that
+            # early commit. Net effect: the aging-history dropdown would
+            # correctly show this file as "(active)" (the DB really does
+            # say so), while aging_store never actually got the parsed
+            # data — "NOT LOADED" forever, with no visible error anywhere
+            # except a server log line nobody was watching. Now the whole
+            # operation is atomic: if refresh_aging_map() fails, the
+            # archived-flag changes above roll back with it, and the
+            # previously-active file stays active instead of a broken one
+            # silently taking its place.
 
             # Reload AgingMap in memory.
             result = refresh_aging_map(db, source_file)

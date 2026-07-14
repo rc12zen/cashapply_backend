@@ -38,20 +38,22 @@ for the SAME class) -- these are listed in
 """
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 from typing import Optional
+
+from ..common.json_cache import load_json_cached
 
 _HERE = Path(__file__).parent
 
 
-@lru_cache(maxsize=1)
 def _load_receipt_method_map() -> dict:
+    # PATCH: was @lru_cache(maxsize=1) — same cross-process staleness bug
+    # as bank_statement/configs/account_loader.py and
+    # rule_engine/fx_service.py (see either file's PATCH note for the full
+    # explanation). Now mtime-based via app.common.json_cache.
     path = _HERE / "configs" / "receipt_method_map.json"
-    with open(path) as f:
-        return json.load(f)
+    return load_json_cached(path)
 
 
 @dataclass

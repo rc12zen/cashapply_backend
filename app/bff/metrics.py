@@ -41,7 +41,7 @@ from sqlalchemy.orm import Session
 
 from ..db.models import AnalysisRun, LineItem, RowStatusHistory, SourceFile
 from ..aging import aging_store
-from .date_range import parse_date_from, parse_date_to
+from ..rule_engine.fx_service import _STATIC_RATE_MAP
 
 
 # ── Category / group mapping — SINGLE SOURCE OF TRUTH ────────────────────────
@@ -92,16 +92,25 @@ GROUP_LABELS: dict[str, str] = {
 def _category_for_row(r: LineItem) -> str:
     """
     The single function that decides which of the 7 display groups a row
-    belongs to. Terminal states (set by HITL approve/reject + Oracle POST
-    result) ALWAYS take priority over the rule_id grouping, since a row
-    that's been approved-and-posted is "processed" regardless of whether
-    it got there via R9a or R9b.
+    belongs to. Terminal states (set by HITL approve/reject + Oracle
+    invoice-mapping result) ALWAYS take priority over the rule_id
+    grouping, since a row that's been approved-and-invoice-mapped is
+    "processed" regardless of whether it got there via R9a or R9b.
+
+    PATCH: was r.oracle_post_status — that field now only means "a bare
+    receipt was created during Bank Reconciliation" (see
+    rule_engine/orchestrator.py's Step 4.5), which happens for EVERY row
+    regardless of category. Using it here would have made every row
+    "Processed" the instant a run finished, before anyone approved
+    anything. reference_status is the invoice-mapping outcome — set only
+    when a SPOC approves a ready_for_oracle row (hitl/service.py) — which
+    is what "Processed"/"Posted"/"Invoice Mapped" actually means.
     """
-    if r.oracle_post_status == "success":
+    if r.reference_status == "success":
         return GROUP_PROCESSED
     if r.hitl_status == "rejected":
         return GROUP_REJECTED
-    if r.oracle_post_status == "failed":
+    if r.reference_status == "failed":
         return GROUP_POST_FAILED
     return RULE_ID_TO_GROUP.get(r.rule_id, GROUP_CONFLICT_EXCEPTION)
 
@@ -125,9 +134,15 @@ def _base_query(db: Session, run_id: int | None, date_from: str | None, date_to:
         # matches what those pills mean, and matches how Analysis History's
         # own date filter already works (AnalysisRun.started_at — see
         # bff/run_routes.py's get_run_history).
-        q = q.filter(LineItem.created_at >= parse_date_from(date_from))
+        q = q.filter(LineItem.created_at >= date_from)
     if date_to:
-        q = q.filter(LineItem.created_at <= parse_date_to(date_to))
+        # created_at has a real time-of-day component (unlike the old
+        # statement_date, which lands on midnight for most parsed
+        # statements) — a bare "<= date_to" would only match rows created
+        # before midnight on that date, silently excluding almost the
+        # entire day. Push the boundary to end-of-day instead.
+        end_of_day = dt.datetime.strptime(date_to, "%Y-%m-%d") + dt.timedelta(days=1) - dt.timedelta(microseconds=1)
+        q = q.filter(LineItem.created_at <= end_of_day)
     if bank_name:
         q = q.filter(LineItem.bank_name == bank_name)
     if business_unit:
@@ -172,18 +187,9 @@ def compute_metrics(db: Session, run_id: int | None = None, date_from: str | Non
         run_obj = db.query(AnalysisRun).filter(AnalysisRun.run_id == run_id).first()
         total_statements = len(run_obj.selected_files) if run_obj and run_obj.selected_files else 0
     else:
-        # PATCH: was also filtering archived.is_(False) — but the normal
-        # "remove file from list" action always archives a SourceFile once
-        # its run completes, so that filter made this count permanently 0.
-        # "statements uploaded in this period" is a historical fact, not
-        # "currently active in the upload list" — scope by upload date
-        # instead, same as every other period-scoped KPI on this page.
-        statements_q = db.query(SourceFile).filter(SourceFile.kind == "bank_statement")
-        if date_from:
-            statements_q = statements_q.filter(SourceFile.uploaded_at >= parse_date_from(date_from))
-        if date_to:
-            statements_q = statements_q.filter(SourceFile.uploaded_at <= parse_date_to(date_to))
-        total_statements = statements_q.count()
+        total_statements = db.query(SourceFile).filter(
+            SourceFile.kind == "bank_statement", SourceFile.archived.is_(False)
+        ).count()
 
     return {
         # ── Legacy fields — unchanged, kept for backward compatibility ──────
@@ -195,7 +201,7 @@ def compute_metrics(db: Session, run_id: int | None = None, date_from: str | Non
         "pending_hitl": count(lambda r: r.current_state == "review_approve"),
         "approved": count(lambda r: r.hitl_status == "approved"),
         "rejected": count(lambda r: r.hitl_status == "rejected"),
-        "posted_to_oracle": count(lambda r: r.oracle_post_status == "success"),
+        "posted_to_oracle": count(lambda r: r.reference_status == "success"),  # PATCH: was oracle_post_status — see _category_for_row
         "extraction_method_breakdown": _breakdown(rows),
         "aging_report_loaded":    aging_store.get_status().get("loaded", False),
         "aging_report_row_count": aging_store.get_status().get("row_count", 0),
@@ -205,16 +211,16 @@ def compute_metrics(db: Session, run_id: int | None = None, date_from: str | Non
         "groups": groups,
         "identified": len(rows) - groups.get("unidentified", 0),
 
-        # ── Amount view (INR equivalent) ──────────────────────────────────────
+        # ── Amount view (USD equivalent) ──────────────────────────────────────
         "group_amounts": _group_amounts(rows),
-        "total_inr_amount": round(sum(_to_inr(r) for r in rows), 2),
+        "total_usd_amount": round(sum(_to_usd(r) for r in rows), 2),
     }
 
 
-def _to_inr(r: LineItem) -> float:
+def _to_functional_amount(r: LineItem) -> float:
     """
-    Convert a row's credit_amount to INR using the two FX legs already
-    stored on the LineItem.
+    Convert a row's credit_amount to ITS OWN functional (ledger) currency
+    using the two FX legs already stored on the LineItem.
 
     Leg 1: statement_currency → invoice_currency  (fx_credit_to_invoice)
     Leg 2: invoice_currency   → functional_currency (fx_invoice_to_functional)
@@ -222,11 +228,15 @@ def _to_inr(r: LineItem) -> float:
     Combined: credit_amount × leg1_rate × leg2_rate = functional amount.
 
     If either rate is missing we treat it as 1.0 (same currency on that leg).
-    If statement_currency is already INR both rates are 1.0 so amount passes
-    through unchanged.
 
-    This is a best-effort INR view — not a live FX lookup, just uses whatever
-    rates were captured at processing time.
+    IMPORTANT: this is NOT always INR. functional_currency is whichever
+    ledger currency the row's OU uses (see
+    rule_engine/configs/ou_functional_currency.json) — USD for US OUs,
+    MXN for Mexico OUs, GBP for UK, etc. This function used to be named
+    _to_inr() and was summed directly into a KPI labeled "INR", which
+    silently produced a meaningless mixed-currency total the moment any
+    row belonged to a non-Indian OU. See _to_usd() below for the actual
+    single-currency aggregate this dashboard needs.
     """
     amount = float(r.credit_amount or 0)
     if not amount:
@@ -236,14 +246,58 @@ def _to_inr(r: LineItem) -> float:
     return round(amount * leg1 * leg2, 2)
 
 
+def _convert_static(amount: float, from_ccy: str, to_ccy: str) -> float:
+    """
+    Approximate currency conversion using rule_engine.fx_service's static
+    fallback rate table — the SAME table already used for rule-band
+    evaluation when Oracle's live GL rate isn't available, so this display
+    conversion is at least consistent with the rest of the app rather
+    than inventing a second, different rate source.
+
+    NOT for Oracle posting (same caveat as the source table) — this is
+    purely for the dashboard's single-currency summary view. Tries a
+    direct pair, then the inverse, then bridges through USD.
+    """
+    from_ccy = (from_ccy or "").upper()
+    to_ccy = (to_ccy or "").upper()
+    if not from_ccy or from_ccy == to_ccy:
+        return amount
+
+    direct = _STATIC_RATE_MAP.get(f"{from_ccy}_{to_ccy}")
+    if direct:
+        return round(amount * direct, 2)
+
+    inverse = _STATIC_RATE_MAP.get(f"{to_ccy}_{from_ccy}")
+    if inverse:
+        return round(amount / inverse, 2)
+
+    from_to_usd = _STATIC_RATE_MAP.get(f"{from_ccy}_USD")
+    usd_to_target = _STATIC_RATE_MAP.get(f"USD_{to_ccy}")
+    if from_to_usd and usd_to_target:
+        return round(amount * from_to_usd * usd_to_target, 2)
+
+    # No rate found anywhere — return the raw amount rather than silently
+    # dropping it, but this case means the rate table needs a new entry
+    # for this currency pair (see fx_service.py's _STATIC_RATE_MAP).
+    return amount
+
+
+def _to_usd(r: LineItem) -> float:
+    """The dashboard's actual single-currency total — every row's amount
+    converted from ITS OWN functional currency into USD, so rows from
+    different OUs/ledgers can be summed together meaningfully."""
+    functional_amount = _to_functional_amount(r)
+    return _convert_static(functional_amount, r.functional_currency or "USD", "USD")
+
+
 def _group_amounts(rows: list[LineItem]) -> dict:
-    """INR-equivalent total credit amount per display group."""
+    """USD-equivalent total credit amount per display group."""
     amounts = {g: 0.0 for g in (
         GROUP_UNIDENTIFIED, GROUP_NEEDS_REMITTANCE, GROUP_READY_FOR_ORACLE,
         GROUP_CONFLICT_EXCEPTION, GROUP_PROCESSED, GROUP_REJECTED, GROUP_POST_FAILED,
     )}
     for r in rows:
-        amounts[_category_for_row(r)] += _to_inr(r)
+        amounts[_category_for_row(r)] += _to_usd(r)
     return {k: round(v, 2) for k, v in amounts.items()}
     """Counts every row into exactly one of the 7 display groups."""
     counts = {g: 0 for g in (
@@ -331,7 +385,7 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
         "pending_hitl": sum(1 for r in rows if r.current_state == "review_approve"),
         "approved": sum(1 for r in rows if r.hitl_status == "approved"),
         "rejected": sum(1 for r in rows if r.hitl_status == "rejected"),
-        "posted_to_oracle": sum(1 for r in rows if r.oracle_post_status == "success"),
+        "posted_to_oracle": sum(1 for r in rows if r.reference_status == "success"),  # PATCH: was oracle_post_status — see _category_for_row
         "total_credit_amount": float(sum(r.credit_amount or 0 for r in rows)),
         "match_rate_pct": round(matched / len(rows) * 100, 1) if rows else 0.0,
         "triggered_by": run.triggered_by,
@@ -363,7 +417,8 @@ def _serialize_line_item_for_tab(r: LineItem, source: str) -> dict:
         "failed_rules": r.failed_rules,
         "hitl_status": r.hitl_status,
         "oracle_transaction_ref": r.oracle_ref_no,
-        "oracle_post_status": r.oracle_post_status,
+        "oracle_post_status": r.oracle_post_status,  # receipt-creation status (step 1)
+        "reference_status": r.reference_status,        # invoice-mapping status (step 2)
         "_source": source,
         "reason_code": r.reason_code,
         "rule_id": r.rule_id,

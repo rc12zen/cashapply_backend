@@ -41,6 +41,8 @@ from ..audit.service import log_activity
 from ..hitl import (
     approve_row, reject_row, build_breakup_analysis,
     get_hitl_history, retry_oracle_post, serialize_line_item,
+    get_mapping_options, get_invoices_for_customer,
+    preview_manual_mapping, confirm_manual_mapping,
 )
 
 router = APIRouter()
@@ -159,5 +161,54 @@ def retry_oracle(id: int, request: Request, db: Session = Depends(get_db),
                  ip_address=_client_ip(request),
                  status="success" if result.get("success") else "failure",
                  metadata={"post_status": result.get("post_status")})
+    db.commit()
+    return result
+
+
+# ── Manual invoice mapping ────────────────────────────────────────────────────
+# For rows that didn't land in ready_for_oracle automatically. Confirming a
+# mapping only RE-CLASSIFIES the row into ready_for_oracle — it does NOT post
+# to Oracle. Posting still happens through the existing, separate Approve
+# action above. See hitl/manual_mapping.py's module docstring for the full
+# rationale.
+
+@router.get("/{id}/mapping-options")
+def mapping_options(id: int, db: Session = Depends(get_db),
+                     user: User = Depends(require_permission("run:view"))):
+    result = get_mapping_options(db, id)
+    if result.get("error"):
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@router.get("/{id}/mapping-options/customer")
+def mapping_options_for_customer(id: int, customer_name: str, db: Session = Depends(get_db),
+                                  user: User = Depends(require_permission("run:view"))):
+    result = get_invoices_for_customer(db, id, customer_name)
+    if result.get("error"):
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@router.post("/{id}/mapping-preview")
+def mapping_preview(id: int, body: dict, db: Session = Depends(get_db),
+                     user: User = Depends(require_permission("run:view"))):
+    invoice_numbers = body.get("invoice_numbers") or []
+    result = preview_manual_mapping(db, id, invoice_numbers)
+    if result.get("error"):
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@router.post("/{id}/mapping-confirm")
+def mapping_confirm(id: int, body: dict, request: Request, db: Session = Depends(get_db),
+                     user: User = Depends(require_permission("hitl:reject"))):
+    invoice_numbers = body.get("invoice_numbers") or []
+    result = confirm_manual_mapping(db, id, invoice_numbers, user)
+    if result.get("error"):
+        raise HTTPException(400, result["error"])
+    log_activity(db, user, action="hitl.manual_mapping", entity_type="LineItem", entity_id=id,
+                 ip_address=_client_ip(request),
+                 metadata={"invoice_numbers": invoice_numbers, "rule_id": result.get("rule_id")})
     db.commit()
     return result

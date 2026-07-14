@@ -30,12 +30,16 @@ PATCH NOTES (this revision):
 from __future__ import annotations
 
 import datetime as dt
+import logging
 
 from sqlalchemy.orm import Session
 
 from ..db.models import LineItem, RowStatusHistory
-from ..oracle.fusion_client import OracleFusionClient, build_standard_receipt_payload
+from ..oracle.fusion_client import OracleFusionClient, build_remittance_reference_payloads
+from ..oracle.receipt_creation import create_receipt_for_line_item
 from ..bff.metrics import _category_for_row, GROUP_READY_FOR_ORACLE, GROUP_LABELS
+
+logger = logging.getLogger(__name__)
 
 
 def serialize_line_item(r: LineItem) -> dict:
@@ -57,7 +61,8 @@ def serialize_line_item(r: LineItem) -> dict:
         "matched_invoices":    r.matched_invoices,
         "shortfall_pct":       r.shortfall_pct,
         "hitl_status":         r.hitl_status,
-        "oracle_post_status":  r.oracle_post_status,
+        "oracle_post_status":  r.oracle_post_status,  # receipt-creation status (step 1) — see db/models.py
+        "reference_status":    r.reference_status,     # invoice-mapping status (step 2), null until approved
         "post_message":        r.post_message,
         # PATCH: surface the same category every other endpoint now shows,
         # so the HITL preview/pending views are consistent with the ledger.
@@ -120,23 +125,71 @@ def build_breakup_analysis(db: Session, line_item_id: int) -> dict:
     }
 
 
-def _post_to_oracle_and_update(
+def _map_invoice_and_update(
     db: Session, r: LineItem, invoice_breakup: list[dict] | None
 ) -> dict:
-    payload = build_standard_receipt_payload(r, invoice_breakup)
-    r.oracle_payload = payload
+    """
+    Invoice mapping — step 2 of the two-step Oracle flow. Attaches
+    remittanceReferences to the receipt already created for this row
+    during Bank Reconciliation (rule_engine/orchestrator.py's Step 4.5) —
+    does NOT create a new receipt in the normal case.
+
+    Recovery path: if this row somehow never got a successful receipt
+    (r.oracle_post_status != "success" — e.g. the original bare-receipt
+    POST failed, or this row was created before this flow existed), the
+    receipt is created fresh right here, then the reference is attached
+    to it — both in this one call, so a SPOC approving a row always
+    either fully succeeds or fails clearly, never silently skips the
+    reference step because of a stale receipt-creation failure.
+    """
+    if r.oracle_post_status != "success":
+        logger.info("[invoice_mapping] row=%s has no successful receipt yet — retrying creation first", r.id)
+        create_receipt_for_line_item(db, r)
+        if r.oracle_post_status != "success":
+            # Can't map an invoice reference without a receipt to attach it
+            # to — fail clearly rather than attempting a POST that Oracle
+            # would reject anyway (no valid standard_receipt_id).
+            r.reference_status  = "failed"
+            r.reference_added_at = dt.datetime.utcnow()
+            r.reference_message = (
+                f"Cannot map invoice — receipt creation failed/retried and still "
+                f"failed: {r.post_message or 'unknown error'}"
+            )
+            logger.warning("[invoice_mapping] row=%s FAILED — %s", r.id, r.reference_message)
+            return {"success": False, "message": r.reference_message}
+
+    reference_payloads = build_remittance_reference_payloads(r, invoice_breakup)
+    r.reference_payload = reference_payloads
+
+    logger.info(
+        "[invoice_mapping] row=%s standard_receipt_id=%s — attaching %d reference(s)...",
+        r.id, r.standard_receipt_id, len(reference_payloads),
+    )
 
     client = OracleFusionClient()
-    result = client.post_standard_receipt(payload)
+    results = [
+        client.post_remittance_reference(r.standard_receipt_id, ref)
+        for ref in reference_payloads
+    ]
+    r.reference_response_raw = [res.get("raw") for res in results]
 
-    r.oracle_post_status  = "success" if result["success"] else "failed"
-    r.oracle_ref_no       = result.get("oracle_ref_no")
-    r.standard_receipt_id = result.get("standard_receipt_id")
-    r.oracle_status_code  = result.get("status_code")
-    r.post_message        = result.get("message")
-    r.oracle_posted_at    = dt.datetime.utcnow()
+    all_succeeded = all(res["success"] for res in results) if results else True
+    r.reference_status   = "success" if all_succeeded else "failed"
+    r.reference_added_at = dt.datetime.utcnow()
+    if all_succeeded:
+        r.reference_message = f"{len(results)} reference(s) added successfully"
+        logger.info("[invoice_mapping] row=%s SUCCESS — %s", r.id, r.reference_message)
+    else:
+        failed_msgs = [res["message"] for res in results if not res["success"]]
+        r.reference_message = "; ".join(failed_msgs)[:2000]
+        logger.warning("[invoice_mapping] row=%s FAILED — %s", r.id, r.reference_message)
 
-    return result
+    return {
+        "success": all_succeeded,
+        "message": r.reference_message,
+        "oracle_ref_no": r.oracle_ref_no,
+        "standard_receipt_id": r.standard_receipt_id,
+    }
 
 
 def approve_row(
@@ -193,7 +246,7 @@ def approve_row(
         }
 
     r.hitl_status = "approved"
-    result = _post_to_oracle_and_update(db, r, invoice_breakup)
+    result = _map_invoice_and_update(db, r, invoice_breakup)
     r.current_state = "processed" if result["success"] else "post_failed"
     r.status        = "Processed" if result["success"] else "Post Failed"
     r.version       = (r.version or 0) + 1
@@ -219,7 +272,14 @@ def approve_row(
         "oracle_ref_no":      r.oracle_ref_no,
         "oracle_status_code": r.oracle_status_code,
         "standard_receipt_id": r.standard_receipt_id,
-        "post_status":        r.oracle_post_status,
+        # PATCH: was r.oracle_post_status — that field now only means
+        # "a bare receipt exists" (set at Bank Reconciliation, before this
+        # approve action ever ran). The frontend's post_status field means
+        # "did this approve action fully succeed" — that's reference_status
+        # now (the invoice-mapping outcome this very call just produced).
+        "post_status":         r.reference_status,
+        "receipt_creation_status": r.oracle_post_status,
+        "reference_status":        r.reference_status,
         "is_cross_currency":  bool(r.is_cross_currency),
         "fx_rate_used":       float(r.fx_rate) if r.fx_rate else None,
         "applications":       applications,
@@ -284,14 +344,20 @@ def get_hitl_history(db: Session) -> dict:
 
 def retry_oracle_post(db: Session, line_item_id: int) -> dict:
     r = db.query(LineItem).get(line_item_id)
-    if not r or r.oracle_post_status != "failed":
+    # PATCH: was r.oracle_post_status != "failed" — that field now means
+    # "receipt creation failed", not "the row failed to fully process".
+    # The retry button/action is about redoing invoice mapping (and, if
+    # needed, the receipt creation underneath it too — see
+    # _map_invoice_and_update's recovery path), so gate on reference_status.
+    if not r or r.reference_status != "failed":
         return {"error": "Row not eligible for retry"}
 
-    # NOTE: no category gate needed here — oracle_post_status == "failed"
+    # NOTE: no category gate needed here — reference_status == "failed"
     # can only ever happen for a row that already passed the approve_row()
-    # gate above (it had to be ready_for_oracle to attempt a POST at all).
-    # Retrying is just re-attempting the same POST, not a new approval
-    # decision, so no additional check is required.
+    # gate above (it had to be ready_for_oracle to attempt invoice mapping
+    # at all). Retrying is just re-attempting the same mapping (and, if
+    # the underlying receipt itself never succeeded, recreating that too),
+    # not a new approval decision, so no additional check is required.
     invoice_breakup = [
         {
             "invoice_number":  m["invoice_number"],
@@ -299,7 +365,7 @@ def retry_oracle_post(db: Session, line_item_id: int) -> dict:
         }
         for m in (r.matched_invoices or [])
     ]
-    result = _post_to_oracle_and_update(db, r, invoice_breakup)
+    result = _map_invoice_and_update(db, r, invoice_breakup)
     r.current_state = "processed" if result["success"] else "post_failed"
     r.status        = "Processed" if result["success"] else "Post Failed"
 
@@ -310,6 +376,6 @@ def retry_oracle_post(db: Session, line_item_id: int) -> dict:
     db.commit()
     return {
         "id":          r.id,
-        "post_status": r.oracle_post_status,
+        "post_status": r.reference_status,
         "message":     r.post_message,
     }

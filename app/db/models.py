@@ -249,14 +249,40 @@ class LineItem(Base):
     status            = Column(String, default="Not Found")
     hitl_status       = Column(String, nullable=True)
 
-    # ── Oracle posting result ─────────────────────────────────────────────────
-    oracle_ref_no       = Column(String, nullable=True)
-    oracle_status_code  = Column(String, nullable=True)
-    standard_receipt_id = Column(String, nullable=True)
-    oracle_post_status  = Column(String, nullable=True)
-    oracle_posted_at    = Column(DateTime, nullable=True)
-    post_message        = Column(Text, nullable=True)
-    oracle_payload      = Column(JSON, nullable=True)
+    # ── Oracle RECEIPT CREATION (step 1 — Bank Reconciliation stage) ─────────
+    # PATCH: these fields used to be written once, at SPOC-approval time,
+    # meaning "fully approved AND invoice-mapped". They're now written
+    # much earlier — right after the analysis run categorizes this row,
+    # for EVERY credit row regardless of category — and mean only "a bare
+    # Oracle receipt exists for this row" (see rule_engine/orchestrator.py's
+    # Step 4.5, and oracle/fusion_client.py's build_receipt_creation_payload,
+    # which deliberately omits remittanceReferences). standard_receipt_id
+    # is Oracle's own numeric StandardReceiptId — required to address the
+    # child remittanceReferences collection later at invoice-mapping time.
+    oracle_ref_no        = Column(String, nullable=True)   # Oracle's ReceiptNumber (our own generated string)
+    oracle_status_code   = Column(String, nullable=True)
+    standard_receipt_id  = Column(String, nullable=True)   # Oracle's numeric StandardReceiptId
+    oracle_post_status   = Column(String, nullable=True)   # "success" | "failed" — RECEIPT CREATION outcome only
+    oracle_posted_at     = Column(DateTime, nullable=True)
+    post_message         = Column(Text, nullable=True)
+    oracle_payload       = Column(JSON, nullable=True)      # last receipt-creation request body sent
+    oracle_response_raw  = Column(JSON, nullable=True)      # raw Oracle response body from receipt creation — was discarded before, needed for row-detail display
+
+    # ── Oracle INVOICE MAPPING / reference (step 2 — Finance Approval) ───────
+    # Separate from the fields above on purpose: this is what used to be
+    # the ONLY Oracle interaction, gated on ready_for_oracle (R9a/R9b) and
+    # triggered by SPOC approve. Now it's a POST to
+    # /standardReceipts/{standard_receipt_id}/child/remittanceReferences
+    # against the receipt already created in step 1, not a new receipt.
+    # "Processed"/"Posted to Oracle" downstream (dashboard KPI, Executive
+    # Summary, Shortage Review) now means reference_status == "success",
+    # NOT oracle_post_status == "success" — a bare receipt with no invoice
+    # mapping yet is not "done".
+    reference_status     = Column(String, nullable=True)   # "success" | "failed"
+    reference_added_at   = Column(DateTime, nullable=True)
+    reference_message    = Column(Text, nullable=True)
+    reference_payload    = Column(JSON, nullable=True)       # last remittanceReferences request body sent
+    reference_response_raw = Column(JSON, nullable=True)     # raw Oracle response(s) from invoice mapping
 
     created_at = Column(DateTime, default=dt.datetime.utcnow)
     updated_at = Column(DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow)

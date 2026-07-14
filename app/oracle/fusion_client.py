@@ -58,7 +58,7 @@ ReferenceAmount:
 
 PROBLEM 2 — is_cross_ou_currency in response
 ---------------------------------------------
-build_standard_receipt_payload now includes is_cross_ou_currency from the
+build_receipt_creation_payload now includes is_cross_ou_currency from the
 LineItem so the caller (state_machine / API response) can surface the flag
 to the front-end without a separate DB query.
 """
@@ -73,6 +73,7 @@ from ..db.settings import get_settings
 from ..rule_engine.fx_service import get_ou_display_name
 from .receipt_method_resolver import resolve_receipt_method
 from ..common.http_debug_log import log_oracle_request, log_oracle_response, log_oracle_error
+from ..aging import aging_store
 
 
 class OracleFusionClient:
@@ -153,8 +154,17 @@ class OracleFusionClient:
                 data = resp.json()
                 return {
                     "success":             True,
-                    "oracle_ref_no":       data.get("ReceiptNumber") or data.get("ref_no"),
-                    "standard_receipt_id": data.get("ReceiptId")     or data.get("id"),
+                    "oracle_ref_no":       data.get("ReceiptNumber"),
+                    # BUGFIX: was `data.get("ReceiptId") or data.get("id")` —
+                    # a real Oracle response (confirmed against an actual
+                    # /standardReceipts POST result) returns the numeric
+                    # receipt ID under "StandardReceiptId", never "ReceiptId"
+                    # or "id". As written before, standard_receipt_id would
+                    # silently come back None on every real Oracle call —
+                    # which would have broken invoice-mapping entirely,
+                    # since that step needs this ID to address
+                    # /standardReceipts/{id}/child/remittanceReferences.
+                    "standard_receipt_id": data.get("StandardReceiptId"),
                     "status_code":         str(resp.status_code),
                     "message":             "Posted successfully",
                     "raw":                 data,
@@ -176,6 +186,68 @@ class OracleFusionClient:
                 "status_code":         "connection_error",
                 "message":             str(e),
                 "raw":                 None,
+            }
+
+    def post_remittance_reference(self, standard_receipt_id: str, reference_payload: dict) -> dict:
+        """
+        Invoice mapping — POSTs ONE remittance reference to the child
+        collection of an ALREADY-CREATED receipt:
+            /standardReceipts/{standard_receipt_id}/child/remittanceReferences
+
+        This is a different Oracle resource than /standardReceipts itself
+        — confirmed against a real Oracle GET response, whose `links`
+        array exposes exactly this child collection (kind: "collection",
+        name: "remittanceReferences"). It's how invoice mapping attaches
+        to a receipt that was already created bare (no references) during
+        Bank Reconciliation — NOT a PATCH on the receipt's own fields.
+
+        Called once per matched invoice; callers loop for multi-invoice
+        breakups.
+        """
+        s = self.settings
+        url = f"{s.ORACLE_FUSION_BASE_URL}/standardReceipts/{standard_receipt_id}/child/remittanceReferences"
+        auth = (
+            (s.ORACLE_BASIC_USERNAME, s.ORACLE_BASIC_PASSWORD)
+            if s.ORACLE_AUTH_MODE == "basic"
+               and s.ORACLE_BASIC_USERNAME
+               and s.ORACLE_BASIC_PASSWORD
+            else None
+        )
+        headers = self._auth_headers()
+
+        log_oracle_request(
+            "POST", url, headers=headers, auth=auth, json_body=reference_payload,
+            tag="oracle.remittanceReferences",
+        )
+
+        try:
+            resp = httpx.post(
+                url, json=reference_payload,
+                headers=headers, auth=auth, timeout=60,
+            )
+            log_oracle_response(resp, tag="oracle.remittanceReferences")
+
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                return {
+                    "success":     True,
+                    "status_code": str(resp.status_code),
+                    "message":     "Reference added successfully",
+                    "raw":         data,
+                }
+            return {
+                "success":     False,
+                "status_code": str(resp.status_code),
+                "message":     resp.text[:2000],
+                "raw":         None,
+            }
+        except httpx.HTTPError as e:
+            log_oracle_error(e, tag="oracle.remittanceReferences")
+            return {
+                "success":     False,
+                "status_code": "connection_error",
+                "message":     str(e),
+                "raw":         None,
             }
 
 
@@ -217,38 +289,51 @@ def _build_receipt_number(line_item: LineItem) -> str:
     return f"CASHAPPLY-{ou}-{date_str}-{line_item.id}-226"
 
 
-def build_standard_receipt_payload(
-    line_item: LineItem,
-    invoice_breakup: list[dict] | None,
-) -> dict:
+def build_receipt_creation_payload(line_item: LineItem) -> dict:
     """
-    Builds the Oracle AR standardReceipts payload.
+    Builds the Oracle AR standardReceipts CREATION payload — step 1 (Bank
+    Reconciliation stage). Called for EVERY credit row, regardless of
+    category, right after the analysis run finishes categorizing it — NOT
+    gated on ready_for_oracle / SPOC approval.
+
+    Deliberately excludes `remittanceReferences` entirely — invoice
+    mapping happens later, as a separate POST to
+    /standardReceipts/{standard_receipt_id}/child/remittanceReferences
+    (see build_remittance_reference_payloads + OracleFusionClient.
+    post_remittance_reference), once the row reaches ready_for_oracle and
+    a SPOC approves it. At this stage we may not even have SPOC
+    confirmation yet, and rows that never reach ready_for_oracle should
+    still get a bare receipt per the current spec.
+
+    CustomerAccountNumber is "" (empty string, not null/omitted) when no
+    customer was identified for this row — confirmed against the
+    business's own sample payload. Rows that are genuinely unidentified
+    never reach ready_for_oracle anyway (matching requires an identified
+    customer), so this only ever applies to rows that will never get
+    invoice-mapped, not to a temporary/fixable gap.
 
     Parameters
     ----------
     line_item:
         Persisted LineItem with all three currency fields and both FX legs
-        resolved by the orchestrator after Pass 2.
+        already resolved by the orchestrator (this happens for every row
+        in the same pass, before categorization — see orchestrator.py's
+        Pass 2 — so this data is available even for rows that end up
+        unidentified/needs_remittance/conflict_exception).
 
-    invoice_breakup:
-        Optional SPOC-confirmed split from the BreakupModal.
-        Each entry: { "invoice_number": str, "reference_amount": float }
-        reference_amount must be in invoice_currency.
-        When provided, overrides matched_invoices stated_amounts.
-
-    Payload shapes — see module docstring for full examples.
-
-    The private audit field `_fx_sources` is included in the payload dict
-    (prefixed with underscore) so the caller can log it; Oracle ignores
-    unknown fields. Remove it before posting if Oracle rejects extras.
+    Payload shapes for Amount/Currency/ConversionRate — see this module's
+    docstring for the full three-currency-model examples; unchanged from
+    before, only the remittanceReferences array and CustomerAccountNumber
+    handling have changed.
     """
     # ── Resolve currency fields from LineItem ─────────────────────────────────
     credited_currency   = (line_item.statement_currency  or "").upper().strip()
     invoice_currency    = (line_item.invoice_currency    or "").upper().strip()
     functional_currency = (line_item.functional_currency or "").upper().strip()
 
-    # Fall back gracefully when invoice_currency was not resolved at analysis time
-    # (should not happen for postable rows, but be defensive).
+    # Fall back gracefully when invoice_currency was not resolved (e.g. a
+    # genuinely unidentified row with no matched invoice at all — this
+    # payload is built for EVERY row now, not just ones that matched).
     if not invoice_currency:
         invoice_currency = credited_currency or functional_currency
 
@@ -264,39 +349,13 @@ def build_standard_receipt_payload(
     fx_credit_to_invoice = float(line_item.fx_credit_to_invoice) if line_item.fx_credit_to_invoice else None
 
     if is_cross_currency and fx_credit_to_invoice:
-        # Amount Oracle receives is in invoice currency.
         amount_in_invoice_ccy = round(credit_amount * fx_credit_to_invoice, 2)
     else:
-        # Credited currency IS invoice currency — no conversion needed.
         amount_in_invoice_ccy = credit_amount
 
     # ── Leg 2: invoice → functional (Oracle ConversionRate) ──────────────────
-    is_cross_ledger              = bool(line_item.is_cross_ledger)   # invoice != functional
-    fx_invoice_to_functional     = float(line_item.fx_invoice_to_functional) if line_item.fx_invoice_to_functional else None
-
-    # ── Build remittance references (always in invoice currency) ─────────────
-    if invoice_breakup:
-        # SPOC manually confirmed split — use directly.
-        references = [
-            {
-                "ReceiptMatchBy":  "Transaction Number",
-                "ReferenceNumber": inv["invoice_number"],
-                "ReferenceAmount": str(inv["reference_amount"]),
-            }
-            for inv in invoice_breakup
-        ]
-    else:
-        # Use stated_amount from rule engine (_resolve_matched_invoices).
-        # stated_amount is already in invoice_currency (Leg 1 applied during split).
-        matched = line_item.matched_invoices or []
-        references = [
-            {
-                "ReceiptMatchBy":  "Transaction Number",
-                "ReferenceNumber": m["invoice_number"],
-                "ReferenceAmount": str(m.get("stated_amount") or m["outstanding_amount"]),
-            }
-            for m in matched
-        ]
+    is_cross_ledger          = bool(line_item.is_cross_ledger)   # invoice != functional
+    fx_invoice_to_functional = float(line_item.fx_invoice_to_functional) if line_item.fx_invoice_to_functional else None
 
     # ── Resolve the real ReceiptMethod (was hardcoded "Standard" — a value
     #    that appears nowhere in the actual Oracle AR Receipt Methods
@@ -311,25 +370,39 @@ def build_standard_receipt_payload(
     receipt_method_name = receipt_method_result.receipt_method_name or "Standard"
 
     # ── BusinessUnit: Oracle expects "NAME(ou)" (e.g. "PUNE(111)").
-    #    line_item.business_unit is populated during bank-statement parsing
-    #    and can hold a plain bank-description string instead (depends on
-    #    which OU-resolution path ran) -- always derive this from ou_number
-    #    via ou_functional_currency.json instead.
     business_unit = get_ou_display_name(line_item.ou_number) or line_item.business_unit
 
-    # ── CustomerAccountNumber: pull from the first matched invoice's aging
-    #    row (customer_number was already being looked up in AgingInvoice /
-    #    AgingMap, just never threaded through matched_invoices until now).
-    #    A receipt is posted against one customer, so the first match is
-    #    representative; falls back to None (Oracle payload TODO) if this
-    #    row somehow has no matched invoices with a customer_number.
+    # ── CustomerAccountNumber: "" when unresolved, never null/omitted ─────────
+    # PATCH: this used to ONLY look at matched_invoices — which requires an
+    # INVOICE to have been matched. A needs_remittance row (customer
+    # identified in the narrative, but no invoice number found) has
+    # matched_invoices = [] by definition, so CustomerAccountNumber always
+    # came back blank even when the aging report genuinely has that
+    # customer on file — "customer identified" (Card 2's extracted_customer)
+    # and "customer resolved to an aging account number" were being
+    # silently conflated. Now falls back to a customer-name lookup against
+    # the currently-loaded aging report when no invoice was matched, so
+    # this field can be populated correctly even before an invoice is known.
     matched_invoices_raw = line_item.matched_invoices or []
     customer_account_number = next(
         (m.get("customer_number") for m in matched_invoices_raw if m.get("customer_number")),
         None,
     )
+    customer_lookup_note = None
+    if not customer_account_number and line_item.extracted_customer_name:
+        aging_map = aging_store.get_aging_map()
+        if aging_map is not None:
+            match, score = aging_map.fuzzy_customer(line_item.extracted_customer_name)
+            if match:
+                customer_account_number = match.customer_number
+                customer_lookup_note = (
+                    f"CustomerAccountNumber resolved via customer-name lookup against the aging "
+                    f"report (no invoice was matched) — matched '{match.customer_name}' at {score:.0f}% "
+                    f"confidence for extracted name '{line_item.extracted_customer_name}'."
+                )
+    customer_account_number = customer_account_number or ""
 
-    # ── Base payload ──────────────────────────────────────────────────────────
+    # ── Base payload — NO remittanceReferences here, see docstring ───────────
     payload: dict = {
         "ReceiptNumber":               _build_receipt_number(line_item),
         "ReceiptMethod":               receipt_method_name,
@@ -340,14 +413,18 @@ def build_standard_receipt_payload(
         "Amount":                      amount_in_invoice_ccy,
         "AccountingDate":              accounting_date_iso,
         "ReceiptDate":                 statement_date_iso,
-        "remittanceReferences":        references,
     }
+
+    if customer_lookup_note:
+        payload["_customer_account_number_fallback_lookup"] = customer_lookup_note
 
     if not customer_account_number:
         payload["_customer_account_number_unresolved"] = (
-            "No customer_number found on any matched invoice for this row — "
-            "check the aging report has customer_number populated for this customer. "
-            "DO NOT post with CustomerAccountNumber=None."
+            "No customer_number found on any matched invoice, and no confident "
+            "customer-name match was found in the currently-loaded aging report "
+            "either — posted with CustomerAccountNumber=\"\" per spec. This row will "
+            "never reach ready_for_oracle / invoice mapping unless a customer is "
+            "later identified."
         )
 
     if not receipt_method_result.matched:
@@ -366,14 +443,10 @@ def build_standard_receipt_payload(
 
     # ── Add Leg 2 conversion fields when invoice != functional ────────────────
     if is_cross_ledger and fx_invoice_to_functional:
-        # Oracle uses ConversionRate to book Amount (invoice ccy) into
-        # the functional-currency ledger. We never compute that ourselves.
         payload["ConversionRateType"] = "User"
         payload["ConversionRate"]     = fx_invoice_to_functional
         payload["ConversionDate"]     = statement_date_iso
     elif is_cross_ledger and not fx_invoice_to_functional:
-        # Should not reach ready_to_post without this rate — R13 guards it.
-        # If somehow we get here, flag it clearly rather than posting silently.
         payload["_fx_leg2_missing"] = (
             f"fx_invoice_to_functional ({invoice_currency}→{functional_currency}) "
             f"not resolved. DO NOT POST — re-evaluate after providing rate."
@@ -389,12 +462,48 @@ def build_standard_receipt_payload(
         "fx_invoice_to_functional":       fx_invoice_to_functional,
         "fx_invoice_to_functional_source": line_item.fx_invoice_to_functional_source,
     }
-
-    # ── Problem 2: surface cross-OU flag for front-end / state_machine ────────
-    # The state_machine / API layer reads this to set the front-end badge.
-    # It is NOT sent to Oracle.
     payload["_is_cross_ou_currency"] = bool(
         getattr(line_item, "is_cross_ou_currency", False)
     )
 
     return payload
+
+
+def build_remittance_reference_payloads(
+    line_item: LineItem,
+    invoice_breakup: list[dict] | None,
+) -> list[dict]:
+    """
+    Invoice mapping — step 2 (Finance Approval stage), ready_for_oracle
+    rows only. Builds ONE payload per matched invoice for
+    OracleFusionClient.post_remittance_reference(), which POSTs each to
+    /standardReceipts/{standard_receipt_id}/child/remittanceReferences —
+    the receipt itself must already exist (created in step 1).
+
+    Parameters
+    ----------
+    invoice_breakup:
+        Optional SPOC-confirmed split from the BreakupModal.
+        Each entry: { "invoice_number": str, "reference_amount": float }
+        reference_amount must be in invoice_currency.
+        When provided, overrides matched_invoices stated_amounts.
+    """
+    if invoice_breakup:
+        return [
+            {
+                "ReceiptMatchBy":  "Transaction Number",
+                "ReferenceNumber": inv["invoice_number"],
+                "ReferenceAmount": str(inv["reference_amount"]),
+            }
+            for inv in invoice_breakup
+        ]
+
+    matched = line_item.matched_invoices or []
+    return [
+        {
+            "ReceiptMatchBy":  "Transaction Number",
+            "ReferenceNumber": m["invoice_number"],
+            "ReferenceAmount": str(m.get("stated_amount") or m["outstanding_amount"]),
+        }
+        for m in matched
+    ]
