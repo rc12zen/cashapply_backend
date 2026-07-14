@@ -44,6 +44,7 @@ from ..hitl import (
     get_mapping_options, get_invoices_for_customer,
     preview_manual_mapping, confirm_manual_mapping,
 )
+from ..rule_engine.remittance_recheck import recheck_needs_remittance_rows
 
 router = APIRouter()
 
@@ -212,3 +213,27 @@ def mapping_confirm(id: int, body: dict, request: Request, db: Session = Depends
                  metadata={"invoice_numbers": invoice_numbers, "rule_id": result.get("rule_id")})
     db.commit()
     return result
+
+
+@router.post("/{id}/recheck-remittance")
+def recheck_remittance(id: int, request: Request, db: Session = Depends(get_db),
+                        user: User = Depends(require_permission("hitl:reject"))):
+    """
+    Manual counterpart to the periodic remittance_recheck_worker — lets a
+    SPOC re-check a SINGLE needs_remittance row on demand (e.g. "the
+    customer just told me they sent it, I don't want to wait for the
+    next scheduled sweep") instead of only ever happening automatically
+    on an interval. Same underlying logic either way — see
+    rule_engine/remittance_recheck.py.
+    """
+    result = recheck_needs_remittance_rows(db, only_line_item_id=id)
+    if result.get("error"):
+        raise HTTPException(400, result["error"])
+
+    row_result = result["results"][0] if result["results"] else None
+    log_activity(db, user, action="hitl.recheck_remittance", entity_type="LineItem", entity_id=id,
+                 ip_address=_client_ip(request),
+                 metadata={"changed": bool(row_result and row_result.get("changed")),
+                           "to_rule_id": row_result.get("to_rule_id") if row_result else None})
+    db.commit()
+    return row_result or {"id": id, "changed": False, "reason": "No result produced."}
