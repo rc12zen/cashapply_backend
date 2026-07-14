@@ -21,7 +21,7 @@ from ..db.models import User
 from ..db.settings import get_settings
 from ..deps import get_db
 from .azure_validator import TokenValidationError, validate_azure_token
-from .jit_provision import jit_provision_user
+from .onboarding import is_pending_oid
 
 # authorizationUrl/tokenUrl here are informational only (used for OpenAPI docs /
 # the Swagger "Authorize" button) — this backend never issues or exchanges
@@ -52,12 +52,29 @@ async def _validate_azure_and_load_user(token: str, db: Session) -> User:
     if not azure_oid:
         raise HTTPException(status_code=401, detail="Token missing 'oid' claim")
 
+    # Invite-only (closed) onboarding — see PLAN-users-tab.md. There is NO
+    # just-in-time auto-provisioning: an unknown SSO user is rejected. A user
+    # must have been onboarded by an admin first.
     user = db.query(User).filter(User.azure_oid == azure_oid).first()
     if user is None:
-        email = claims.get("preferred_username") or claims.get("upn") or claims.get("email")
-        if not email:
-            raise HTTPException(status_code=401, detail="Token missing email/upn claim for provisioning")
-        user = jit_provision_user(db, azure_oid=azure_oid, email=email, display_name=claims.get("name"))
+        # First login for a pre-onboarded user: match by email against a row
+        # that still carries a "pending:" placeholder oid, and adopt the real
+        # Entra oid into it (keeping the admin-assigned role). Any other case
+        # (no such email, or an email already bound to a different real oid) is
+        # treated as not-onboarded.
+        email = (claims.get("preferred_username") or claims.get("upn")
+                 or claims.get("email") or "").strip().lower()
+        pending = (
+            db.query(User).filter(User.email == email).first() if email else None
+        )
+        if pending is not None and is_pending_oid(pending.azure_oid):
+            pending.azure_oid = azure_oid
+            user = pending
+        else:
+            raise HTTPException(
+                status_code=403,
+                detail="This account has not been onboarded. Contact an administrator.",
+            )
 
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account is disabled — contact an administrator")
@@ -80,11 +97,17 @@ async def get_current_user(
         from .bypass import get_bypass_user
         user = get_bypass_user(x_dev_user, db)
         if user is not None:
+            # Deactivated users can't sign in, even via the dev bypass — mirror
+            # the SSO path's is_active enforcement.
+            if not user.is_active:
+                raise HTTPException(status_code=403, detail="Account is disabled — contact an administrator")
+            user.last_login_at = dt.datetime.utcnow()
+            db.commit()
             request.state.current_user = user  # picked up by audit/middleware.py
             return user
         raise HTTPException(
             status_code=401,
-            detail=f"X-Dev-User '{x_dev_user}' is not in DEV_SSO_BYPASS_EMAILS or does not exist",
+            detail=f"'{x_dev_user}' has not been onboarded. Ask an administrator to add you in the Users tab.",
         )
 
     token = _extract_bearer_token(request)
