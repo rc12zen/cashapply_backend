@@ -30,7 +30,9 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .configs.account_loader import load_account_configs, load_bank_ou_mapping, last4_index  # noqa: F401
+from .configs.account_loader import (  # noqa: F401
+    load_account_configs, load_bank_ou_mapping, last4_index, active_recipe,
+)
 from .account_locator import extract_accounts, normalize_account, match_key
 from .ou_resolver import resolve_ou
 
@@ -123,10 +125,13 @@ def _collect_matches(filepath: str, fmt: str):
     """Return (matches, extracted_accounts).
     matches = list of (account_number, entry, recipe) whose FULL account is in the file."""
     configs = load_account_configs()
+    # recipes[fmt] is an append-only list of version objects; detection always uses
+    # the ACTIVE (latest) version. A format counts as present only when its version
+    # list is a non-empty list.
     candidates = [
-        (acct, entry, entry["recipes"][fmt])
+        (acct, entry, active_recipe(entry, fmt))
         for acct, entry in configs.items()
-        if fmt in (entry.get("recipes") or {})
+        if isinstance((entry.get("recipes") or {}).get(fmt), list) and entry["recipes"][fmt]
     ]
     if not candidates:
         return [], set()

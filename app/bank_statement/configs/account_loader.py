@@ -143,6 +143,57 @@ def last4_index() -> dict:
     return index
 
 
+def _version_list(entry: dict, fmt: str) -> list:
+    """The raw version-object list for entry.recipes[fmt], or [] if absent/malformed."""
+    versions = (entry.get("recipes") or {}).get(fmt)
+    return versions if isinstance(versions, list) else []
+
+
+def active_version(entry: dict, fmt: str) -> dict | None:
+    """Highest-`version` element of recipes[fmt], or None if the format has no versions.
+    `version` (a monotonic int) is the authoritative tie-break; `created_at` is display only."""
+    versions = _version_list(entry, fmt)
+    if not versions:
+        return None
+    return max(versions, key=lambda v: v.get("version", 0))
+
+
+def active_recipe(entry: dict, fmt: str) -> dict | None:
+    """The recipe dict of the active (latest) version for this format — what detection
+    and test use. None if the format has no versions."""
+    av = active_version(entry, fmt)
+    return av.get("recipe") if av else None
+
+
+def list_versions(entry: dict, fmt: str) -> list:
+    """All version objects for a format, newest first."""
+    return sorted(_version_list(entry, fmt), key=lambda v: v.get("version", 0), reverse=True)
+
+
+def format_summaries(entry: dict) -> list:
+    """One summary per format for the read-only Config tab UI. Carries per-version
+    metadata (version/created_at/created_by, newest first) but NOT the recipe bodies —
+    display is metadata-only; the recipe is only needed at detection/test time."""
+    summaries = []
+    for fmt in sorted((entry.get("recipes") or {}).keys()):
+        versions = list_versions(entry, fmt)
+        if not versions:
+            continue
+        summaries.append({
+            "format":         fmt,
+            "active_version": versions[0].get("version", 0),
+            "versions": [
+                {
+                    "version":    v.get("version"),
+                    "created_at": v.get("created_at"),
+                    "created_by": v.get("created_by"),
+                }
+                for v in versions
+            ],
+        })
+    return summaries
+
+
 def reload_account_configs() -> dict:
     """
     Returns a summary for a /reload response. No longer needs to clear any

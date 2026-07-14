@@ -7,116 +7,123 @@
     "currency": "GBP",
     "display_name": "Standard Chartered Bank \u2014 GBP (UK)",
     "recipes": {
-      "xlsx": {
-        "account_locator": {
-          "type": "cell",
-          "row": 1,
-          "col": 1,
-          "sheet": "Bank Statement"
-        },
-        "source": {
-          "engine": "excel",
-          "sheet": {
-            "by": "name",
-            "value": "Bank Statement"
-          },
-          "header": {
-            "row": 4,
-            "merge_rows": [
-              {
-                "row": 5,
-                "rules": [
+      "xlsx": [
+        {
+          "version": 1,
+          "created_at": "2026-07-14T06:59:09Z",
+          "created_by": "migration",
+          "recipe": {
+            "account_locator": {
+              "type": "cell",
+              "row": 1,
+              "col": 1,
+              "sheet": "Bank Statement"
+            },
+            "source": {
+              "engine": "excel",
+              "sheet": {
+                "by": "name",
+                "value": "Bank Statement"
+              },
+              "header": {
+                "row": 4,
+                "merge_rows": [
                   {
-                    "sub_value": "cr",
-                    "rename_parent_to": "Amount_Cr"
-                  },
-                  {
-                    "sub_value": "dr",
-                    "rename_parent_to": "Amount_Dr"
+                    "row": 5,
+                    "rules": [
+                      {
+                        "sub_value": "cr",
+                        "rename_parent_to": "Amount_Cr"
+                      },
+                      {
+                        "sub_value": "dr",
+                        "rename_parent_to": "Amount_Dr"
+                      }
+                    ]
                   }
                 ]
               }
+            },
+            "fields": [
+              {
+                "name": "account_number",
+                "from": {
+                  "type": "cell",
+                  "row": 1,
+                  "col": 1
+                }
+              },
+              {
+                "name": "currency",
+                "from": {
+                  "type": "cell",
+                  "row": 2,
+                  "col": 1
+                }
+              },
+              {
+                "name": "bank_name",
+                "from": {
+                  "type": "fixed",
+                  "value": "Standard Chartered Bank"
+                }
+              },
+              {
+                "name": "date",
+                "from": {
+                  "type": "column",
+                  "name": "Date"
+                }
+              },
+              {
+                "name": "narrative",
+                "from": {
+                  "type": "column",
+                  "name": "Customer Name"
+                }
+              },
+              {
+                "name": "credit_amount",
+                "from": {
+                  "type": "column",
+                  "name": "Amount_Cr"
+                }
+              },
+              {
+                "name": "bank_reference",
+                "from": {
+                  "type": "column",
+                  "name": null
+                }
+              }
+            ],
+            "credit_rule": {
+              "type": "column_not_blank",
+              "field": "credit_amount"
+            },
+            "exclusions": [
+              {
+                "type": "field_value_in",
+                "field": "narrative",
+                "values": [
+                  "Opening Balance",
+                  "Closing Balance"
+                ]
+              }
+            ],
+            "transforms": {
+              "narrative": [
+                {
+                  "type": "strip"
+                }
+              ]
+            },
+            "date_formats": [
+              "YYYY-MM-DD"
             ]
           }
-        },
-        "fields": [
-          {
-            "name": "account_number",
-            "from": {
-              "type": "cell",
-              "row": 1,
-              "col": 1
-            }
-          },
-          {
-            "name": "currency",
-            "from": {
-              "type": "cell",
-              "row": 2,
-              "col": 1
-            }
-          },
-          {
-            "name": "bank_name",
-            "from": {
-              "type": "fixed",
-              "value": "Standard Chartered Bank"
-            }
-          },
-          {
-            "name": "date",
-            "from": {
-              "type": "column",
-              "name": "Date"
-            }
-          },
-          {
-            "name": "narrative",
-            "from": {
-              "type": "column",
-              "name": "Customer Name"
-            }
-          },
-          {
-            "name": "credit_amount",
-            "from": {
-              "type": "column",
-              "name": "Amount_Cr"
-            }
-          },
-          {
-            "name": "bank_reference",
-            "from": {
-              "type": "column",
-              "name": null
-            }
-          }
-        ],
-        "credit_rule": {
-          "type": "column_not_blank",
-          "field": "credit_amount"
-        },
-        "exclusions": [
-          {
-            "type": "field_value_in",
-            "field": "narrative",
-            "values": [
-              "Opening Balance",
-              "Closing Balance"
-            ]
-          }
-        ],
-        "transforms": {
-          "narrative": [
-            {
-              "type": "strip"
-            }
-          ]
-        },
-        "date_formats": [
-          "YYYY-MM-DD"
-        ]
-      }
+        }
+      ]
     }
   },
   "914031244": {
@@ -126,88 +133,95 @@
     "currency": "USD",
     "display_name": "HSBC CashPro \u2014 USD (Southern California)",
     "recipes": {
-      "xlsx": {
-        "account_locator": {
-          "type": "column",
-          "name": "Account number"
-        },
-        "source": {
-          "engine": "excel",
-          "sheet": {
-            "by": "name",
-            "value": "Bank Statement"
-          },
-          "header": {
-            "row": 0
-          }
-        },
-        "fields": [
-          {
-            "name": "account_number",
-            "from": {
+      "xlsx": [
+        {
+          "version": 1,
+          "created_at": "2026-07-14T06:59:09Z",
+          "created_by": "migration",
+          "recipe": {
+            "account_locator": {
               "type": "column",
               "name": "Account number"
-            }
-          },
-          {
-            "name": "currency",
-            "from": {
-              "type": "column",
-              "name": "Currency"
-            }
-          },
-          {
-            "name": "bank_name",
-            "from": {
-              "type": "fixed",
-              "value": "HSBC Bank USA NA"
-            }
-          },
-          {
-            "name": "date",
-            "from": {
-              "type": "column",
-              "name": "Value date"
-            }
-          },
-          {
-            "name": "narrative",
-            "from": {
-              "type": "column",
-              "name": "Narrative"
-            }
-          },
-          {
-            "name": "credit_amount",
-            "from": {
-              "type": "column",
-              "name": "Credit amount"
-            }
-          },
-          {
-            "name": "bank_reference",
-            "from": {
-              "type": "column",
-              "name": "Bank reference"
-            }
+            },
+            "source": {
+              "engine": "excel",
+              "sheet": {
+                "by": "name",
+                "value": "Bank Statement"
+              },
+              "header": {
+                "row": 0
+              }
+            },
+            "fields": [
+              {
+                "name": "account_number",
+                "from": {
+                  "type": "column",
+                  "name": "Account number"
+                }
+              },
+              {
+                "name": "currency",
+                "from": {
+                  "type": "column",
+                  "name": "Currency"
+                }
+              },
+              {
+                "name": "bank_name",
+                "from": {
+                  "type": "fixed",
+                  "value": "HSBC Bank USA NA"
+                }
+              },
+              {
+                "name": "date",
+                "from": {
+                  "type": "column",
+                  "name": "Value date"
+                }
+              },
+              {
+                "name": "narrative",
+                "from": {
+                  "type": "column",
+                  "name": "Narrative"
+                }
+              },
+              {
+                "name": "credit_amount",
+                "from": {
+                  "type": "column",
+                  "name": "Credit amount"
+                }
+              },
+              {
+                "name": "bank_reference",
+                "from": {
+                  "type": "column",
+                  "name": "Bank reference"
+                }
+              }
+            ],
+            "credit_rule": {
+              "type": "column_not_blank",
+              "field": "credit_amount"
+            },
+            "exclusions": [],
+            "transforms": {
+              "narrative": [
+                {
+                  "type": "strip"
+                }
+              ]
+            },
+            "date_formats": [
+              "DD/MM/YYYY"
+            ]
           }
-        ],
-        "credit_rule": {
-          "type": "column_not_blank",
-          "field": "credit_amount"
-        },
-        "exclusions": [],
-        "transforms": {
-          "narrative": [
-            {
-              "type": "strip"
-            }
-          ]
-        },
-        "date_formats": [
-          "DD/MM/YYYY"
-        ]
-      }
+        }
+      ]
     }
   },
   "316097347": {
@@ -217,118 +231,125 @@
     "currency": "AUD",
     "display_name": "ANZ Bank \u2014 AUD (Australia)",
     "recipes": {
-      "xlsx": {
-        "account_locator": {
-          "type": "cell",
-          "row": 1,
-          "col": 1,
-          "sheet": "Bank Statement"
-        },
-        "source": {
-          "engine": "excel",
-          "sheet": {
-            "by": "name",
-            "value": "Bank Statement"
-          },
-          "header": {
-            "row": 5,
-            "merge_rows": [
-              {
-                "row": 6,
-                "rules": [
+      "xlsx": [
+        {
+          "version": 1,
+          "created_at": "2026-07-14T06:59:09Z",
+          "created_by": "migration",
+          "recipe": {
+            "account_locator": {
+              "type": "cell",
+              "row": 1,
+              "col": 1,
+              "sheet": "Bank Statement"
+            },
+            "source": {
+              "engine": "excel",
+              "sheet": {
+                "by": "name",
+                "value": "Bank Statement"
+              },
+              "header": {
+                "row": 5,
+                "merge_rows": [
                   {
-                    "sub_value": "cr",
-                    "rename_parent_to": "Amount_Cr"
-                  },
-                  {
-                    "sub_value": "dr",
-                    "rename_parent_to": "Amount_Dr"
+                    "row": 6,
+                    "rules": [
+                      {
+                        "sub_value": "cr",
+                        "rename_parent_to": "Amount_Cr"
+                      },
+                      {
+                        "sub_value": "dr",
+                        "rename_parent_to": "Amount_Dr"
+                      }
+                    ]
                   }
                 ]
               }
+            },
+            "fields": [
+              {
+                "name": "account_number",
+                "from": {
+                  "type": "cell",
+                  "row": 1,
+                  "col": 1
+                }
+              },
+              {
+                "name": "currency",
+                "from": {
+                  "type": "cell",
+                  "row": 2,
+                  "col": 1
+                }
+              },
+              {
+                "name": "bank_name",
+                "from": {
+                  "type": "fixed",
+                  "value": "ANZ Bank"
+                }
+              },
+              {
+                "name": "date",
+                "from": {
+                  "type": "column",
+                  "name": "Date"
+                }
+              },
+              {
+                "name": "narrative",
+                "from": {
+                  "type": "column",
+                  "name": "Customer Name"
+                }
+              },
+              {
+                "name": "credit_amount",
+                "from": {
+                  "type": "column",
+                  "name": "Amount_Cr"
+                }
+              },
+              {
+                "name": "bank_reference",
+                "from": {
+                  "type": "column",
+                  "name": null
+                }
+              }
+            ],
+            "credit_rule": {
+              "type": "column_not_blank",
+              "field": "credit_amount"
+            },
+            "exclusions": [
+              {
+                "type": "field_value_in",
+                "field": "narrative",
+                "values": [
+                  "Opening Balance",
+                  "Closing Balance"
+                ]
+              }
+            ],
+            "transforms": {
+              "narrative": [
+                {
+                  "type": "strip"
+                }
+              ]
+            },
+            "date_formats": [
+              "YYYY-MM-DD",
+              "DD-Mon-YYYY",
+              "DD-MMM-YYYY"
             ]
           }
-        },
-        "fields": [
-          {
-            "name": "account_number",
-            "from": {
-              "type": "cell",
-              "row": 1,
-              "col": 1
-            }
-          },
-          {
-            "name": "currency",
-            "from": {
-              "type": "cell",
-              "row": 2,
-              "col": 1
-            }
-          },
-          {
-            "name": "bank_name",
-            "from": {
-              "type": "fixed",
-              "value": "ANZ Bank"
-            }
-          },
-          {
-            "name": "date",
-            "from": {
-              "type": "column",
-              "name": "Date"
-            }
-          },
-          {
-            "name": "narrative",
-            "from": {
-              "type": "column",
-              "name": "Customer Name"
-            }
-          },
-          {
-            "name": "credit_amount",
-            "from": {
-              "type": "column",
-              "name": "Amount_Cr"
-            }
-          },
-          {
-            "name": "bank_reference",
-            "from": {
-              "type": "column",
-              "name": null
-            }
-          }
-        ],
-        "credit_rule": {
-          "type": "column_not_blank",
-          "field": "credit_amount"
-        },
-        "exclusions": [
-          {
-            "type": "field_value_in",
-            "field": "narrative",
-            "values": [
-              "Opening Balance",
-              "Closing Balance"
-            ]
-          }
-        ],
-        "transforms": {
-          "narrative": [
-            {
-              "type": "strip"
-            }
-          ]
-        },
-        "date_formats": [
-          "YYYY-MM-DD",
-          "DD-Mon-YYYY",
-          "DD-MMM-YYYY"
-        ]
-      }
+        }
+      ]
     }
   },
   "00130833000200016033": {
@@ -338,94 +359,101 @@
     "currency": "COP",
     "display_name": "BBVA Colombia \u2014 Historical Movements (.xls)",
     "recipes": {
-      "xls": {
-        "account_locator": {
-          "type": "cell",
-          "row": 9,
-          "col": 2
-        },
-        "source": {
-          "engine": "excel",
-          "sheet": {
-            "by": "index",
-            "value": 0
-          },
-          "header": {
-            "row": 13
-          }
-        },
-        "fields": [
-          {
-            "name": "account_number",
-            "from": {
+      "xls": [
+        {
+          "version": 1,
+          "created_at": "2026-07-14T06:59:09Z",
+          "created_by": "migration",
+          "recipe": {
+            "account_locator": {
               "type": "cell",
               "row": 9,
               "col": 2
-            }
-          },
-          {
-            "name": "currency",
-            "from": {
-              "type": "fixed",
-              "value": "COP"
-            }
-          },
-          {
-            "name": "bank_name",
-            "from": {
-              "type": "fixed",
-              "value": "BBVA Colombia"
-            }
-          },
-          {
-            "name": "date",
-            "from": {
-              "type": "column",
-              "name": "OPERATION DATE"
-            }
-          },
-          {
-            "name": "narrative",
-            "from": {
-              "type": "concat",
-              "names": [
-                "OBSERVATIONS",
-                "CONCEPT"
-              ],
-              "sep": " "
-            }
-          },
-          {
-            "name": "credit_amount",
-            "from": {
-              "type": "column",
-              "name": "AMOUNT (COP)"
-            }
-          },
-          {
-            "name": "bank_reference",
-            "from": {
-              "type": "column",
-              "name": "TRANSACTION NUMBER"
-            }
+            },
+            "source": {
+              "engine": "excel",
+              "sheet": {
+                "by": "index",
+                "value": 0
+              },
+              "header": {
+                "row": 13
+              }
+            },
+            "fields": [
+              {
+                "name": "account_number",
+                "from": {
+                  "type": "cell",
+                  "row": 9,
+                  "col": 2
+                }
+              },
+              {
+                "name": "currency",
+                "from": {
+                  "type": "fixed",
+                  "value": "COP"
+                }
+              },
+              {
+                "name": "bank_name",
+                "from": {
+                  "type": "fixed",
+                  "value": "BBVA Colombia"
+                }
+              },
+              {
+                "name": "date",
+                "from": {
+                  "type": "column",
+                  "name": "OPERATION DATE"
+                }
+              },
+              {
+                "name": "narrative",
+                "from": {
+                  "type": "concat",
+                  "names": [
+                    "OBSERVATIONS",
+                    "CONCEPT"
+                  ],
+                  "sep": " "
+                }
+              },
+              {
+                "name": "credit_amount",
+                "from": {
+                  "type": "column",
+                  "name": "AMOUNT (COP)"
+                }
+              },
+              {
+                "name": "bank_reference",
+                "from": {
+                  "type": "column",
+                  "name": "TRANSACTION NUMBER"
+                }
+              }
+            ],
+            "credit_rule": {
+              "type": "amount_positive",
+              "field": "credit_amount"
+            },
+            "exclusions": [],
+            "transforms": {
+              "narrative": [
+                {
+                  "type": "strip"
+                }
+              ]
+            },
+            "date_formats": [
+              "DD-MM-YYYY"
+            ]
           }
-        ],
-        "credit_rule": {
-          "type": "amount_positive",
-          "field": "credit_amount"
-        },
-        "exclusions": [],
-        "transforms": {
-          "narrative": [
-            {
-              "type": "strip"
-            }
-          ]
-        },
-        "date_formats": [
-          "DD-MM-YYYY"
-        ]
-      }
+        }
+      ]
     }
   },
   "000274178": {
@@ -435,88 +463,95 @@
     "currency": "USD",
     "display_name": "HSBC CashPro \u2014 USD (Zensar INC)",
     "recipes": {
-      "xlsx": {
-        "account_locator": {
-          "type": "column",
-          "name": "Account number"
-        },
-        "source": {
-          "engine": "excel",
-          "sheet": {
-            "by": "name",
-            "value": "Sheet1"
-          },
-          "header": {
-            "row": 0
-          }
-        },
-        "fields": [
-          {
-            "name": "account_number",
-            "from": {
+      "xlsx": [
+        {
+          "version": 1,
+          "created_at": "2026-07-14T06:59:09Z",
+          "created_by": "migration",
+          "recipe": {
+            "account_locator": {
               "type": "column",
               "name": "Account number"
-            }
-          },
-          {
-            "name": "currency",
-            "from": {
-              "type": "column",
-              "name": "Currency"
-            }
-          },
-          {
-            "name": "bank_name",
-            "from": {
-              "type": "fixed",
-              "value": "HSBC Bank USA NA"
-            }
-          },
-          {
-            "name": "date",
-            "from": {
-              "type": "column",
-              "name": "Value date"
-            }
-          },
-          {
-            "name": "narrative",
-            "from": {
-              "type": "column",
-              "name": "Narrative"
-            }
-          },
-          {
-            "name": "credit_amount",
-            "from": {
-              "type": "column",
-              "name": "Credit amount"
-            }
-          },
-          {
-            "name": "bank_reference",
-            "from": {
-              "type": "column",
-              "name": "Bank reference"
-            }
+            },
+            "source": {
+              "engine": "excel",
+              "sheet": {
+                "by": "name",
+                "value": "Sheet1"
+              },
+              "header": {
+                "row": 0
+              }
+            },
+            "fields": [
+              {
+                "name": "account_number",
+                "from": {
+                  "type": "column",
+                  "name": "Account number"
+                }
+              },
+              {
+                "name": "currency",
+                "from": {
+                  "type": "column",
+                  "name": "Currency"
+                }
+              },
+              {
+                "name": "bank_name",
+                "from": {
+                  "type": "fixed",
+                  "value": "HSBC Bank USA NA"
+                }
+              },
+              {
+                "name": "date",
+                "from": {
+                  "type": "column",
+                  "name": "Value date"
+                }
+              },
+              {
+                "name": "narrative",
+                "from": {
+                  "type": "column",
+                  "name": "Narrative"
+                }
+              },
+              {
+                "name": "credit_amount",
+                "from": {
+                  "type": "column",
+                  "name": "Credit amount"
+                }
+              },
+              {
+                "name": "bank_reference",
+                "from": {
+                  "type": "column",
+                  "name": "Bank reference"
+                }
+              }
+            ],
+            "credit_rule": {
+              "type": "column_not_blank",
+              "field": "credit_amount"
+            },
+            "exclusions": [],
+            "transforms": {
+              "narrative": [
+                {
+                  "type": "strip"
+                }
+              ]
+            },
+            "date_formats": [
+              "DD/MM/YYYY"
+            ]
           }
-        ],
-        "credit_rule": {
-          "type": "column_not_blank",
-          "field": "credit_amount"
-        },
-        "exclusions": [],
-        "transforms": {
-          "narrative": [
-            {
-              "type": "strip"
-            }
-          ]
-        },
-        "date_formats": [
-          "DD/MM/YYYY"
-        ]
-      }
+        }
+      ]
     }
   },
   "01250858396": {
@@ -526,105 +561,112 @@
     "currency": "GBP",
     "display_name": "Standard Chartered Bank - EUR",
     "recipes": {
-      "xlsx": {
-        "key": "_DRAFT_",
-        "account_locator": {
-          "type": "cell",
-          "row": 1,
-          "col": 1,
-          "sheet": "Bank Statement"
-        },
-        "source": {
-          "engine": "excel",
-          "sheet": {
-            "by": "name",
-            "value": "Bank Statement"
-          },
-          "header": {
-            "row": 5,
-            "merge_rows": [
-              {
-                "row": 6,
-                "rules": [
+      "xlsx": [
+        {
+          "version": 1,
+          "created_at": "2026-07-14T06:59:09Z",
+          "created_by": "migration",
+          "recipe": {
+            "key": "_DRAFT_",
+            "account_locator": {
+              "type": "cell",
+              "row": 1,
+              "col": 1,
+              "sheet": "Bank Statement"
+            },
+            "source": {
+              "engine": "excel",
+              "sheet": {
+                "by": "name",
+                "value": "Bank Statement"
+              },
+              "header": {
+                "row": 5,
+                "merge_rows": [
                   {
-                    "sub_value": "Cr",
-                    "rename_parent_to": "Amount_Cr"
-                  },
-                  {
-                    "sub_value": "Dr",
-                    "rename_parent_to": "Amount_Dr"
+                    "row": 6,
+                    "rules": [
+                      {
+                        "sub_value": "Cr",
+                        "rename_parent_to": "Amount_Cr"
+                      },
+                      {
+                        "sub_value": "Dr",
+                        "rename_parent_to": "Amount_Dr"
+                      }
+                    ]
                   }
                 ]
               }
+            },
+            "fields": [
+              {
+                "name": "date",
+                "from": {
+                  "type": "column",
+                  "name": "Date"
+                }
+              },
+              {
+                "name": "narrative",
+                "from": {
+                  "type": "column",
+                  "name": "Customer Name"
+                }
+              },
+              {
+                "name": "credit_amount",
+                "from": {
+                  "type": "column",
+                  "name": "Amount_Cr"
+                }
+              },
+              {
+                "name": "account_number",
+                "from": {
+                  "type": "cell",
+                  "row": 1,
+                  "col": 1
+                }
+              },
+              {
+                "name": "currency",
+                "from": {
+                  "type": "cell",
+                  "row": 2,
+                  "col": 1
+                }
+              },
+              {
+                "name": "bank_name",
+                "from": {
+                  "type": "fixed",
+                  "value": "Standard Chartered Bank"
+                }
+              },
+              {
+                "name": "bank_reference",
+                "from": {
+                  "type": "column",
+                  "name": null
+                }
+              }
+            ],
+            "credit_rule": {
+              "type": "column_not_blank",
+              "field": "credit_amount"
+            },
+            "exclusions": [],
+            "transforms": {},
+            "date_formats": [
+              "DD/MM/YYYY",
+              "YYYY-MM-DD",
+              "MM/DD/YYYY",
+              "DD-MM-YYYY"
             ]
           }
-        },
-        "fields": [
-          {
-            "name": "date",
-            "from": {
-              "type": "column",
-              "name": "Date"
-            }
-          },
-          {
-            "name": "narrative",
-            "from": {
-              "type": "column",
-              "name": "Customer Name"
-            }
-          },
-          {
-            "name": "credit_amount",
-            "from": {
-              "type": "column",
-              "name": "Amount_Cr"
-            }
-          },
-          {
-            "name": "account_number",
-            "from": {
-              "type": "cell",
-              "row": 1,
-              "col": 1
-            }
-          },
-          {
-            "name": "currency",
-            "from": {
-              "type": "cell",
-              "row": 2,
-              "col": 1
-            }
-          },
-          {
-            "name": "bank_name",
-            "from": {
-              "type": "fixed",
-              "value": "Standard Chartered Bank"
-            }
-          },
-          {
-            "name": "bank_reference",
-            "from": {
-              "type": "column",
-              "name": null
-            }
-          }
-        ],
-        "credit_rule": {
-          "type": "column_not_blank",
-          "field": "credit_amount"
-        },
-        "exclusions": [],
-        "transforms": {},
-        "date_formats": [
-          "DD/MM/YYYY",
-          "YYYY-MM-DD",
-          "MM/DD/YYYY",
-          "DD-MM-YYYY"
-        ]
-      }
+        }
+      ]
     }
   },
   "5800401217": {
@@ -634,87 +676,94 @@
     "currency": "USD",
     "display_name": "BOA - USD",
     "recipes": {
-      "xlsx": {
-        "key": "_DRAFT_",
-        "account_locator": {
-          "type": "column",
-          "name": "Account Number"
-        },
-        "source": {
-          "engine": "excel",
-          "sheet": {
-            "by": "name",
-            "value": "CashPro"
-          },
-          "header": {
-            "row": 5
-          }
-        },
-        "fields": [
-          {
-            "name": "date",
-            "from": {
-              "type": "column",
-              "name": "As of Date"
-            }
-          },
-          {
-            "name": "narrative",
-            "from": {
-              "type": "column",
-              "name": "Text"
-            }
-          },
-          {
-            "name": "credit_amount",
-            "from": {
-              "type": "column",
-              "name": "Amount"
-            }
-          },
-          {
-            "name": "account_number",
-            "from": {
+      "xlsx": [
+        {
+          "version": 1,
+          "created_at": "2026-07-14T06:59:09Z",
+          "created_by": "migration",
+          "recipe": {
+            "key": "_DRAFT_",
+            "account_locator": {
               "type": "column",
               "name": "Account Number"
-            }
-          },
-          {
-            "name": "currency",
-            "from": {
-              "type": "column",
-              "name": "Currency"
-            }
-          },
-          {
-            "name": "bank_name",
-            "from": {
-              "type": "column",
-              "name": "Bank ID Description"
-            }
-          },
-          {
-            "name": "bank_reference",
-            "from": {
-              "type": "column",
-              "name": "Bank Reference"
-            }
+            },
+            "source": {
+              "engine": "excel",
+              "sheet": {
+                "by": "name",
+                "value": "CashPro"
+              },
+              "header": {
+                "row": 5
+              }
+            },
+            "fields": [
+              {
+                "name": "date",
+                "from": {
+                  "type": "column",
+                  "name": "As of Date"
+                }
+              },
+              {
+                "name": "narrative",
+                "from": {
+                  "type": "column",
+                  "name": "Text"
+                }
+              },
+              {
+                "name": "credit_amount",
+                "from": {
+                  "type": "column",
+                  "name": "Amount"
+                }
+              },
+              {
+                "name": "account_number",
+                "from": {
+                  "type": "column",
+                  "name": "Account Number"
+                }
+              },
+              {
+                "name": "currency",
+                "from": {
+                  "type": "column",
+                  "name": "Currency"
+                }
+              },
+              {
+                "name": "bank_name",
+                "from": {
+                  "type": "column",
+                  "name": "Bank ID Description"
+                }
+              },
+              {
+                "name": "bank_reference",
+                "from": {
+                  "type": "column",
+                  "name": "Bank Reference"
+                }
+              }
+            ],
+            "credit_rule": {
+              "type": "flag_matches",
+              "field": "Data Type",
+              "pattern": "(?i)cr"
+            },
+            "exclusions": [],
+            "transforms": {},
+            "date_formats": [
+              "DD/MM/YYYY",
+              "YYYY-MM-DD",
+              "MM/DD/YYYY",
+              "DD-MM-YYYY"
+            ]
           }
-        ],
-        "credit_rule": {
-          "type": "flag_matches",
-          "field": "Data Type",
-          "pattern": "(?i)cr"
-        },
-        "exclusions": [],
-        "transforms": {},
-        "date_formats": [
-          "DD/MM/YYYY",
-          "YYYY-MM-DD",
-          "MM/DD/YYYY",
-          "DD-MM-YYYY"
-        ]
-      }
+        }
+      ]
     }
   },
   "083009060": {
@@ -724,84 +773,174 @@
     "currency": "USD",
     "display_name": "HDFC Bank \u2014 USD",
     "recipes": {
-      "csv": {
-        "key": "_DRAFT_",
-        "account_locator": {
-          "type": "column",
-          "name": "ABA NUMBER"
-        },
-        "source": {
-          "engine": "csv",
-          "header": {
-            "row": 0
-          },
-          "encoding": "auto",
-          "delimiter": "auto"
-        },
-        "fields": [
-          {
-            "name": "date",
-            "from": {
-              "type": "column",
-              "name": "DATE"
-            }
-          },
-          {
-            "name": "narrative",
-            "from": {
-              "type": "column",
-              "name": "REFERENCE DETAIL"
-            }
-          },
-          {
-            "name": "credit_amount",
-            "from": {
-              "type": "column",
-              "name": "AMOUNT"
-            }
-          },
-          {
-            "name": "account_number",
-            "from": {
+      "csv": [
+        {
+          "version": 1,
+          "created_at": "2026-07-14T07:21:50Z",
+          "recipe": {
+            "key": "_DRAFT_",
+            "account_locator": {
               "type": "column",
               "name": "ABA NUMBER"
-            }
+            },
+            "source": {
+              "engine": "csv",
+              "header": {
+                "row": 0
+              },
+              "encoding": "auto",
+              "delimiter": "auto"
+            },
+            "fields": [
+              {
+                "name": "date",
+                "from": {
+                  "type": "column",
+                  "name": "DATE"
+                }
+              },
+              {
+                "name": "narrative",
+                "from": {
+                  "type": "column",
+                  "name": "REFERENCE DETAIL"
+                }
+              },
+              {
+                "name": "credit_amount",
+                "from": {
+                  "type": "column",
+                  "name": "AMOUNT"
+                }
+              },
+              {
+                "name": "account_number",
+                "from": {
+                  "type": "column",
+                  "name": "ABA NUMBER"
+                }
+              },
+              {
+                "name": "currency",
+                "from": {
+                  "type": "column",
+                  "name": "CURRENCY"
+                }
+              },
+              {
+                "name": "bank_name",
+                "from": {
+                  "type": "fixed",
+                  "value": "HDFC Bank"
+                }
+              },
+              {
+                "name": "bank_reference",
+                "from": {
+                  "type": "column",
+                  "name": "REFERENCE NUMBER"
+                }
+              }
+            ],
+            "credit_rule": {
+              "type": "amount_positive",
+              "field": "AMOUNT"
+            },
+            "exclusions": [],
+            "transforms": {},
+            "date_formats": [
+              "DD/MM/YYYY",
+              "YYYY-MM-DD",
+              "MM/DD/YYYY",
+              "DD-MM-YYYY"
+            ]
           },
-          {
-            "name": "currency",
-            "from": {
-              "type": "column",
-              "name": "CURRENCY"
-            }
-          },
-          {
-            "name": "bank_name",
-            "from": {
-              "type": "fixed",
-              "value": "HDFC Bank"
-            }
-          },
-          {
-            "name": "bank_reference",
-            "from": {
-              "type": "column",
-              "name": "REFERENCE NUMBER"
-            }
-          }
-        ],
-        "credit_rule": {
-          "type": "amount_positive",
-          "field": "AMOUNT"
+          "created_by": "admin@example.com"
         },
-        "exclusions": [],
-        "transforms": {},
-        "date_formats": [
-          "DD/MM/YYYY",
-          "YYYY-MM-DD",
-          "MM/DD/YYYY",
-          "DD-MM-YYYY"
-        ]
-      }
+        {
+          "version": 2,
+          "created_at": "2026-07-14T07:23:37Z",
+          "recipe": {
+            "key": "_DRAFT_",
+            "account_locator": {
+              "type": "column",
+              "name": "ABA NUMBER"
+            },
+            "source": {
+              "engine": "csv",
+              "header": {
+                "row": 0
+              },
+              "encoding": "auto",
+              "delimiter": "auto"
+            },
+            "fields": [
+              {
+                "name": "date",
+                "from": {
+                  "type": "column",
+                  "name": "DATE"
+                }
+              },
+              {
+                "name": "narrative",
+                "from": {
+                  "type": "column",
+                  "name": "REFERENCE DETAIL"
+                }
+              },
+              {
+                "name": "credit_amount",
+                "from": {
+                  "type": "column",
+                  "name": "AMOUNT"
+                }
+              },
+              {
+                "name": "account_number",
+                "from": {
+                  "type": "column",
+                  "name": "ABA NUMBER"
+                }
+              },
+              {
+                "name": "currency",
+                "from": {
+                  "type": "column",
+                  "name": "CURRENCY"
+                }
+              },
+              {
+                "name": "bank_name",
+                "from": {
+                  "type": "fixed",
+                  "value": "HDFC Bank"
+                }
+              },
+              {
+                "name": "bank_reference",
+                "from": {
+                  "type": "column",
+                  "name": "REFERENCE NUMBER"
+                }
+              }
+            ],
+            "credit_rule": {
+              "type": "amount_positive",
+              "field": "AMOUNT"
+            },
+            "exclusions": [],
+            "transforms": {},
+            "date_formats": [
+              "DD/MM/YYYY",
+              "YYYY-MM-DD",
+              "MM/DD/YYYY",
+              "DD-MM-YYYY"
+            ]
+          },
+          "created_by": "admin@example.com"
+        }
+      ]
     }
   }
 }
