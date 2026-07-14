@@ -139,6 +139,14 @@ def build_row_detail(db: Session, record_id: int) -> dict:
         "is_cross_currency": bool(r.is_cross_currency) if hasattr(r, "is_cross_currency") else None,
         "is_cross_ledger":   bool(r.is_cross_ledger)   if hasattr(r, "is_cross_ledger")   else None,
         "is_cross_ou":       bool(getattr(r, "is_cross_ou_currency", False)),
+        # PATCH: persistent record of whether this row's CURRENT mapping
+        # came from a SPOC manually picking invoice(s) — see
+        # LineItem.manually_mapped's comment in db/models.py. Lets the
+        # frontend show "already mapped" clearly instead of re-presenting
+        # a blank picker after a successful confirm.
+        "manually_mapped":    bool(r.manually_mapped),
+        "manually_mapped_at": r.manually_mapped_at.isoformat() if r.manually_mapped_at else None,
+        "manually_mapped_by": r.manually_mapped_by,
         "bank_statement": {
             "bank_name": r.bank_name,
             "statement_date": r.statement_date.isoformat() if r.statement_date else None,

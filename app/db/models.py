@@ -241,6 +241,21 @@ class LineItem(Base):
     reason_code   = Column(String, nullable=True)
     rule_id       = Column(String, nullable=True)
 
+    # ── Manual invoice mapping tracking ───────────────────────────────────────
+    # Set by hitl/manual_mapping.py's confirm_manual_mapping() — the only
+    # persistent record of "this row's CURRENT matched_invoices/rule_id came
+    # from a SPOC hand-picking an invoice, not automatic AI/regex extraction
+    # or an automatic aging match." Previously the only trace of this was a
+    # RowStatusHistory row (trigger="manual_mapping") — a historical log
+    # entry, not something the row-detail page could read back to know
+    # "is this ALREADY manually mapped" versus "does this need mapping."
+    # That gap is exactly why the Manual Invoice Mapping card kept showing
+    # the same blank picker even after a successful confirm — nothing on
+    # the row recorded that a mapping had already happened.
+    manually_mapped    = Column(Boolean, default=False)
+    manually_mapped_at = Column(DateTime, nullable=True)
+    manually_mapped_by = Column(String, nullable=True)  # SPOC email
+
     # ── Legacy flags (kept for lib/api.ts backward-compatibility) ─────────────
     # DO NOT rename — frontend depends on these exact column names.
     is_matched        = Column(Boolean, default=False)
