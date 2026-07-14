@@ -236,6 +236,7 @@ class SaveRecipeRequest(BaseModel):
     # instead of relying on a guess that may not match the OU's real ledger.
     functional_currency: str | None = None
     storage_key: str | None = None    # (unused for keying; kept for symmetry)
+    source_filename: str | None = None  # statement file the config was built from (for the audit log)
 
 
 @router.post("/builder/save")
@@ -292,12 +293,11 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
         reload_account_configs()
         raise HTTPException(400, f"Config invalid, not saved: {e}")
 
-    if created or not overwritten:
-        # New account, or a new format recipe added to an existing account —
-        # both are "a config was created". A recipe *replace* (overwritten) is not.
-        log_activity(db, user, action="config.create", entity_type="AccountConfig",
-                     entity_id=acct, metadata={"display_name": body.display_name})
-        db.commit()  # log_activity rides caller txn; builder_save has no other DB commit
+    # Log every successful save — new config or a new version of one.
+    log_activity(db, user, action="config.create", entity_type="AccountConfig",
+                 entity_id=acct, metadata={"display_name": body.display_name,
+                                           "source_filename": body.source_filename})
+    db.commit()  # log_activity rides caller txn; builder_save has no other DB commit
 
     # ── OU mapping — bank_ou_mapping.json (last-4 keyed, the file
     #    bank_statement/ou_resolver.py's resolve_ou() actually reads) ────────

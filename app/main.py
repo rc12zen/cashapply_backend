@@ -18,7 +18,6 @@ configure_logging()  # must run before any other app import that grabs a logger 
 from .db.session import init_db
 from .db.settings import get_settings
 from .aging.watcher import start_watcher
-from .audit.middleware import ActivityLogMiddleware
 from .bff import (
     run_routes, results_routes, hitl_routes, config_routes, filters_routes,
     executive_summary, config_builder_routes, auth_routes, admin_routes,
@@ -35,13 +34,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Generic per-request activity logging (design doc §6). Registered AFTER
-# CORSMiddleware so it still wraps every real request but doesn't interfere
-# with preflight handling. Explicit log_activity() calls at domain-specific
-# points (approve/reject/upload/role-change/...) still happen inside the
-# route handlers themselves — this middleware only adds the generic
-# view/list/download coverage those calls don't already provide.
-app.add_middleware(ActivityLogMiddleware)
+# NOTE: the generic per-request ActivityLogMiddleware was removed — it flooded
+# the audit trail with "viewed/performed /api/..." request noise. Only explicit
+# domain log_activity() calls (run/config/approve/reject/upload/...) are audited now.
 
 
 @app.on_event("startup")

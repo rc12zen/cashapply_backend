@@ -34,7 +34,6 @@ router = APIRouter()
 _CATEGORIES: dict[str, dict] = {
     "analysis_run":      {"like": ["run.start%", "run.reset%"], "actor": "user"},
     "config_creation":   {"like": ["config.create%"]},
-    "system":            {"actor": "system"},                  # user_id IS NULL, any action
     "approved":          {"like": ["hitl.approve%", "oracle.retry%"]},
     "rejected":          {"like": ["hitl.reject%"]},
 }
@@ -51,6 +50,8 @@ def _summarize(r: ActivityLog, email: str | None) -> str:
         return f"{who} started an Analysis Run" + (f" on {', '.join(files)}" if files else "")
     if a.startswith("run.reset"):
         return f"{who} reset Analysis Run #{id_}"
+    if a.startswith("config.create"):
+        return f"{who} added {m.get('display_name')}" + (f" for {m.get('source_filename')}" if m.get('source_filename') else "")
     if a.startswith("statement.ingest_complete"):
         return f"Statement #{id_} processed — {m.get('new_rows', 0)} new rows, {m.get('duplicate_rows', 0)} duplicates"
     if a.startswith("statement.upload_rejected_duplicate"):
@@ -63,8 +64,6 @@ def _summarize(r: ActivityLog, email: str | None) -> str:
         return f"{who} deleted statement {id_}"
     if a.startswith("hitl.manual_mapping"):
         return f"{who} mapped line item #{id_} to invoice(s) {', '.join(m.get('invoice_numbers') or [])}"
-    if a.startswith("config.create"):
-        return f"The config for {m.get('display_name')} has been created by {who}"
     if a.startswith("hitl.approve_bulk"):
         return f"{who} approved multiple line items"
     if a.startswith("hitl.approve"):
