@@ -24,12 +24,14 @@ import json
 import dataclasses
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from ..db.models import SourceFile
+from ..db.models import SourceFile, User
 from ..deps import get_db
+from ..auth import get_optional_current_user
+from ..audit.service import log_activity
 from ..storage.client import get_storage_client
 from ..bank_statement.account_locator import extract_accounts, normalize_account, last4, match_key
 from ..bank_statement.configs.account_loader import (
@@ -237,7 +239,8 @@ class SaveRecipeRequest(BaseModel):
 
 
 @router.post("/builder/save")
-def builder_save(body: SaveRecipeRequest):
+def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
+                 user: User | None = Depends(get_optional_current_user)):
     """Save/attach a recipe. If the account exists, the recipe is added (or replaced)
     under recipes[format]; otherwise a new account entry is created. Validates the
     whole registry after writing and rolls back on failure."""
@@ -288,6 +291,13 @@ def builder_save(body: SaveRecipeRequest):
             f.write(before)
         reload_account_configs()
         raise HTTPException(400, f"Config invalid, not saved: {e}")
+
+    if created or not overwritten:
+        # New account, or a new format recipe added to an existing account —
+        # both are "a config was created". A recipe *replace* (overwritten) is not.
+        log_activity(db, user, action="config.create", entity_type="AccountConfig",
+                     entity_id=acct, metadata={"display_name": body.display_name})
+        db.commit()  # log_activity rides caller txn; builder_save has no other DB commit
 
     # ── OU mapping — bank_ou_mapping.json (last-4 keyed, the file
     #    bank_statement/ou_resolver.py's resolve_ou() actually reads) ────────
