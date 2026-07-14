@@ -36,6 +36,16 @@ class Settings(BaseSettings):
     REMITTANCE_SOURCE: Literal["local_folder", "graph_api"] = "local_folder"
     REMITTANCE_LOCAL_FOLDER: str = "./remittance_inbox_local"
 
+    # ── Remittance recheck worker (App1) ─────────────────────────────────────
+    # How often (seconds) the standalone recheck worker
+    # (tasks/remittance_recheck_worker.py) re-scans needs_remittance rows
+    # against newly-arrived remittances persisted by App2. Independent of
+    # App2's own REMITTANCE_POLL_INTERVAL_SECONDS (how often App2 checks the
+    # mailbox) — this is how often App1 checks whether any of ITS stuck rows
+    # now have a match. Set generously (default 5 min) since this is a
+    # full table scan of needs_remittance rows each run.
+    REMITTANCE_RECHECK_INTERVAL_SECONDS: int = 300
+
     # Microsoft Graph (used when REMITTANCE_SOURCE=graph_api)
     GRAPH_TENANT_ID: str | None = None
     GRAPH_CLIENT_ID: str | None = None
