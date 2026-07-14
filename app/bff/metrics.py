@@ -39,9 +39,10 @@ import datetime as dt
 
 from sqlalchemy.orm import Session
 
-from ..db.models import AnalysisRun, LineItem, RowStatusHistory, SourceFile
+from ..db.models import AnalysisRun, LineItem, RowStatusHistory
 from ..aging import aging_store
 from ..rule_engine.fx_service import _STATIC_RATE_MAP
+from .date_range import parse_date_from, parse_date_to
 
 
 # ── Category / group mapping — SINGLE SOURCE OF TRUTH ────────────────────────
@@ -134,20 +135,25 @@ def _base_query(db: Session, run_id: int | None, date_from: str | None, date_to:
         # matches what those pills mean, and matches how Analysis History's
         # own date filter already works (AnalysisRun.started_at — see
         # bff/run_routes.py's get_run_history).
-        q = q.filter(LineItem.created_at >= date_from)
+        # Parse before comparing — a raw string vs a timestamp column throws
+        # on Postgres. See bff/date_range.py.
+        q = q.filter(LineItem.created_at >= parse_date_from(date_from))
     if date_to:
-        # created_at has a real time-of-day component (unlike the old
-        # statement_date, which lands on midnight for most parsed
-        # statements) — a bare "<= date_to" would only match rows created
-        # before midnight on that date, silently excluding almost the
-        # entire day. Push the boundary to end-of-day instead.
-        end_of_day = dt.datetime.strptime(date_to, "%Y-%m-%d") + dt.timedelta(days=1) - dt.timedelta(microseconds=1)
-        q = q.filter(LineItem.created_at <= end_of_day)
+        # parse_date_to pushes the boundary to end-of-day: created_at has a
+        # real time-of-day component, so a bare "<= date_to" would exclude
+        # almost the entire day.
+        q = q.filter(LineItem.created_at <= parse_date_to(date_to))
     if bank_name:
         q = q.filter(LineItem.bank_name == bank_name)
     if business_unit:
         q = q.filter(LineItem.business_unit == business_unit)
-    if run_by:
+    if run_by and not run_id:
+        # Skip when run_id is already set ("Last Analysis" pill): run_id pins
+        # one specific run, which already has exactly one triggered_by. ANDing
+        # run_by on top only ever narrows to that same run (redundant) or,
+        # far more often, zeroes every row out (whenever the selected user
+        # didn't happen to start that exact latest run) — making the whole
+        # dashboard look broken every time the User dropdown changes.
         # PATCH: was RowStatusHistory.triggered_by ("approved_by") — that
         # only exists once a human has actually clicked Approve/Reject on
         # at least one row, so the User dropdown stayed empty for every
@@ -182,14 +188,18 @@ def compute_metrics(db: Session, run_id: int | None = None, date_from: str | Non
 
     groups = _group_counts(rows)
 
-    # Bank statements — scoped to the run when run_id is known
-    if run_id:
-        run_obj = db.query(AnalysisRun).filter(AnalysisRun.run_id == run_id).first()
-        total_statements = len(run_obj.selected_files) if run_obj and run_obj.selected_files else 0
+    # Bank statements analysed within the filtered scope — sum the
+    # selected_files of every run represented in the filtered rows. Unifies
+    # run-scoped ("Last Analysis") and date/bank/BU/user modes; empty scope -> 0.
+    # ponytail: bank/BU filter narrows rows (hence runs) but selected_files is
+    # per-run, not per-bank — so this over-counts a multi-bank run's files under
+    # a bank filter. Add a LineItem->source_file_id FK for exact per-bank counts.
+    run_ids = {r.run_id for r in rows if r.run_id is not None}
+    if run_ids:
+        runs = db.query(AnalysisRun).filter(AnalysisRun.run_id.in_(run_ids)).all()
+        total_statements = sum(len(ro.selected_files or []) for ro in runs)
     else:
-        total_statements = db.query(SourceFile).filter(
-            SourceFile.kind == "bank_statement", SourceFile.archived.is_(False)
-        ).count()
+        total_statements = 0
 
     return {
         # ── Legacy fields — unchanged, kept for backward compatibility ──────
