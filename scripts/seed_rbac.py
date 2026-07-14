@@ -23,8 +23,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.db.session import session_scope  # noqa: E402
 from app.db.models import Permission, Role, RolePermission, User  # noqa: E402
+from app.auth.onboarding import pending_oid  # noqa: E402
 
 # role_name -> [permission codes]. "*" = every permission (Administrator).
+# NOTE: "user:manage" gates the admin Users tab. Administrator holds "*", which
+# already satisfies every check, so listing it here is for catalog completeness
+# and explicit intent — no other role gets it.
 ROLE_PERMISSIONS: dict[str, list[str]] = {
     "Administrator": ["*"],
     "Analyst": ["statement:upload", "run:start", "run:view", "hitl:reject"],
@@ -40,7 +44,8 @@ ALL_PERMISSION_CODES = sorted({
     if code != "*"
 } | {
     "statement:upload", "run:start", "run:view", "oracle:post", "oracle:retry",
-    "hitl:reject", "report:download", "activity_log:view", "dashboard:view", "*",
+    "hitl:reject", "report:download", "activity_log:view", "dashboard:view",
+    "user:manage", "*",
 })
 
 
@@ -93,8 +98,16 @@ def seed_dev_user(email: str, role_name: str, azure_oid: str | None = None) -> N
             print(f"Updated existing user {email} -> role {role_name}")
             return
 
+        # Placeholder azure_oid = "pending:<email>" (same scheme the Users tab
+        # uses for onboarding). This matters for the FIRST-admin bootstrap on a
+        # production/SSO deployment: on that admin's first real SSO login, the
+        # reconciliation path (app/auth/dependencies.py) matches by email and
+        # adopts their real Entra oid — but ONLY for "pending:" placeholders. A
+        # non-pending oid (the old "local-dev-*") would leave the seeded admin
+        # locked out in prod. Local bypass identifies users by email, so this
+        # placeholder works there too.
         db.add(User(
-            azure_oid=azure_oid or f"local-dev-{email}",
+            azure_oid=azure_oid or pending_oid(email),
             email=email.lower(),
             display_name=email.split("@")[0].title(),
             role_id=role.id,

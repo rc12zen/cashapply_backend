@@ -13,6 +13,16 @@ SAFETY CONTRACT — read before touching this file:
   3. Do not add a "bypass in prod if a magic header is present" fallback of
      any kind, no matter how tempting during an incident. Use a real Azure
      test account for that instead.
+
+ALLOWLIST NOTE:
+  This used to ALSO require the email to be in DEV_SSO_BYPASS_EMAILS. With the
+  invite-only Users tab, the Users table IS the allowlist — only emails an admin
+  has onboarded exist as rows, so an unknown email resolves to None here anyway.
+  The env allowlist was therefore redundant friction (every onboarded user had
+  to be hand-added to .env before they could log in locally), so it was dropped.
+  DEV_SSO_BYPASS_EMAILS is now unused/legacy. The caller (dependencies.py) still
+  enforces `is_active`, so deactivated users cannot bypass-login. This only
+  affects local dev — the prod SSO path is unchanged.
 """
 from __future__ import annotations
 
@@ -32,12 +42,6 @@ def get_bypass_user(x_dev_user: str | None, db: Session) -> User | None:
     if not x_dev_user:
         return None
 
-    allowed = {
-        e.strip().lower()
-        for e in (settings.DEV_SSO_BYPASS_EMAILS or "").split(",")
-        if e.strip()
-    }
-    if x_dev_user.strip().lower() not in allowed:
-        return None
-
+    # The Users table is the allowlist: an email that hasn't been onboarded has
+    # no row and returns None. is_active is enforced by the caller.
     return db.query(User).filter(User.email == x_dev_user.strip().lower()).first()
