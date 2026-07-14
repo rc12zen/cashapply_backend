@@ -63,6 +63,16 @@ def check_duplicate_file(db: Session, file_hash: str) -> dict | None:
         "uploaded_at": existing.uploaded_at.isoformat() if existing.uploaded_at else None,
         "existing_source_file_id": existing.source_file_id,
         "existing_file_archived": bool(source.archived) if source else False,
+        # PATCH: lets handle_statement_upload_v2() distinguish "this exact
+        # file was already successfully ingested" from "this exact file was
+        # uploaded before but ingestion never succeeded" (most commonly:
+        # no bank config existed yet). Without this, a file that failed
+        # only because a config was missing became a permanently-dead
+        # hash — re-uploading the identical bytes always hit this duplicate
+        # branch and was rejected outright, even after the user went and
+        # created the config that would let it succeed this time.
+        "existing_ingest_status": source.ingest_status if source else None,
+        "existing_ingest_error": source.ingest_error if source else None,
         "existing_run_id": prior_run.run_id if prior_run else None,
         "history_link": (
             f"/analysis-history/row/{prior_run.run_id}" if prior_run else "/analysis-history"
