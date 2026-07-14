@@ -104,6 +104,43 @@ def handle_statement_upload_v2(db: Session, filename: str, data: bytes, uploaded
                 "ingest_status": source.ingest_status,
                 "message": f'"{filename}" was previously removed but is now restored to your Account Statements list.',
             }
+
+        # PATCH: the file is still active (never archived), but its ONLY
+        # prior ingestion attempt failed — most commonly because no bank
+        # config existed yet for this account/format at the time. The user
+        # may have since created one via the Config Builder wizard.
+        #
+        # Without this branch, re-uploading the identical bytes always fell
+        # through to the flat "duplicate, blocked" response below — a dead
+        # end, since the same file_hash can never take the normal "new
+        # upload" path again, and creating a config alone (builder_save())
+        # never touches this SourceFile row or re-triggers ingestion.
+        #
+        # Fix: reuse the existing row, reset it back to "processing", and
+        # return duplicate=False so the route defers ingest_statement_task
+        # again. detect_config() runs fresh inside ingest_and_parse(), so if
+        # a config now exists, this succeeds and rows are finally parsed —
+        # no new SourceFile row or file_hash entry needed, since the bytes
+        # (and the storage key they were saved under) haven't changed.
+        if dup.get("existing_ingest_status") == "error":
+            source = db.query(SourceFile).get(dup["existing_source_file_id"])
+            source.ingest_status = "processing"
+            source.ingest_error = None
+            log_activity(db, uploaded_by, action="statement.upload_retry_after_error",
+                         entity_type="SourceFile", entity_id=source.id,
+                         metadata={"file_hash": file_hash, "filename": filename,
+                                   "prior_error": dup.get("existing_ingest_error")})
+            db.commit()
+            db.refresh(source)
+            return {
+                "duplicate": False,
+                "retried": True,
+                "source_file_id": source.id,
+                "filename": source.filename,
+                "ingest_status": source.ingest_status,
+                "message": f'"{filename}" previously failed to process (no config existed yet) — retrying now.',
+            }
+
         log_activity(db, uploaded_by, action="statement.upload_rejected_duplicate",
                      entity_type="SourceFile", entity_id=dup["existing_source_file_id"],
                      status="failure", metadata={"file_hash": file_hash, "filename": filename})

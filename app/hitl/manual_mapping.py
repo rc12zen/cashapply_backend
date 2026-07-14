@@ -30,6 +30,8 @@ visually verified the customer/invoice against the aging report itself.
 """
 from __future__ import annotations
 
+import datetime as dt
+
 from sqlalchemy.orm import Session
 
 from ..db.models import LineItem, RowStatusHistory, User
@@ -208,6 +210,16 @@ def confirm_manual_mapping(
     r.is_matched     = True
     r.current_state  = "review_approve"  # same state automatic ready_for_oracle rows sit in, awaiting Approve
     r.status         = "Ready for Oracle (Manual Mapping)"
+
+    # PATCH: persistent record that THIS row's current mapping came from a
+    # SPOC, not automatic extraction — see the LineItem.manually_mapped
+    # field comment in db/models.py for why this matters (previously the
+    # only trace was a RowStatusHistory log entry, unreadable by the
+    # row-detail page, which is why the Manual Mapping card couldn't tell
+    # "already mapped" apart from "needs mapping").
+    r.manually_mapped    = True
+    r.manually_mapped_at = dt.datetime.utcnow()
+    r.manually_mapped_by = user.email if user else None
 
     db.add(RowStatusHistory(
         line_item_id=r.id, from_state=from_state, to_state=r.current_state,
