@@ -21,7 +21,7 @@ from __future__ import annotations
 import datetime as dt
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
-from sqlalchemy import desc
+from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
 
 from ..db.models import AnalysisRun, BankAccount, LineItem, RunStatus, SourceFile, StatementTransactionRow, User
@@ -132,11 +132,31 @@ def get_pending_by_account(db: Session = Depends(get_db), user: User = Depends(r
                 )
                 .count()
             )
+            # PATCH: distinguish "genuinely unrecognised" from "recognised,
+            # but every row here has already been through a run" — the
+            # latter is the re-upload-of-an-already-processed-statement
+            # case (rows survive row_hash dedup and land back on this same
+            # account with consumed_by_run_id already set, even though the
+            # newly-uploaded file itself is a different byte-for-byte file
+            # than whatever was uploaded originally). Only computed when
+            # there's nothing left pending, since that's the only time the
+            # frontend needs it — avoids an extra query per runnable account.
+            group["last_consumed_run_id"] = None
+            if group["pending_row_count"] == 0:
+                group["last_consumed_run_id"] = (
+                    db.query(func.max(StatementTransactionRow.consumed_by_run_id))
+                    .filter(
+                        StatementTransactionRow.bank_account_id == key,
+                        StatementTransactionRow.consumed_by_run_id.isnot(None),
+                    )
+                    .scalar()
+                )
         else:
             # No resolved account (e.g. account number missing at ingest) —
             # fall back to summing the per-file snapshot, same fallback
             # rule the orchestrator itself uses for these files.
             group["pending_row_count"] = sum(fi["new_row_count"] or 0 for fi in group["files"])
+            group["last_consumed_run_id"] = None
 
     return {"accounts": list(groups.values())}
 
