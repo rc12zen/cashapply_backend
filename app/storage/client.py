@@ -145,7 +145,7 @@ def get_storage_client() -> StorageClient:
     if _client_singleton is not None:
         return _client_singleton
     s = get_settings()
-    if s.ENVIRONMENT == "azure":
+    if s.STORAGE_BACKEND == "azure":
         _client_singleton = AzureBlobStorageClient(
             connection_string=s.AZURE_STORAGE_CONNECTION_STRING,
             account_url=s.AZURE_STORAGE_ACCOUNT_URL,

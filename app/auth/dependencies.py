@@ -93,7 +93,11 @@ async def get_current_user(
     settings = get_settings()
 
     # Guard #1 — bypass module is only ever imported inside this branch.
-    if settings.ENVIRONMENT == "local" and x_dev_user:
+    # Gated on APP_ENV (deployment tier), NOT STORAGE_BACKEND — a UAT/PROD
+    # deployment can use local disk storage while still requiring real
+    # Azure AD tokens here (see db/settings.py's docstring for why these
+    # were split).
+    if settings.APP_ENV == "local" and x_dev_user:
         from .bypass import get_bypass_user
         user = get_bypass_user(x_dev_user, db)
         if user is not None:

@@ -71,6 +71,7 @@ def get_files(db: Session = Depends(get_db), user: User = Depends(require_permis
             "ou_number": r.ou_number or "",
             "source_file_id": r.id,
             "ingest_status": r.ingest_status,
+            "ingest_error": r.ingest_error,
             "new_row_count": r.new_row_count,
             "duplicate_row_count": r.duplicate_row_count,
         })

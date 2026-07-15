@@ -40,7 +40,7 @@ def generate_presigned_read_url(bucket: str, key: str, expires_in_seconds: int =
     from ..db.settings import get_settings
     s = get_settings()
 
-    if s.ENVIRONMENT == "azure":
+    if s.STORAGE_BACKEND == "azure":
         from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
         sas = generate_blob_sas(
             account_name=s.AZURE_STORAGE_ACCOUNT_URL.split(".")[0].replace("https://", "") if s.AZURE_STORAGE_ACCOUNT_URL else "",

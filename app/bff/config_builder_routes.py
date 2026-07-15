@@ -6,6 +6,7 @@ Config Builder + account-config management for the account-based engine.
   GET    /builder/raw-preview/{filename}   — raw cell grid for the wizard
   POST   /builder/locate-account           — live-extract account(s) via a locator draft
   POST   /builder/test                     — test a *draft recipe* against a file
+  GET    /builder/available-ous            — OU/BU picklist for the wizard's OU step
   POST   /builder/save                     — save a recipe (create account / add format recipe)
   GET    /builder/accounts                 — list accounts (Manage + Clone-from-existing)
   GET    /builder/account/{account_number} — full account entry (for cloning)
@@ -14,54 +15,44 @@ Config Builder + account-config management for the account-based engine.
   POST   /test-existing                    — test a *saved* recipe against a file
   GET    /detect/{filename}                — re-detect + list matching accounts
 
-Config store is JSON only: account_configs.json (+ account_ou_map.json).
+DB-BACKED (was JSON only). account_configs.json, bank_ou_mapping.json,
+account_ou_map.json and ou_functional_currency.json are no longer read or
+written anywhere in this module. OU + Business Unit are captured here at
+save time as a real relationship — BankAccount.ou_id -> OrganizationUnit —
+via _get_or_create_organization_unit()/_get_or_create_bank_account() below,
+and recipes are versioned rows in AccountConfigRecipe. This is now the
+single place account configs are created; everything downstream (detector,
+parser, ou_resolver, fx_service) reads the same DB rows through
+bank_statement/configs/account_loader.py.
 Register under /api/config alongside config_routes.
 """
 from __future__ import annotations
 
 import os
-import json
+import logging
 import dataclasses
 import datetime as dt
-from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from ..db.models import SourceFile, User
+from ..db.models import SourceFile, User, BankAccount, OrganizationUnit, AccountConfigRecipe
 from ..deps import get_db
 from ..auth import get_optional_current_user
 from ..audit.service import log_activity
 from ..storage.client import get_storage_client
+from ..common.errors import AppError
 from ..bank_statement.account_locator import extract_accounts, normalize_account, last4, match_key
 from ..bank_statement.configs.account_loader import (
     load_account_configs, load_account_ou_map, reload_account_configs,
     active_recipe, format_summaries,
 )
+from ..aging import aging_store
 
 router = APIRouter()
+logger = logging.getLogger("cashapply.config_builder")
 
-_CFG_DIR = Path(__file__).parent.parent / "bank_statement" / "configs"
-_ACCOUNT_CONFIGS_PATH = _CFG_DIR / "account_configs.json"
-# BUGFIX: this used to point at account_ou_map.json — a legacy, full-account-
-# keyed file that NOTHING in the active OU-resolution path reads.
-# bank_statement/ou_resolver.py's resolve_ou() (the function every real
-# detection actually calls) reads load_bank_ou_mapping() ->
-# bank_ou_mapping.json, keyed by last-4, not account_ou_map.json. Every OU
-# mapping saved via this wizard was silently going into a dead file — the
-# save succeeded with no error, but the account's OU would never actually
-# resolve during a real analysis run. See account_loader.py's own comment:
-# "do not replace with account_ou_map.json ... which had wrong OU names."
-_OU_MAP_PATH = _CFG_DIR / "bank_ou_mapping.json"
-# Separate registry fx_service.py actually uses for functional currency +
-# the Oracle "NAME(ou)" BusinessUnit display string — see
-# rule_engine/fx_service.py's get_functional_currency()/get_ou_display_name().
-# Onboarding an account for a genuinely NEW ou_number needs an entry here
-# too, or FX Leg 2 resolution and the Oracle payload's BusinessUnit field
-# both silently fail for that OU until someone edits this file by hand
-# (its own comment says exactly that: "Add new OUs here when onboarded.").
-_OU_FUNCTIONAL_CURRENCY_PATH = Path(__file__).parent.parent / "rule_engine" / "configs" / "ou_functional_currency.json"
 _STATEMENT_BUCKET = "bank-statements"
 _FMT_ALIASES = {"xlsm": "xlsx", "txt": "csv"}
 
@@ -91,13 +82,6 @@ def _local_path_by_key(db: Session, storage_key: str) -> tuple[SourceFile, str]:
 def _file_format(filename: str) -> str:
     ext = os.path.splitext(filename)[1].lower().lstrip(".")
     return _FMT_ALIASES.get(ext, ext)
-
-
-def _read_raw(path: Path) -> dict:
-    if not path.exists():
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
 
 
 def _test_recipe(local_path: str, recipe: dict, key: str, filename: str) -> dict:
@@ -190,7 +174,10 @@ def builder_raw_preview(filename: str, db: Session = Depends(get_db)):
                 sheets.append({"name": sh, "rows": rows})
             wb.close()
         except Exception as e:
-            raise HTTPException(500, f"Could not read xlsx: {e}")
+            logger.exception("raw-preview: failed to read xlsx %s", filename)
+            raise AppError(422, "Could not read this file",
+                            f"'{filename}' doesn't look like a valid Excel (.xlsx) file — "
+                            f"it may be corrupted or actually be a different format ({e.__class__.__name__}).")
     elif ext == "xls":
         try:
             import xlrd
@@ -205,7 +192,10 @@ def builder_raw_preview(filename: str, db: Session = Depends(get_db)):
                     rows.append(row)
                 sheets.append({"name": sh, "rows": rows})
         except Exception as e:
-            raise HTTPException(500, f"Could not read xls: {e}")
+            logger.exception("raw-preview: failed to read xls %s", filename)
+            raise AppError(422, "Could not read this file",
+                            f"'{filename}' doesn't look like a valid legacy Excel (.xls) file — "
+                            f"it may be corrupted or actually be a different format ({e.__class__.__name__}).")
     elif ext in ("csv", "txt"):
         try:
             import csv
@@ -214,9 +204,14 @@ def builder_raw_preview(filename: str, db: Session = Depends(get_db)):
                         for i, row in enumerate(csv.reader(f)) if i < MAX_ROWS]
             sheets.append({"name": "Sheet1", "rows": rows})
         except Exception as e:
-            raise HTTPException(500, f"Could not read csv: {e}")
+            logger.exception("raw-preview: failed to read csv %s", filename)
+            raise AppError(422, "Could not read this file",
+                            f"'{filename}' could not be parsed as a CSV file "
+                            f"({e.__class__.__name__}). Check the file isn't empty or binary.")
     else:
-        raise HTTPException(400, f"Unsupported extension: .{ext}")
+        raise AppError(400, "Unsupported file type",
+                        f"Files with a '.{ext}' extension aren't supported here — "
+                        f"upload an xlsx, xls, csv, or txt bank statement.")
 
     return {"filename": filename, "storage_key": record.storage_key, "extension": ext, "sheets": sheets}
 
@@ -265,6 +260,44 @@ def builder_test(body: BuilderTestRequest, db: Session = Depends(get_db)):
     return _test_recipe(local_path, body.config_draft, body.config_draft.get("key", "_DRAFT_"), _record.filename)
 
 
+# ── OU/BU picklist for the wizard's OU step ────────────────────────────────────
+
+@router.get("/builder/available-ous")
+def available_ous(db: Session = Depends(get_db)):
+    """
+    OUs the wizard's OU/Business Unit step can offer, so onboarding an
+    account picks from a real, known OU instead of free-typing one that
+    might not exist. Two sources, merged:
+      1. OUs already onboarded (OrganizationUnit table) — these have a
+         known business_unit name + functional_currency already.
+      2. OU numbers seen in the currently loaded aging report (the
+         authoritative Oracle feed — aging_store's AgingMap.ou_numbers())
+         that AREN'T onboarded yet. These show up with business_unit=None
+         so the wizard prompts for the name once, on first use.
+    """
+    known: dict[str, dict] = {}
+    for ou in db.query(OrganizationUnit).filter(OrganizationUnit.active.is_(True)).all():
+        known[ou.ou_number] = {
+            "ou_number": ou.ou_number,
+            "business_unit": ou.ou_name,
+            "functional_currency": ou.functional_currency,
+            "known": True,
+        }
+
+    aging_map = aging_store.get_aging_map()
+    if aging_map is not None:
+        for ou_number in aging_map.ou_numbers:
+            if ou_number and ou_number not in known:
+                known[ou_number] = {
+                    "ou_number": ou_number,
+                    "business_unit": None,
+                    "functional_currency": None,
+                    "known": False,
+                }
+
+    return {"ous": sorted(known.values(), key=lambda o: o["ou_number"])}
+
+
 # ── save a recipe (create account or add a format recipe under an existing one) ──
 
 class SaveRecipeRequest(BaseModel):
@@ -274,16 +307,17 @@ class SaveRecipeRequest(BaseModel):
     recipe: dict                      # account_locator + source + fields + credit_rule + …
     bank: str | None = None
     currency: str | None = None
-    ou_number: str | None = None
-    business_unit: str | None = None
+    # OU + Business Unit are now REQUIRED — every account config must be
+    # linked to a real OrganizationUnit, never saved "OU unknown". This is
+    # what makes OU/BU a relationship (BankAccount.ou_id -> OrganizationUnit)
+    # instead of an optional free-text afterthought.
+    ou_number: str
+    business_unit: str
     # Ledger/functional currency for this OU — required for Oracle FX Leg 2
     # resolution (rule_engine/fx_service.py's get_functional_currency()).
     # Only used if ou_number is genuinely new (see builder_save); falls
     # back to `currency` (the bank account's own statement currency) if
-    # left blank, matching the same best-effort default
-    # ingestion/ingest_service.py's auto-provisioning already uses — but
-    # exposed here so a human can set it correctly at onboarding time
-    # instead of relying on a guess that may not match the OU's real ledger.
+    # left blank.
     functional_currency: str | None = None
     storage_key: str | None = None    # (unused for keying; kept for symmetry)
     # Best-effort author of this version, read from the login_user_email_stub
@@ -292,122 +326,121 @@ class SaveRecipeRequest(BaseModel):
     created_by: str | None = None
 
 
+def _get_or_create_organization_unit(db: Session, ou_number: str, business_unit: str,
+                                       functional_currency: str | None) -> OrganizationUnit:
+    ou_number = ou_number.strip()
+    business_unit = business_unit.strip()
+    ou = db.query(OrganizationUnit).filter(OrganizationUnit.ou_number == ou_number).first()
+    if ou is None:
+        ou = OrganizationUnit(
+            ou_number=ou_number,
+            ou_name=business_unit,
+            functional_currency=(functional_currency or "USD").upper(),
+        )
+        db.add(ou)
+        db.flush()
+    elif business_unit and ou.ou_name != business_unit:
+        # Onboarding this account corrected/updated the BU name for an
+        # already-known OU — keep it in sync rather than silently ignoring
+        # what the person just typed.
+        ou.ou_name = business_unit
+    return ou
+
+
+def _get_or_create_bank_account(db: Session, acct: str, body: "SaveRecipeRequest",
+                                  ou: OrganizationUnit) -> tuple[BankAccount, bool]:
+    """Returns (bank_account, created)."""
+    existing = (
+        db.query(BankAccount)
+        .filter(BankAccount.account_number == acct, BankAccount.bank_name == (body.bank or "UNKNOWN"))
+        .first()
+    )
+    if existing:
+        existing.display_name = body.display_name
+        existing.account_last4 = last4(acct)
+        if body.currency:
+            existing.currency = body.currency
+        if existing.ou_id != ou.id:
+            existing.ou_id = ou.id
+        return existing, False
+
+    account = BankAccount(
+        ou_id=ou.id,
+        account_number=acct,
+        account_last4=last4(acct),
+        display_name=body.display_name,
+        bank_name=body.bank or "UNKNOWN",
+        bank_config_key=acct,
+        currency=body.currency,
+    )
+    db.add(account)
+    db.flush()
+    return account, True
+
+
 @router.post("/builder/save")
 def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
                  user: User | None = Depends(get_optional_current_user)):
-    """Save/attach a recipe. If the account exists, the recipe is added (or replaced)
-    under recipes[format]; otherwise a new account entry is created. Validates the
-    whole registry after writing and rolls back on failure."""
+    """Save/attach a recipe. If the account exists, a new recipe version is added
+    for the format; otherwise a new account is created — always linked to a real
+    OrganizationUnit (OU + Business Unit), never saved without one."""
     acct = str(body.account_number).strip()
     if not acct:
-        raise HTTPException(400, "Account number is required")
+        raise AppError(400, "Account number required", "Enter the bank account number before saving.")
     if not body.display_name.strip():
-        raise HTTPException(400, "Display name is required")
+        raise AppError(400, "Display name required", "Give this account a display name before saving.")
     fmt = _FMT_ALIASES.get(body.format.lower(), body.format.lower())
     if fmt not in ("xlsx", "xls", "csv", "pdf"):
-        raise HTTPException(400, f"Unsupported format '{body.format}'")
+        raise AppError(400, "Unsupported file format",
+                        f"'{body.format}' isn't supported — use xlsx, xls, csv, or pdf.")
     if not body.recipe.get("account_locator"):
-        raise HTTPException(400, "Recipe must include an account_locator")
+        raise AppError(400, "Recipe incomplete",
+                        "This recipe has no account locator — go back to the Account step and try again.")
+    if not body.ou_number.strip():
+        raise AppError(400, "Organization Unit required",
+                        "Choose the Organization Unit this account belongs to before saving.")
+    if not body.business_unit.strip():
+        raise AppError(400, "Business Unit required",
+                        "Enter the Business Unit name for this Organization Unit before saving.")
 
-    raw = _read_raw(_ACCOUNT_CONFIGS_PATH)
-    before = json.dumps(raw)
-
-    created_at = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-    created_by = (body.created_by or "").strip() or None
-
-    def _version_obj(version: int) -> dict:
-        obj = {"version": version, "created_at": created_at, "recipe": body.recipe}
-        if created_by:
-            obj["created_by"] = created_by
-        return obj
-
-    entry = raw.get(acct) if not acct.startswith("_") else None
-    created = False          # brand-new account
-    format_created = False   # first recipe for this format on an existing account
-    if isinstance(entry, dict):
-        recipes = entry.setdefault("recipes", {})
-        existing = recipes.get(fmt)
-        if isinstance(existing, list) and existing:
-            # Append a new version — never replace. version = max existing + 1.
-            next_version = max((v.get("version", 0) for v in existing), default=0) + 1
-            existing.append(_version_obj(next_version))
-        else:
-            # Format absent (or malformed) → start its version list at 1.
-            format_created = True
-            recipes[fmt] = [_version_obj(1)]
-            next_version = 1
-        entry["display_name"] = body.display_name
-        entry["account_last4"] = last4(acct)
-        if body.bank:     entry["bank"] = body.bank
-        if body.currency: entry["currency"] = body.currency
-        entry["account_number"] = acct
-    else:
-        created = True
-        format_created = True
-        next_version = 1
-        raw[acct] = {
-            "account_number": acct,
-            "account_last4":  last4(acct),
-            "bank":           body.bank or "",
-            "currency":       body.currency or "",
-            "display_name":   body.display_name,
-            "recipes":        {fmt: [_version_obj(1)]},
-        }
-
-    # write + validate, roll back on failure
-    with open(_ACCOUNT_CONFIGS_PATH, "w", encoding="utf-8") as f:
-        json.dump(raw, f, indent=2)
     try:
-        reload_account_configs()
+        ou = _get_or_create_organization_unit(db, body.ou_number, body.business_unit, body.functional_currency)
+        account, created = _get_or_create_bank_account(db, acct, body, ou)
+
+        existing_versions = (
+            db.query(AccountConfigRecipe)
+            .filter(AccountConfigRecipe.bank_account_id == account.id, AccountConfigRecipe.format == fmt)
+            .all()
+        )
+        format_created = not existing_versions
+        next_version = max((v.version for v in existing_versions), default=0) + 1
+
+        recipe_row = AccountConfigRecipe(
+            bank_account_id=account.id,
+            format=fmt,
+            version=next_version,
+            recipe=body.recipe,
+            created_by=(body.created_by or "").strip() or None,
+        )
+        db.add(recipe_row)
+
+        if user is not None:
+            action = "config.create" if (created or format_created) else "config.version_added"
+            log_activity(db, user, action=action, entity_type="AccountConfig",
+                         entity_id=acct,
+                         metadata={"display_name": body.display_name, "format": fmt, "version": next_version,
+                                   "ou_number": ou.ou_number, "business_unit": ou.ou_name})
+
+        db.commit()
+    except AppError:
+        db.rollback()
+        raise
     except Exception as e:
-        with open(_ACCOUNT_CONFIGS_PATH, "w", encoding="utf-8") as f:
-            f.write(before)
-        reload_account_configs()
-        raise HTTPException(400, f"Config invalid, not saved: {e}")
-
-    # Audit. A new account or a brand-new format recipe is a "create"; adding a
-    # further version to an existing format is an update. (The old `overwritten`
-    # variable no longer exists in the versioned save — appends never replace.)
-    if user is not None:
-        action = "config.create" if (created or format_created) else "config.version_added"
-        log_activity(db, user, action=action, entity_type="AccountConfig",
-                     entity_id=acct,
-                     metadata={"display_name": body.display_name, "format": fmt, "version": next_version})
-        db.commit()  # log_activity rides caller txn; builder_save has no other DB commit
-
-    # ── OU mapping — bank_ou_mapping.json (last-4 keyed, the file
-    #    bank_statement/ou_resolver.py's resolve_ou() actually reads) ────────
-    if body.ou_number:
-        ou_number = body.ou_number.strip()
-        business_unit = (body.business_unit or "").strip()
-        ou_display = f"{business_unit}({ou_number})" if business_unit else ou_number
-
-        ou_map = _read_raw(_OU_MAP_PATH)
-        ou_map[last4(acct)] = {
-            "ou": ou_display,
-            "ou_number": ou_number,
-            "bank": body.bank or "",
-            "bank_config": acct,
-        }
-        with open(_OU_MAP_PATH, "w", encoding="utf-8") as f:
-            json.dump(ou_map, f, indent=2)
-
-        # ── ou_functional_currency.json — the SEPARATE, ou_number-keyed
-        #    registry rule_engine/fx_service.py actually reads for FX Leg 2
-        #    resolution and the Oracle payload's BusinessUnit field. Only
-        #    write here if this OU is genuinely new — never silently
-        #    overwrite an existing, presumably-correct entry with a guess.
-        func_ccy_map = _read_raw(_OU_FUNCTIONAL_CURRENCY_PATH)
-        if ou_number not in func_ccy_map:
-            func_ccy_map[ou_number] = {
-                "ou": ou_display,
-                "country": "",
-                "functional_currency": (body.functional_currency or body.currency or "USD").upper(),
-            }
-            with open(_OU_FUNCTIONAL_CURRENCY_PATH, "w", encoding="utf-8") as f:
-                json.dump(func_ccy_map, f, indent=2)
-
-        reload_account_configs()
+        db.rollback()
+        logger.exception("builder_save failed for account %s", acct)
+        raise AppError(400, "Could not save this config",
+                        f"The account or recipe data didn't save ({e.__class__.__name__}). "
+                        f"Nothing was changed — check the recipe fields and try again.")
 
     if created:
         message = f"Created account {acct} with {fmt} recipe (v1)."
@@ -424,6 +457,8 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
         "format_created": format_created,
         "appended": not created and not format_created,
         "version": next_version,
+        "ou_number": ou.ou_number,
+        "business_unit": ou.ou_name,
         "message": message,
     }
 
@@ -483,39 +518,45 @@ def test_existing(body: TestExistingRequest, db: Session = Depends(get_db)):
 # ── delete account / recipe ──────────────────────────────────────────────────────
 
 @router.delete("/builder/{account_number}")
-def delete_account(account_number: str):
-    """Delete an entire account config (all its recipes) + its OU mapping."""
-    raw = _read_raw(_ACCOUNT_CONFIGS_PATH)
-    if account_number not in raw or account_number.startswith("_"):
-        raise HTTPException(404, f"Account '{account_number}' not found")
-    del raw[account_number]
-    with open(_ACCOUNT_CONFIGS_PATH, "w", encoding="utf-8") as f:
-        json.dump(raw, f, indent=2)
-
-    ou = _read_raw(_OU_MAP_PATH)
-    if ou.pop(account_number, None) is not None:
-        with open(_OU_MAP_PATH, "w", encoding="utf-8") as f:
-            json.dump(ou, f, indent=2)
-
+def delete_account(account_number: str, db: Session = Depends(get_db)):
+    """Delete an entire account config (all its recipes). The OU itself is left
+    alone — other accounts may still reference it."""
+    account = db.query(BankAccount).filter(BankAccount.account_number == account_number).first()
+    if not account:
+        raise AppError(404, "Account not found", f"No config exists for account '{account_number}'.")
+    db.query(AccountConfigRecipe).filter(AccountConfigRecipe.bank_account_id == account.id).delete()
+    db.delete(account)
+    db.commit()
     reload_account_configs()
     return {"success": True, "deleted": account_number}
 
 
 @router.delete("/builder/{account_number}/{fmt}")
-def delete_recipe(account_number: str, fmt: str):
-    """Delete a single format recipe. If it was the last recipe, the account is removed."""
+def delete_recipe(account_number: str, fmt: str, db: Session = Depends(get_db)):
+    """Delete every version of a single format recipe. If it was the account's
+    last format, the account itself is removed too."""
     fmt = _FMT_ALIASES.get(fmt.lower(), fmt.lower())
-    raw = _read_raw(_ACCOUNT_CONFIGS_PATH)
-    entry = raw.get(account_number)
-    if not isinstance(entry, dict) or fmt not in (entry.get("recipes") or {}):
-        raise HTTPException(404, f"Account '{account_number}' has no '{fmt}' recipe")
-    del entry["recipes"][fmt]
-    account_removed = False
-    if not entry["recipes"]:
-        del raw[account_number]
-        account_removed = True
-    with open(_ACCOUNT_CONFIGS_PATH, "w", encoding="utf-8") as f:
-        json.dump(raw, f, indent=2)
+    account = db.query(BankAccount).filter(BankAccount.account_number == account_number).first()
+    if not account:
+        raise AppError(404, "Account not found", f"No config exists for account '{account_number}'.")
+    versions = (
+        db.query(AccountConfigRecipe)
+        .filter(AccountConfigRecipe.bank_account_id == account.id, AccountConfigRecipe.format == fmt)
+        .all()
+    )
+    if not versions:
+        raise AppError(404, "Recipe not found",
+                        f"Account '{account_number}' has no '{fmt}' recipe to delete.")
+    for v in versions:
+        db.delete(v)
+    db.flush()
+    remaining = (
+        db.query(AccountConfigRecipe).filter(AccountConfigRecipe.bank_account_id == account.id).count()
+    )
+    account_removed = remaining == 0
+    if account_removed:
+        db.delete(account)
+    db.commit()
     reload_account_configs()
     return {"success": True, "account_number": account_number, "format": fmt,
             "account_removed": account_removed}

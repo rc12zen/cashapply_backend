@@ -16,6 +16,8 @@ ingest_and_parse():
 """
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -28,7 +30,30 @@ from ..audit.service import log_activity
 from .file_hash import check_duplicate_file, compute_file_hash, record_file_hash
 from .row_hash import compute_row_hash
 
+logger = logging.getLogger("cashapply.ingestion")
+
 STATEMENT_BUCKET = "bank-statements"
+
+
+class OUNotMappedError(Exception):
+    """
+    Raised when a bank account was successfully recognized (its statement
+    format matched a registered config) but no Organizational Unit mapping
+    could be resolved for it. bank_accounts.ou_id is NOT NULL, so this MUST
+    be caught before it reaches the DB — every onboarded account needs an
+    Organization Unit set via the Config Builder wizard (OU + Business Unit
+    are required there) or it will hit this wall the first time a statement
+    for it is ingested.
+    """
+    def __init__(self, account_number: str | None, bank_name: str | None):
+        self.account_number = account_number
+        self.bank_name = bank_name
+        super().__init__(
+            f"This account ({account_number}, {bank_name or 'bank name unknown'}) was "
+            f"recognized, but has no Organization Unit set up for it yet. "
+            f"Go to the Config tab and set its Organization Unit and Business Unit, "
+            f"then re-upload or reprocess this statement."
+        )
 
 
 def _get_or_create_bank_account(db: Session, account_number: str | None, bank_name: str | None,
@@ -41,6 +66,20 @@ def _get_or_create_bank_account(db: Session, account_number: str | None, bank_na
         .first()
     )
     if existing:
+        # PATCH: previously returned as-is, forever — ou_id was frozen at
+        # whatever it was the FIRST time this account was ever ingested,
+        # even if bank_ou_mapping.json got a proper entry added afterward
+        # (e.g. this account originally got the auto-provisioned "stub" OU
+        # below because no mapping existed yet). Fixing the JSON only ever
+        # helped brand-new accounts — anything already in the DB stayed on
+        # the stale/stub OU no matter what you fixed. Self-heal it here:
+        # only ever upgrades to a real, resolvable OU; never clears one out
+        # or overwrites with something worse.
+        if ou_number:
+            real_ou = db.query(OrganizationUnit).filter(OrganizationUnit.ou_number == ou_number).first()
+            if real_ou and existing.ou_id != real_ou.id:
+                existing.ou_id = real_ou.id
+                db.flush()
         return existing
 
     ou = None
@@ -59,6 +98,14 @@ def _get_or_create_bank_account(db: Session, account_number: str | None, bank_na
             )
             db.add(ou)
             db.flush()
+    else:
+        # PATCH: this used to fall through to `BankAccount(ou_id=None, ...)`
+        # below, which then hit a raw NotNullViolation on the DB insert —
+        # ou_id is NOT NULL, so this can never actually succeed. Fail
+        # clearly and catchably here instead, so the caller can set a
+        # meaningful ingest_error rather than the row silently retrying
+        # forever against the same unresolvable OU gap.
+        raise OUNotMappedError(account_number, bank_name)
 
     account = BankAccount(
         ou_id=ou.id if ou else None,
@@ -122,8 +169,12 @@ def handle_statement_upload_v2(db: Session, filename: str, data: bytes, uploaded
         # a config now exists, this succeeds and rows are finally parsed —
         # no new SourceFile row or file_hash entry needed, since the bytes
         # (and the storage key they were saved under) haven't changed.
-        if dup.get("existing_ingest_status") == "error":
+        if dup.get("existing_ingest_status") in ("error", "unrecognized"):
             source = db.query(SourceFile).get(dup["existing_source_file_id"])
+            logger.info(
+                "Re-upload of previously %s file: source_file_id=%s filename=%r -> retrying",
+                dup.get("existing_ingest_status"), source.id, filename,
+            )
             source.ingest_status = "processing"
             source.ingest_error = None
             log_activity(db, uploaded_by, action="statement.upload_retry_after_error",
@@ -156,6 +207,23 @@ def handle_statement_upload_v2(db: Session, filename: str, data: bytes, uploaded
     is_ambiguous = detection.reason == "AMBIGUOUS" if hasattr(detection, "reason") else False
     candidates = list_matching_configs(local_path) if (is_ambiguous or not detection.success) else []
 
+    # BUGFIX: this used to always set ingest_status="processing" here, even
+    # though detect_config() above has ALREADY told us, synchronously,
+    # whether a config exists. The background job (ingest_and_parse) then
+    # re-ran detect_config(), found the same "no match", and stamped
+    # ingest_status="error" — the exact same status used for genuine
+    # failures (OU not mapped, unexpected exceptions). That conflation is
+    # what made a brand-new/not-yet-configured statement show a red "Error"
+    # badge + "Reconfigure" button in the UI, identical to a real failure.
+    # "No config exists yet" is an expected, everyday state — not an error —
+    # so it gets its own status, set immediately (no need to even defer the
+    # background job when we already know it can't proceed).
+    ingest_status = "unrecognized" if (is_ambiguous or not detection.success) else "processing"
+    logger.info(
+        "Upload detection: filename=%r success=%s ambiguous=%s config_key=%r -> ingest_status=%r",
+        filename, detection.success, is_ambiguous, detection.config_key, ingest_status,
+    )
+
     record = SourceFile(
         kind="bank_statement",
         filename=filename,
@@ -165,7 +233,7 @@ def handle_statement_upload_v2(db: Session, filename: str, data: bytes, uploaded
         business_unit=(detection.ou_info or {}).get("ou"),
         uploaded_by_user_id=uploaded_by.id if uploaded_by else None,
         file_hash=file_hash,
-        ingest_status="processing",
+        ingest_status=ingest_status,
     )
     db.add(record)
     db.flush()  # need record.id before inserting the hash row
@@ -205,7 +273,7 @@ def handle_statement_upload_v2(db: Session, filename: str, data: bytes, uploaded
         "ambiguous": is_ambiguous,
         "candidates": candidates,
         "warning": warning,
-        "ingest_status": "processing",
+        "ingest_status": ingest_status,
     }
 
 
@@ -225,18 +293,36 @@ def ingest_and_parse(db: Session, source_file_id: int) -> dict:
         local_path = storage.local_path_for_read(STATEMENT_BUCKET, record.storage_key)
         detection = detect_config(local_path)
         if not detection.success:
-            record.ingest_status = "error"
-            record.ingest_error = "Bank format not auto-detected; cannot parse rows for ingestion."
+            # Same distinction as handle_statement_upload_v2 above: no config
+            # matching this file is a normal, expected state (needs
+            # configuring), not a processing failure — keep it out of
+            # ingest_status="error" so the UI doesn't show it as one.
+            logger.info(
+                "Background detection still no match: source_file_id=%s filename=%r -> ingest_status='unrecognized'",
+                source_file_id, record.filename,
+            )
+            record.ingest_status = "unrecognized"
+            record.ingest_error = "No matching account configuration found for this statement — configure this account to enable ingestion."
             db.commit()
             return {"error": record.ingest_error}
 
         raw_rows = parse_credit_rows(local_path, detection, record.filename)
 
+        # PATCH: was `ou_number=record.ou_number` — a snapshot taken once at
+        # the ORIGINAL upload attempt and never refreshed. If bank_ou_mapping
+        # .json (or the account's config) was fixed/added after that first
+        # attempt, every retry kept reusing the stale value (often still
+        # None) instead of picking up the fix, because detect_config() above
+        # already re-resolves it fresh on every call but nothing was reading
+        # that fresh value back out. Prefer it; fall back to the stored
+        # value only if this call's own detection didn't produce one.
+        resolved_ou_number = (detection.ou_info or {}).get("ou_number") or record.ou_number
+
         bank_account = _get_or_create_bank_account(
             db,
             account_number=(raw_rows[0].account_number if raw_rows else None),
             bank_name=(raw_rows[0].bank_name if raw_rows else None),
-            ou_number=record.ou_number,
+            ou_number=resolved_ou_number,
             currency=(raw_rows[0].currency if raw_rows else None),
         )
         if bank_account:
@@ -279,6 +365,10 @@ def ingest_and_parse(db: Session, source_file_id: int) -> dict:
         record.duplicate_row_count = len(payload) - new_count
         record.ingest_status = "ready"
         record.ingest_error = None
+        logger.info(
+            "Ingestion ready: source_file_id=%s filename=%r total_rows=%d new_rows=%d duplicate_rows=%d",
+            source_file_id, record.filename, len(payload), new_count, len(payload) - new_count,
+        )
 
         log_activity(db, None, action="statement.ingest_complete",
                      entity_type="SourceFile", entity_id=record.id,
@@ -287,11 +377,41 @@ def ingest_and_parse(db: Session, source_file_id: int) -> dict:
         db.commit()
         return {"total_rows": len(payload), "new_rows": new_count, "duplicate_rows": len(payload) - new_count}
 
-    except Exception as exc:
+    except OUNotMappedError as exc:
+        # Permanent (data-completeness), not transient — retrying achieves
+        # nothing until bank_ou_mapping.json is fixed, so don't re-raise
+        # (which is what triggers procrastinate's automatic retry). Record
+        # the clean, actionable message and stop here, same shape as the
+        # "Bank format not auto-detected" branch above.
         db.rollback()
         record = db.query(SourceFile).get(source_file_id)
         if record:
             record.ingest_status = "error"
             record.ingest_error = str(exc)
+            db.commit()
+        logger.warning("Ingestion stopped (OU not mapped): source_file_id=%s — %s", source_file_id, exc)
+        return {"error": str(exc)}
+
+    except Exception as exc:
+        # PATCH: this used to store str(exc) directly into ingest_error —
+        # for a raw SQLAlchemy/DB error, str(exc) IS the full multi-line
+        # dump (the INSERT statement, every bound parameter, and the
+        # sqlalche.me troubleshooting link), which then got surfaced
+        # straight into the Account Statements card's tooltip. Log the real
+        # exception (with traceback) server-side where a developer can
+        # actually use it, and keep the user-facing message short and
+        # non-technical — this is the one case where we genuinely don't
+        # know what went wrong, so we say that plainly rather than dumping
+        # a stack trace on someone who can't act on it.
+        logger.exception("Ingestion failed unexpectedly: source_file_id=%s", source_file_id)
+        db.rollback()
+        record = db.query(SourceFile).get(source_file_id)
+        if record:
+            record.ingest_status = "error"
+            record.ingest_error = (
+                "Something went wrong while processing this statement (not a recognized "
+                "format or OU issue). Check the server logs for source_file_id="
+                f"{source_file_id}, or try re-uploading the file."
+            )
             db.commit()
         raise

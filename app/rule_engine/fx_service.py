@@ -99,49 +99,58 @@ _STATIC_RATE_MAP: dict[str, float] = {
 }
 
 
-def _load_ou_functional_currency() -> dict:
-    # PATCH: was @lru_cache(maxsize=1) — same cross-process staleness bug
-    # as bank_statement/configs/account_loader.py (see that file's PATCH
-    # note for the full explanation). A newly-onboarded OU's functional
-    # currency would never be seen by the worker process until it was
-    # manually restarted. Now mtime-based via app.common.json_cache.
-    path = _HERE / "configs" / "ou_functional_currency.json"
-    return load_json_cached(path)
+def _load_organization_unit(ou_number: str):
+    """
+    DB-BACKED (was ou_functional_currency.json). OrganizationUnit is now the
+    single source of truth for both functional currency and the BU display
+    name -- populated at Config Builder onboarding time (see
+    bff/config_builder_routes.py), not a separately-maintained JSON file.
+    No cache needed: a plain indexed lookup, and every process hits the
+    same DB directly, so there is no cross-process staleness to solve for.
+    """
+    from ..db.session import session_scope
+    from ..db.models import OrganizationUnit
+
+    with session_scope() as db:
+        ou = db.query(OrganizationUnit).filter(OrganizationUnit.ou_number == str(ou_number)).first()
+        if ou is None:
+            return None
+        return {"functional_currency": ou.functional_currency, "ou_name": ou.ou_name}
 
 
 def get_functional_currency(ou_number: str | None) -> Optional[str]:
     """
     Returns the functional (ledger) currency for a given OU number.
-    e.g. get_functional_currency("111") → "INR"
-         get_functional_currency("312") → "GBP"
-    Returns None if OU not in map (treat as unknown, flag for review).
+    e.g. get_functional_currency("111") -> "INR"
+         get_functional_currency("312") -> "GBP"
+    Returns None if the OU isn't onboarded yet (treat as unknown, flag for review).
     """
     if not ou_number:
         return None
-    mapping = _load_ou_functional_currency()
-    entry = mapping.get(str(ou_number))
+    entry = _load_organization_unit(ou_number)
     return entry.get("functional_currency") if entry else None
 
 
 def get_ou_display_name(ou_number: str | None) -> Optional[str]:
     """
     Returns Oracle's own BU display string for a given OU number, e.g.
-    get_ou_display_name("111") → "PUNE(111)"
+    get_ou_display_name("111") -> "PUNE(111)"
 
     This is the value Oracle's standardReceipts payload expects for
     "BusinessUnit" -- it is NOT the same as LineItem.business_unit, which
-    is populated during bank-statement parsing from account_ou_map.json /
-    bank_ou_mapping.json and can hold a plain bank-account description
-    (e.g. "HSBC US Southern California") rather than Oracle's "NAME(ou)"
-    format, depending on which OU-resolution path ran. Always derive the
-    Oracle payload's BusinessUnit from here (keyed by ou_number), not from
-    line_item.business_unit directly.
+    is populated during bank-statement parsing and can hold a plain
+    bank-account description (e.g. "HSBC US Southern California") rather
+    than Oracle's "NAME(ou)" format, depending on which OU-resolution path
+    ran. Always derive the Oracle payload's BusinessUnit from here (keyed
+    by ou_number), not from line_item.business_unit directly.
     """
     if not ou_number:
         return None
-    mapping = _load_ou_functional_currency()
-    entry = mapping.get(str(ou_number))
-    return entry.get("ou") if entry else None
+    entry = _load_organization_unit(ou_number)
+    if not entry:
+        return None
+    ou_name = entry.get("ou_name")
+    return f"{ou_name}({ou_number})" if ou_name else str(ou_number)
 
 
 def _load_fx_conversion_type_map() -> dict:

@@ -18,6 +18,7 @@ configure_logging()  # must run before any other app import that grabs a logger 
 from .db.session import init_db
 from .db.settings import get_settings
 from .aging.watcher import start_watcher
+from .common.errors import register_exception_handlers
 from .bff import (
     run_routes, results_routes, hitl_routes, config_routes, filters_routes,
     executive_summary, config_builder_routes, auth_routes, admin_routes,
@@ -25,6 +26,11 @@ from .bff import (
 )
 
 app = FastAPI(title="CashApply Backend", version="1.1.0")
+
+# Every error the frontend receives — deliberate (AppError/HTTPException) or
+# genuinely unexpected — comes back as {"title": ..., "message": ...}. Raw
+# tracebacks/exception dumps never leave the server; see common/errors.py.
+register_exception_handlers(app)
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,7 +67,7 @@ def on_startup():
     from .tasks.app import procrastinate_app
     procrastinate_app.open()
 
-    if settings.ENVIRONMENT == "local" and not settings.AZURE_TENANT_ID:
+    if settings.APP_ENV == "local" and not settings.AZURE_TENANT_ID:
         import logging
         logging.getLogger("uvicorn.error").warning(
             "AZURE_TENANT_ID / AZURE_CLIENT_ID not set — Azure SSO token "
@@ -69,6 +75,18 @@ def on_startup():
             "for local testing via the X-Dev-User bypass header (see "
             "README_SETUP_AND_TESTING.md), but must be configured before "
             "any deployment reachable outside your own machine."
+        )
+
+    if settings.APP_ENV != "local" and not settings.AZURE_TENANT_ID:
+        import logging
+        logging.getLogger("uvicorn.error").error(
+            "APP_ENV=%s but AZURE_TENANT_ID/AZURE_CLIENT_ID are not set, and "
+            "the X-Dev-User bypass is disabled outside APP_ENV=local — every "
+            "single request will 401 until real Azure AD SSO is configured. "
+            "This is not a storage issue (STORAGE_BACKEND can still be "
+            "'local'); it's specifically that no sign-in method is usable "
+            "right now.",
+            settings.APP_ENV,
         )
 
 

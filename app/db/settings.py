@@ -2,8 +2,12 @@
 cashapply_shared.settings
 ==========================
 Single source of truth for environment configuration. Both App1 and App2
-import this. Behavior switches between "local" and "azure" purely via
-env vars — no code branching needed at the call site (see storage.py).
+import this. STORAGE_BACKEND controls storage (local disk vs Azure Blob —
+see storage.py); APP_ENV controls the deployment tier and, specifically,
+whether the local dev SSO bypass is reachable at all (see auth/bypass.py).
+These are independent — a UAT/PROD deployment can run APP_ENV=uat/prod
+with STORAGE_BACKEND=local (this app lives on a single VM) while still
+requiring real Azure AD SSO tokens.
 """
 from __future__ import annotations
 
@@ -16,16 +20,29 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    # ── Environment switch ──────────────────────────────────────────────────
-    ENVIRONMENT: Literal["local", "azure"] = "local"
+    # ── Storage backend switch ───────────────────────────────────────────────
+    # Purely "where do files live" — local disk or Azure Blob. Independent of
+    # APP_ENV below: you can run UAT/PROD with local disk storage (this app
+    # is a single VM, per design) while still enforcing real Azure AD SSO.
+    STORAGE_BACKEND: Literal["local", "azure"] = "local"
+
+    # ── Deployment tier ───────────────────────────────────────────────────────
+    # Gates ONE thing: whether the X-Dev-User SSO bypass header (app/auth/bypass.py)
+    # is honored at all. Only ever "local" in actual local development — set
+    # this to "uat" or "prod" the moment real Azure AD SSO is configured for
+    # that environment, even if STORAGE_BACKEND stays "local". Previously a
+    # single ENVIRONMENT flag controlled both storage AND the SSO bypass,
+    # which meant there was no way to keep local-disk storage while turning
+    # off the bypass for a real deployment — this split fixes that.
+    APP_ENV: Literal["local", "uat", "prod"] = "local"
 
     # ── Database (shared by App1 + App2) ────────────────────────────────────
     DATABASE_URL: str = "postgresql+psycopg2://cashapply:cashapply@localhost:5432/cashapply"
 
-    # ── Local storage root (used when ENVIRONMENT=local) ────────────────────
+    # ── Local storage root (used when STORAGE_BACKEND=local) ────────────────
     LOCAL_STORAGE_ROOT: str = "./storage"
 
-    # ── Azure Blob Storage (used when ENVIRONMENT=azure) ────────────────────
+    # ── Azure Blob Storage (used when STORAGE_BACKEND=azure) ────────────────
     AZURE_STORAGE_CONNECTION_STRING: str | None = None
     AZURE_STORAGE_ACCOUNT_URL: str | None = None  # used with AAD/Managed Identity instead of conn string
     AZURE_CONTAINER_BANK_STATEMENTS: str = "bank-statements"

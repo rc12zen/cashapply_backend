@@ -457,11 +457,11 @@ class RemittanceInvoiceLine(Base):
 
 class OrganizationUnit(Base):
     """
-    Formalizes what is currently free-text ou_number strings scattered across
-    SourceFile / LineItem / ou_functional_currency.json. Existing string
-    columns are left untouched for backward compatibility; this table is the
-    new source of truth going forward and is backfilled from
-    rule_engine/configs/ou_functional_currency.json on first migration.
+    The single source of truth for OU + Business Unit data. Populated by
+    the Config Builder wizard at account onboarding time (OU + Business
+    Unit are required fields there) — no JSON file, no migration; this
+    table and BankAccount.ou_id together are the only place OU/BU data
+    lives.
     """
     __tablename__ = "organization_units"
 
@@ -475,19 +475,58 @@ class OrganizationUnit(Base):
 
 
 class BankAccount(Base):
+    """
+    The account "header" — one row per onboarded bank account. Recipes
+    (formerly account_configs.json's recipes[format]) live in
+    AccountConfigRecipe, versioned and FK'd here. OU + Business Unit are a
+    real relationship via ou_id -> OrganizationUnit, not free-text columns
+    copied into a side JSON file — this table + OrganizationUnit together
+    are now the single source of truth for OU/BU, replacing
+    account_configs.json + bank_ou_mapping.json + account_ou_map.json.
+    """
     __tablename__ = "bank_accounts"
 
     id               = Column(Integer, primary_key=True, autoincrement=True)
     ou_id            = Column(Integer, ForeignKey("organization_units.id"), nullable=False)
     account_number   = Column(String(50), nullable=False)
+    account_last4    = Column(String(4), nullable=True, index=True)
+    display_name     = Column(String(200), nullable=True)
     bank_name        = Column(String(200), nullable=False)
-    bank_config_key  = Column(String(100), nullable=True)   # links to bank_ou_mapping.json entries
+    bank_config_key  = Column(String(100), nullable=True)   # legacy key, kept for display/back-compat only
     currency         = Column(String(10), nullable=True)
     active           = Column(Boolean, default=True)
 
     __table_args__ = (UniqueConstraint("account_number", "bank_name", name="uq_bank_account_number_name"),)
 
     organization_unit = relationship("OrganizationUnit", back_populates="bank_accounts")
+    recipes           = relationship("AccountConfigRecipe", back_populates="bank_account",
+                                      order_by="AccountConfigRecipe.version")
+
+
+class AccountConfigRecipe(Base):
+    """
+    Replaces account_configs.json's recipes[format] = [ {version, created_at,
+    created_by, recipe} ]. Same append-only versioning: a new save for an
+    existing (bank_account_id, format) always inserts the next version,
+    never overwrites a prior one. The recipe body itself (account_locator +
+    source + fields + credit_rule + ...) stays a single JSON column — same
+    shape the parser/detector already expect, least rework vs normalizing it.
+    """
+    __tablename__ = "account_config_recipes"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    bank_account_id = Column(Integer, ForeignKey("bank_accounts.id"), nullable=False, index=True)
+    format          = Column(String(10), nullable=False)   # xlsx | xls | csv | pdf
+    version         = Column(Integer, nullable=False)
+    recipe          = Column(JSON, nullable=False)
+    created_at      = Column(DateTime, default=dt.datetime.utcnow)
+    created_by      = Column(String(200), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("bank_account_id", "format", "version", name="uq_recipe_account_format_version"),
+    )
+
+    bank_account = relationship("BankAccount", back_populates="recipes")
 
 
 # ── Users / RBAC ─────────────────────────────────────────────────────────────

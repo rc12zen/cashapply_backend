@@ -55,19 +55,15 @@ revision shipped real credentials as code defaults; removed).
 python3 -c "from app.db.session import init_db; init_db()"
 
 # Seeds the 5 roles + permission set, and creates two dev-bypass users
-python -m scripts.seed_rbac --dev-user admin@example.com --dev-role Administrator
-python -m scripts.seed_rbac --dev-user analyst@example.com --dev-role Analyst
+python -m scripts.seed_rbac --dev-user muni@zensar.com --dev-role Administrator
+python -m scripts.seed_rbac --dev-user muni_analyst@zensar.com --dev-role Analyst
 ```
 
 Re-running `seed_rbac` is safe — every insert is get-or-create.
 
 ## 6. Register procrastinate's schema
 
-Procrastinate needs its own tables/functions in the same database (job
-queue, not your business data):
-
-```bash
-procrastinate --app=app.tasks.app.procrastinate_app schema --apply
+python -m scripts.apply_procrastinate_schema
 ```
 
 ## 7. Run the app + worker (two terminals)

@@ -1,118 +1,99 @@
 """
-app.bank_statement.configs.account_loader
-==========================================
-Loads and validates the account-based config registry (JSON, no DB).
+app.bank_statement.configs.account_loader  (DB-BACKED -- replaces JSON)
+========================================================================
+Loads the account-based config registry from the database instead of
+account_configs.json / bank_ou_mapping.json / account_ou_map.json.
 
-Files (this directory)
-  account_configs.json  — full account number -> { display_name, recipes{fmt:…} }
-  account_ou_map.json   — full account number -> { ou_number, business_unit }
-  account_config_schema.json — JSON Schema for a single account entry
+WHY THIS CHANGED
+-----------------
+Config used to live in three separate JSON files that could (and did)
+drift out of sync with each other. OU and Business Unit are now a real FK
+relationship (BankAccount.ou_id -> OrganizationUnit), and recipes are
+versioned rows in AccountConfigRecipe -- see app/db/models.py. This module
+is now the ONLY place that reads that data; every other module (detector,
+parser, ou_resolver, bff routes) still calls the same functions below, so
+this was a swap of *implementation*, not of *interface* -- callers did not
+need to change.
 
-Provides:
-  load_account_configs()  — validated dict {account_number: entry}
-  load_account_ou_map()   — dict {account_number: {ou_number, business_unit}}
-  last4_index()           — {last4: [account_number, …]} for fast matching
-  reload_account_configs()— clear caches + rebuild (hot reload after save/delete)
+Public API (unchanged shapes, so callers are unaffected):
+  load_account_configs()  -> {account_number: entry}   (entry shaped like the
+                              old JSON: display_name, account_last4, bank,
+                              currency, recipes:{fmt:[versions...]})
+  load_bank_ou_mapping()  -> {last4: {ou, ou_number, bank, bank_config}}
+  load_account_ou_map     -> alias, kept for any old imports
+  last4_index()           -> {last4: [account_number, ...]}
+  ou_index()              -> dict copy of load_bank_ou_mapping()
+  active_version() / active_recipe() / list_versions() / format_summaries()
+                          -> unchanged, operate on the entry shape above
+  reload_account_configs()-> summary dict (no-op cache-buster; DB reads are
+                              always live, there is no mtime cache anymore)
 
-Keys beginning with "_" (e.g. "_comment") are ignored everywhere.
-
-PATCH (cross-process staleness fix): this used to cache via a bare
-`@lru_cache(maxsize=1)` — a pure in-process cache. The API server and the
-background worker are always separate OS processes; saving a new account
-via the Config Builder Wizard hit the API process and called
-reload_account_configs() there, which never touched the worker's own
-cache — so a newly-onboarded bank account detected as UNKNOWN in every
-analysis run (which executes in the worker) until the worker was
-manually restarted. Now cached by (path, mtime) via
-app.common.json_cache — every process independently notices the file
-changed on its next call, no manual reload/restart required. See
-app/common/json_cache.py for the full rationale.
+No JSON files are read here anymore. account_config_schema.json is no
+longer used -- integrity (recipe must be valid JSON, format must be one of
+xlsx/xls/csv/pdf) is now guaranteed by the DB schema + the save endpoint.
 """
 from __future__ import annotations
 
-from pathlib import Path
-import json
-
-from ...common.json_cache import load_json_cached
-
-_HERE = Path(__file__).parent
-_CONFIGS_PATH = _HERE / "account_configs.json"
-_OU_MAP_PATH  = _HERE / "bank_ou_mapping.json"   # last-4-keyed, authoritative Zensar OU data
-_SCHEMA_PATH  = _HERE / "account_config_schema.json"
+from ...db.session import session_scope
+from ...db.models import BankAccount, OrganizationUnit, AccountConfigRecipe
 
 
-class AccountConfigValidationError(Exception):
-    pass
+# -- entry-shape builders (DB rows -> the same dict shape callers expect) ----
 
-
-def _strip_private(raw: dict) -> dict:
-    """Drop keys that start with '_' (comments / metadata)."""
-    return {k: v for k, v in raw.items() if not str(k).startswith("_")}
-
-
-def _validate(entries: dict) -> None:
-    """Validate every account entry against account_config_schema.json.
-    Silently skips if jsonschema isn't installed (dev convenience)."""
-    try:
-        import jsonschema
-    except ImportError:
-        return
-
-    with open(_SCHEMA_PATH, encoding="utf-8") as f:
-        schema = json.load(f)
-
-    errors: list[str] = []
-    for acct, entry in entries.items():
-        try:
-            jsonschema.validate(entry, schema)
-        except jsonschema.ValidationError as e:
-            path = " → ".join(str(p) for p in e.path) if e.path else "(root)"
-            errors.append(f"account '{acct}': {e.message} at {path}")
-        # cross-field: the stored last4 must match the account number's tail
-        norm = _normalize_account(str(entry.get("account_number", "")))
-        expected = norm[-4:] if norm else ""
-        if expected and entry.get("account_last4") and entry["account_last4"] != expected:
-            errors.append(
-                f"account '{acct}': account_last4 '{entry['account_last4']}' "
-                f"does not match account_number tail '{expected}'"
-            )
-
-    if errors:
-        raise AccountConfigValidationError(
-            f"{len(errors)} account config(s) failed validation:\n"
-            + "\n".join(f"  • {e}" for e in errors)
-        )
-
-
-def _normalize_account(value: str) -> str:
-    """Uppercase, keep A-Z0-9 (drop spaces/dashes/dots), drop trailing '.0'.
-    Mirrors the normalization used by the account locator (Phase 2)."""
-    s = str(value).strip()
-    if s.endswith(".0") and s[:-2].isdigit():
-        s = s[:-2]
-    return "".join(ch for ch in s.upper() if ch.isalnum())
+def _entry_from_bank_account(acct: BankAccount) -> dict:
+    recipes: dict[str, list[dict]] = {}
+    for r in acct.recipes:
+        recipes.setdefault(r.format, []).append({
+            "version":    r.version,
+            "created_at": r.created_at.isoformat() + "Z" if r.created_at else None,
+            "created_by": r.created_by,
+            "recipe":     r.recipe,
+        })
+    return {
+        "account_number": acct.account_number,
+        "account_last4":  acct.account_last4,
+        "display_name":   acct.display_name or acct.account_number,
+        "bank":            acct.bank_name,
+        "currency":        acct.currency,
+        "ou_number":       acct.organization_unit.ou_number if acct.organization_unit else None,
+        "business_unit":   acct.organization_unit.ou_name if acct.organization_unit else None,
+        "recipes":         recipes,
+    }
 
 
 def load_account_configs() -> dict:
-    """Load + validate account_configs.json. Returns {account_number: entry}."""
-    raw = load_json_cached(_CONFIGS_PATH)
-    entries = _strip_private(raw)
-    _validate(entries)
-    return entries
+    """Load every onboarded account, keyed by account_number. DB is always
+    live -- no cache, no staleness to reason about across processes."""
+    with session_scope() as db:
+        accounts = db.query(BankAccount).filter(BankAccount.active.is_(True)).all()
+        return {a.account_number: _entry_from_bank_account(a) for a in accounts}
 
 
 def load_bank_ou_mapping() -> dict:
     """
-    Load bank_ou_mapping.json — keyed by last-4 account suffix.
-    Schema per entry: {ou, ou_number, bank, bank_config}
-    where `ou` is the Zensar OU display name (e.g. "PUNE(111)").
-    This is the authoritative Zensar OU reference; do not replace with
-    account_ou_map.json (full-account keyed) which had wrong OU names.
+    {last4: {ou, ou_number, bank, bank_config}} -- shaped exactly like the old
+    bank_ou_mapping.json so bank_statement/ou_resolver.py's resolve_ou()
+    needs no changes. Built from BankAccount JOIN OrganizationUnit.
     """
-    if not _OU_MAP_PATH.exists():
-        return {}
-    raw = load_json_cached(_OU_MAP_PATH)
-    return _strip_private(raw)
+    with session_scope() as db:
+        accounts = (
+            db.query(BankAccount)
+            .filter(BankAccount.active.is_(True), BankAccount.account_last4.isnot(None))
+            .all()
+        )
+        out: dict[str, dict] = {}
+        for a in accounts:
+            ou = a.organization_unit
+            if ou is None:
+                continue
+            ou_display = f"{ou.ou_name}({ou.ou_number})" if ou.ou_name else ou.ou_number
+            out[a.account_last4] = {
+                "ou":           ou_display,
+                "ou_number":    ou.ou_number,
+                "bank":         a.bank_name or "",
+                "bank_config":  a.account_number,
+            }
+        return out
 
 
 # Keep load_account_ou_map as an alias so any code that imports it still works.
@@ -120,38 +101,26 @@ load_account_ou_map = load_bank_ou_mapping
 
 
 def ou_index() -> dict:
-    """
-    Build {last4_suffix: entry} from bank_ou_mapping.json for O(1) rowwise
-    OU lookup. Not cached beyond load_bank_ou_mapping()'s own mtime-based
-    cache — this dict() copy is cheap enough to rebuild on every call, and
-    doing so means it can never go stale independently of the source file.
-    """
+    """{last4_suffix: entry} -- same as before, now DB-backed under the hood."""
     return dict(load_bank_ou_mapping())
 
 
 def last4_index() -> dict:
-    """Build {last4: [account_number, …]} from the registry for fast matching.
-    Multiple accounts can share a last4 — that's the collision case resolved by
-    the full account number at detection time. Not cached beyond
-    load_account_configs()'s own mtime-based cache, for the same reason as
-    ou_index() above."""
+    """{last4: [account_number, ...]} built from the registry for fast matching."""
     index: dict[str, list[str]] = {}
     for acct, entry in load_account_configs().items():
-        last4 = entry.get("account_last4") or _normalize_account(acct)[-4:]
+        last4 = entry.get("account_last4")
         if last4:
             index.setdefault(last4, []).append(acct)
     return index
 
 
 def _version_list(entry: dict, fmt: str) -> list:
-    """The raw version-object list for entry.recipes[fmt], or [] if absent/malformed."""
     versions = (entry.get("recipes") or {}).get(fmt)
     return versions if isinstance(versions, list) else []
 
 
 def active_version(entry: dict, fmt: str) -> dict | None:
-    """Highest-`version` element of recipes[fmt], or None if the format has no versions.
-    `version` (a monotonic int) is the authoritative tie-break; `created_at` is display only."""
     versions = _version_list(entry, fmt)
     if not versions:
         return None
@@ -159,21 +128,15 @@ def active_version(entry: dict, fmt: str) -> dict | None:
 
 
 def active_recipe(entry: dict, fmt: str) -> dict | None:
-    """The recipe dict of the active (latest) version for this format — what detection
-    and test use. None if the format has no versions."""
     av = active_version(entry, fmt)
     return av.get("recipe") if av else None
 
 
 def list_versions(entry: dict, fmt: str) -> list:
-    """All version objects for a format, newest first."""
     return sorted(_version_list(entry, fmt), key=lambda v: v.get("version", 0), reverse=True)
 
 
 def format_summaries(entry: dict) -> list:
-    """One summary per format for the read-only Config tab UI. Carries per-version
-    metadata (version/created_at/created_by, newest first) but NOT the recipe bodies —
-    display is metadata-only; the recipe is only needed at detection/test time."""
     summaries = []
     for fmt in sorted((entry.get("recipes") or {}).keys()):
         versions = list_versions(entry, fmt)
@@ -195,13 +158,9 @@ def format_summaries(entry: dict) -> list:
 
 
 def reload_account_configs() -> dict:
-    """
-    Returns a summary for a /reload response. No longer needs to clear any
-    cache — load_json_cached() already re-reads automatically the moment a
-    file's mtime changes, in every process independently — but kept as a
-    named entrypoint since bff/config_builder_routes.py calls it after
-    every save, and it's a convenient place to report a fresh count.
-    """
+    """Kept as a named entrypoint since bff/config_builder_routes.py calls it
+    after every save -- with no cache left to bust, this just reports a fresh
+    count for the /reload response."""
     configs = load_account_configs()
     ou_map = load_bank_ou_mapping()
     return {
