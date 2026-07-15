@@ -163,6 +163,29 @@ async def upload_statement(
     return result
 
 
+@router.post("/files/{source_file_id}/reingest")
+def reingest_statement(source_file_id: int, request: Request, db: Session = Depends(get_db),
+                       user: User = Depends(require_permission("statement:upload"))):
+    """
+    Re-run ingestion for an already-uploaded statement, in place. Used after a
+    config is created for a previously-UNKNOWN file via the Home "Configure"
+    flow: the file's bytes are still in storage, but its original ingest failed
+    ("Bank format not auto-detected") and left it error/unresolved/0-rows. A
+    plain re-upload would hit the duplicate-hash guard and do nothing, so this
+    re-defers the ingest job — detect_config now matches, rows parse, the bank
+    account links, and status flips to ready. ingest_and_parse is idempotent.
+    """
+    record = db.query(SourceFile).get(source_file_id)
+    if not record or record.kind != "bank_statement":
+        raise HTTPException(404, "Source file not found")
+    record.ingest_status = "processing"
+    record.ingest_error = None
+    db.commit()
+    from ..tasks.ingestion_tasks import ingest_statement_task
+    ingest_statement_task.defer(source_file_id=source_file_id)
+    return {"source_file_id": source_file_id, "ingest_status": "processing"}
+
+
 @router.get("/files/{source_file_id}/ingest-status")
 def get_ingest_status(source_file_id: int, db: Session = Depends(get_db),
                        user: User = Depends(require_permission("run:view"))):
@@ -215,6 +238,34 @@ def start_run(payload: dict, request: Request, db: Session = Depends(get_db),
     selected_files = payload.get("selected_files", [])
     if not selected_files:
         raise HTTPException(400, "No files selected.")
+
+    # Guard: at least one selected statement must be analyzable — i.e. resolve
+    # to a bank account that still has unconsumed rows. The orchestrator
+    # consumes rows by bank_account_id, so a run against only Unknown
+    # (unrecognised, no bank_account_id) or already-consumed statements would
+    # do nothing. Reject it here instead of creating a no-op run — this is the
+    # server-side counterpart to the Home tab's "runnable account" gate, so a
+    # direct API call can't bypass it.
+    sources = db.query(SourceFile).filter(
+        SourceFile.kind == "bank_statement",
+        SourceFile.filename.in_(selected_files),
+    ).all()
+    account_ids = {s.bank_account_id for s in sources if s.bank_account_id is not None}
+    pending_rows = (
+        db.query(StatementTransactionRow)
+        .filter(
+            StatementTransactionRow.bank_account_id.in_(account_ids),
+            StatementTransactionRow.consumed_by_run_id.is_(None),
+        )
+        .count()
+        if account_ids else 0
+    )
+    if pending_rows == 0:
+        raise HTTPException(
+            400,
+            "None of the selected statements are analyzable — they're either "
+            "unrecognised (configure the account first) or have no pending rows.",
+        )
 
     # Fast-fail check (UX layer) — the advisory lock in
     # _run_analysis_locked() is the actual correctness guarantee for true

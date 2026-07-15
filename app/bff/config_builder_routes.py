@@ -22,9 +22,10 @@ from __future__ import annotations
 import os
 import json
 import dataclasses
+import datetime as dt
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -36,6 +37,7 @@ from ..storage.client import get_storage_client
 from ..bank_statement.account_locator import extract_accounts, normalize_account, last4, match_key
 from ..bank_statement.configs.account_loader import (
     load_account_configs, load_account_ou_map, reload_account_configs,
+    active_recipe, format_summaries,
 )
 
 router = APIRouter()
@@ -117,6 +119,54 @@ def _test_recipe(local_path: str, recipe: dict, key: str, filename: str) -> dict
         return {"success": True, "row_count": len(rows), "rows": [_ser(r) for r in rows[:50]]}
     except (ColumnValidationError, Exception) as e:
         return {"success": False, "error": str(e), "row_count": 0, "rows": []}
+
+
+# ── upload a file for the wizard (NO ingestion) ──────────────────────────────────
+
+@router.post("/builder/upload")
+async def builder_upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """
+    Store an uploaded report so the Config Builder wizard can preview / locate /
+    test against it — WITHOUT running the ingestion pipeline.
+
+    Config-building is by definition the "no config exists yet" case, so routing
+    this through /api/run/upload (which detect_config()s and then defers
+    ingest_statement) always fails detection ("Bank format not auto-detected"),
+    marks the file ingest_status="error", and clutters the Home analysis list
+    with a failed file. Here we only need the bytes on disk + a SourceFile row so
+    raw-preview can resolve the file by name.
+
+    - No ingestion is deferred.
+    - No duplicate-hash block: re-uploading the same file (to add a NEW version
+      of an existing config) is expected and must be allowed.
+    - The row is created archived=True so it never shows in the Home statements
+      list; the wizard reads it by (kind, filename) regardless of archived state.
+    """
+    filename = file.filename or "upload"
+    data = await file.read()
+
+    storage = get_storage_client()
+    storage.save(_STATEMENT_BUCKET, filename, data)
+
+    record = db.query(SourceFile).filter(
+        SourceFile.kind == "bank_statement", SourceFile.filename == filename
+    ).first()
+    if record:
+        # Reuse the existing row (e.g. adding a new version of the same file).
+        record.storage_key = filename
+    else:
+        record = SourceFile(
+            kind="bank_statement",
+            filename=filename,
+            storage_key=filename,
+            ingest_status="config_only",   # never analysed; excluded from Home list
+            archived=True,
+        )
+        db.add(record)
+    db.commit()
+    db.refresh(record)
+
+    return {"filename": filename, "source_file_id": record.id}
 
 
 # ── raw preview ─────────────────────────────────────────────────────────────────
@@ -236,6 +286,10 @@ class SaveRecipeRequest(BaseModel):
     # instead of relying on a guess that may not match the OU's real ledger.
     functional_currency: str | None = None
     storage_key: str | None = None    # (unused for keying; kept for symmetry)
+    # Best-effort author of this version, read from the login_user_email_stub
+    # cookie by the wizard (this module's axios has no dev-user interceptor).
+    # Displayed as "added by" in the read-only version list; omitted if unknown.
+    created_by: str | None = None
 
 
 @router.post("/builder/save")
@@ -258,13 +312,30 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
     raw = _read_raw(_ACCOUNT_CONFIGS_PATH)
     before = json.dumps(raw)
 
+    created_at = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    created_by = (body.created_by or "").strip() or None
+
+    def _version_obj(version: int) -> dict:
+        obj = {"version": version, "created_at": created_at, "recipe": body.recipe}
+        if created_by:
+            obj["created_by"] = created_by
+        return obj
+
     entry = raw.get(acct) if not acct.startswith("_") else None
-    overwritten = False
-    created = False
+    created = False          # brand-new account
+    format_created = False   # first recipe for this format on an existing account
     if isinstance(entry, dict):
         recipes = entry.setdefault("recipes", {})
-        overwritten = fmt in recipes
-        recipes[fmt] = body.recipe
+        existing = recipes.get(fmt)
+        if isinstance(existing, list) and existing:
+            # Append a new version — never replace. version = max existing + 1.
+            next_version = max((v.get("version", 0) for v in existing), default=0) + 1
+            existing.append(_version_obj(next_version))
+        else:
+            # Format absent (or malformed) → start its version list at 1.
+            format_created = True
+            recipes[fmt] = [_version_obj(1)]
+            next_version = 1
         entry["display_name"] = body.display_name
         entry["account_last4"] = last4(acct)
         if body.bank:     entry["bank"] = body.bank
@@ -272,13 +343,15 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
         entry["account_number"] = acct
     else:
         created = True
+        format_created = True
+        next_version = 1
         raw[acct] = {
             "account_number": acct,
             "account_last4":  last4(acct),
             "bank":           body.bank or "",
             "currency":       body.currency or "",
             "display_name":   body.display_name,
-            "recipes":        {fmt: body.recipe},
+            "recipes":        {fmt: [_version_obj(1)]},
         }
 
     # write + validate, roll back on failure
@@ -292,11 +365,14 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
         reload_account_configs()
         raise HTTPException(400, f"Config invalid, not saved: {e}")
 
-    if created or not overwritten:
-        # New account, or a new format recipe added to an existing account —
-        # both are "a config was created". A recipe *replace* (overwritten) is not.
-        log_activity(db, user, action="config.create", entity_type="AccountConfig",
-                     entity_id=acct, metadata={"display_name": body.display_name})
+    # Audit. A new account or a brand-new format recipe is a "create"; adding a
+    # further version to an existing format is an update. (The old `overwritten`
+    # variable no longer exists in the versioned save — appends never replace.)
+    if user is not None:
+        action = "config.create" if (created or format_created) else "config.version_added"
+        log_activity(db, user, action=action, entity_type="AccountConfig",
+                     entity_id=acct,
+                     metadata={"display_name": body.display_name, "format": fmt, "version": next_version})
         db.commit()  # log_activity rides caller txn; builder_save has no other DB commit
 
     # ── OU mapping — bank_ou_mapping.json (last-4 keyed, the file
@@ -333,14 +409,22 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
 
         reload_account_configs()
 
+    if created:
+        message = f"Created account {acct} with {fmt} recipe (v1)."
+    elif format_created:
+        message = f"Added {fmt} recipe to account {acct} (v1)."
+    else:
+        message = f"Added version {next_version} to {fmt} recipe for account {acct}."
+
     return {
         "success": True,
         "account_number": acct,
         "format": fmt,
         "created": created,
-        "overwritten": overwritten,
-        "message": (f"Added {fmt} recipe to existing account {acct}."
-                    if not created else f"Created account {acct} with {fmt} recipe."),
+        "format_created": format_created,
+        "appended": not created and not format_created,
+        "version": next_version,
+        "message": message,
     }
 
 
@@ -357,7 +441,10 @@ def list_accounts():
             "display_name":   entry.get("display_name", acct),
             "bank":           entry.get("bank"),
             "currency":       entry.get("currency"),
-            "formats":        sorted((entry.get("recipes") or {}).keys()),
+            # Per-format version metadata (newest first, active flagged) for the
+            # read-only version list on the Config tab. Recipe bodies are omitted
+            # here — display is metadata-only.
+            "formats":        format_summaries(entry),
         })
     return {"accounts": out}
 
@@ -387,7 +474,7 @@ def test_existing(body: TestExistingRequest, db: Session = Depends(get_db)):
         raise HTTPException(404, f"Account '{body.account_number}' not found")
     record, local_path = _local_path(db, body.filename)
     fmt = body.format or _file_format(body.filename)
-    recipe = (entry.get("recipes") or {}).get(fmt)
+    recipe = active_recipe(entry, fmt)   # test always runs the active (latest) version
     if not recipe:
         raise HTTPException(404, f"Account '{body.account_number}' has no '{fmt}' recipe")
     return _test_recipe(local_path, recipe, body.account_number, record.filename)
