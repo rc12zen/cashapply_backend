@@ -24,6 +24,15 @@ class ActivityLogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
 
+        # Disabled: this generic "{METHOD} {path}" row-per-request logging
+        # was pure noise on the Activity Log page (hundreds of "viewed
+        # /api/..." rows drowning out real actions). Kept registered (not
+        # removed from main.py) so re-enabling later is a one-line revert —
+        # just delete this early return. Explicit log_activity() calls at
+        # domain-specific points (run/config/approve/reject/upload/...)
+        # are unaffected and still log normally.
+        return response
+
         path = request.url.path
         if any(path.startswith(p) for p in _SKIP_PREFIXES):
             return response

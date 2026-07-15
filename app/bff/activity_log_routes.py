@@ -33,8 +33,7 @@ router = APIRouter()
 # actor="system" → only background/pipeline rows (user_id NULL).
 _CATEGORIES: dict[str, dict] = {
     "analysis_run":      {"like": ["run.start%", "run.reset%"], "actor": "user"},
-    "config_creation":   {"like": ["config.create%"]},
-    "system":            {"actor": "system"},                  # user_id IS NULL, any action
+    "config_creation":   {"like": ["config.create%", "config.version_added%"]},
     "approved":          {"like": ["hitl.approve%", "oracle.retry%"]},
     "rejected":          {"like": ["hitl.reject%"]},
 }
@@ -64,7 +63,13 @@ def _summarize(r: ActivityLog, email: str | None) -> str:
     if a.startswith("hitl.manual_mapping"):
         return f"{who} mapped line item #{id_} to invoice(s) {', '.join(m.get('invoice_numbers') or [])}"
     if a.startswith("config.create"):
-        return f"The config for {m.get('display_name')} has been created by {who}"
+        name = m.get("display_name")
+        src = m.get("source_filename")
+        return f"{who} added {name}" + (f" for {src}" if src else "")
+    if a.startswith("config.version_added"):
+        name = m.get("display_name")
+        src = m.get("source_filename")
+        return f"{who} added a new version of {name}" + (f" for {src}" if src else "")
     if a.startswith("hitl.approve_bulk"):
         return f"{who} approved multiple line items"
     if a.startswith("hitl.approve"):

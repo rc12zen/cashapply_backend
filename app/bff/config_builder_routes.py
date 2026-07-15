@@ -290,6 +290,7 @@ class SaveRecipeRequest(BaseModel):
     # cookie by the wizard (this module's axios has no dev-user interceptor).
     # Displayed as "added by" in the read-only version list; omitted if unknown.
     created_by: str | None = None
+    source_filename: str | None = None  # statement file the config was built from (for the audit log)
 
 
 @router.post("/builder/save")
@@ -372,7 +373,8 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
         action = "config.create" if (created or format_created) else "config.version_added"
         log_activity(db, user, action=action, entity_type="AccountConfig",
                      entity_id=acct,
-                     metadata={"display_name": body.display_name, "format": fmt, "version": next_version})
+                     metadata={"display_name": body.display_name, "format": fmt, "version": next_version,
+                               "source_filename": body.source_filename})
         db.commit()  # log_activity rides caller txn; builder_save has no other DB commit
 
     # ── OU mapping — bank_ou_mapping.json (last-4 keyed, the file
