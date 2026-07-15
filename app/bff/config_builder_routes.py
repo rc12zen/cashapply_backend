@@ -324,6 +324,7 @@ class SaveRecipeRequest(BaseModel):
     # cookie by the wizard (this module's axios has no dev-user interceptor).
     # Displayed as "added by" in the read-only version list; omitted if unknown.
     created_by: str | None = None
+    file_name: str | None = None      # uploaded report name, for the activity log line
 
 
 def _get_or_create_organization_unit(db: Session, ou_number: str, business_unit: str,
@@ -424,12 +425,18 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
         )
         db.add(recipe_row)
 
-        if user is not None:
+        author = user or (
+            db.query(User).filter(User.email == body.created_by.strip()).first()
+            if body.created_by else None
+        )
+        if author is not None or body.created_by:
             action = "config.create" if (created or format_created) else "config.version_added"
-            log_activity(db, user, action=action, entity_type="AccountConfig",
+            log_activity(db, author, action=action, entity_type="AccountConfig",
                          entity_id=acct,
                          metadata={"display_name": body.display_name, "format": fmt, "version": next_version,
-                                   "ou_number": ou.ou_number, "business_unit": ou.ou_name})
+                                   "ou_number": ou.ou_number, "business_unit": ou.ou_name,
+                                   "account_last4": last4(acct), "file_name": body.file_name,
+                                   "created_by": body.created_by})
 
         db.commit()
     except AppError:

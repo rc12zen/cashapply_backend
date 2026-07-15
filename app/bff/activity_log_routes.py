@@ -39,8 +39,7 @@ router = APIRouter()
 # by the background ingestion worker) still show up under "All Logs".
 _CATEGORIES: dict[str, dict] = {
     "analysis_run":      {"like": ["run.start%", "run.reset%"], "actor": "user"},
-    "config_creation":   {"like": ["config.create%"]},
-    "manual_mapping":    {"like": ["hitl.manual_mapping%"]},
+    "manual_mapping":    {"like": ["hitl.manual_mapping%", "config.create%", "config.version_added%"]},
     "approved":          {"like": ["hitl.approve%", "oracle.retry%"]},
     "rejected":          {"like": ["hitl.reject%"]},
 }
@@ -48,7 +47,7 @@ _CATEGORIES: dict[str, dict] = {
 
 def _summarize(r: ActivityLog, email: str | None) -> str:
     """Plain-English, one-line description of a log row for non-engineers."""
-    who = email or "System"
+    who = email or (r.log_metadata or {}).get("created_by") or "System"
     m = r.log_metadata or {}
     a = r.action or ""
     id_ = r.entity_id
@@ -69,8 +68,9 @@ def _summarize(r: ActivityLog, email: str | None) -> str:
         return f"{who} deleted statement {id_}"
     if a.startswith("hitl.manual_mapping"):
         return f"{who} mapped line item #{id_} to invoice(s) {', '.join(m.get('invoice_numbers') or [])}"
-    if a.startswith("config.create"):
-        return f"The config for {m.get('display_name')} has been created by {who}"
+    if a.startswith("config.create") or a.startswith("config.version_added"):
+        last4 = m.get("account_last4") or (id_ or "")[-4:]
+        return f"{who} added a bank config - {m.get('display_name')} for {last4} using {m.get('file_name') or 'unknown file'}"
     if a.startswith("hitl.approve_bulk"):
         return f"{who} approved multiple line items"
     if a.startswith("hitl.approve"):
