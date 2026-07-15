@@ -1,13 +1,14 @@
 """
 app.audit.middleware
 ======================
-Generic request-level activity logging. Catches "view"/"download"-style
-events for free so every route doesn't need an explicit log_activity() call.
-Domain-significant events (approve/reject/oracle post/role change) still log
-explicitly at their call site with real entity context — see design doc §6.
-
-Skips logging the noisy, low-value paths (health check, static assets,
-OpenAPI docs) so the activity log stays about actual user actions.
+DEPRECATED — no longer registered (see app/main.py). This used to catch
+every GET/POST/PUT/DELETE/PATCH request and write one ActivityLog row per
+call, which was the source of the "System Logs" bloat in the Activity Log
+page (one row per page view, poll, or list call, growing without bound).
+Domain-significant events (approve/reject/oracle post/role change/run
+start/upload/config create/manual invoice mapping) still log explicitly at
+their own call sites via audit.service.log_activity() — that's unaffected
+by removing this. Left in place only for reference; do not re-register it.
 """
 from __future__ import annotations
 

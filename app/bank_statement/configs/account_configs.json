@@ -942,5 +942,120 @@
         }
       ]
     }
+  },
+  "0120128134": {
+    "account_number": "0120128134",
+    "account_last4": "8134",
+    "bank": "Development Bank of Singapore",
+    "currency": "SGD",
+    "display_name": "Development Bank of Singapore \u2014 SGD",
+    "recipes": {
+      "xlsx": [
+        {
+          "version": 1,
+          "created_at": "2026-07-15T05:18:55Z",
+          "recipe": {
+            "key": "_DRAFT_",
+            "account_locator": {
+              "type": "cell",
+              "row": 1,
+              "col": 1
+            },
+            "source": {
+              "engine": "excel",
+              "sheet": {
+                "by": "name",
+                "value": "Singapore DBS"
+              },
+              "header": {
+                "row": 5,
+                "merge_rows": [
+                  {
+                    "row": 6,
+                    "rules": [
+                      {
+                        "sub_value": "Cr",
+                        "rename_parent_to": "Amount_Cr"
+                      },
+                      {
+                        "sub_value": "Dr",
+                        "rename_parent_to": "Amount_Dr"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            "fields": [
+              {
+                "name": "date",
+                "from": {
+                  "type": "column",
+                  "name": "Date"
+                }
+              },
+              {
+                "name": "narrative",
+                "from": {
+                  "type": "column",
+                  "name": "Customer Name"
+                }
+              },
+              {
+                "name": "credit_amount",
+                "from": {
+                  "type": "column",
+                  "name": "Amount_Cr"
+                }
+              },
+              {
+                "name": "account_number",
+                "from": {
+                  "type": "cell",
+                  "row": 1,
+                  "col": 1
+                }
+              },
+              {
+                "name": "currency",
+                "from": {
+                  "type": "cell",
+                  "row": 2,
+                  "col": 1
+                }
+              },
+              {
+                "name": "bank_name",
+                "from": {
+                  "type": "cell",
+                  "row": 0,
+                  "col": 1
+                }
+              },
+              {
+                "name": "bank_reference",
+                "from": {
+                  "type": "column",
+                  "name": "Receipt/Payment No"
+                }
+              }
+            ],
+            "credit_rule": {
+              "type": "column_not_blank",
+              "field": "Amount_Cr"
+            },
+            "exclusions": [],
+            "transforms": {},
+            "date_formats": [
+              "DD/MM/YYYY",
+              "YYYY-MM-DD",
+              "MM/DD/YYYY",
+              "DD-MM-YYYY"
+            ]
+          },
+          "created_by": "admin@example.com"
+        }
+      ]
+    }
   }
 }

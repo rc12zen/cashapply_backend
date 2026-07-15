@@ -18,11 +18,10 @@ configure_logging()  # must run before any other app import that grabs a logger 
 from .db.session import init_db
 from .db.settings import get_settings
 from .aging.watcher import start_watcher
-from .audit.middleware import ActivityLogMiddleware
 from .bff import (
     run_routes, results_routes, hitl_routes, config_routes, filters_routes,
     executive_summary, config_builder_routes, auth_routes, admin_routes,
-    activity_log_routes, ai_usage_routes,
+    activity_log_routes, ai_usage_routes, storage_routes,
 )
 
 app = FastAPI(title="CashApply Backend", version="1.1.0")
@@ -35,13 +34,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Generic per-request activity logging (design doc §6). Registered AFTER
-# CORSMiddleware so it still wraps every real request but doesn't interfere
-# with preflight handling. Explicit log_activity() calls at domain-specific
-# points (approve/reject/upload/role-change/...) still happen inside the
-# route handlers themselves — this middleware only adds the generic
-# view/list/download coverage those calls don't already provide.
-app.add_middleware(ActivityLogMiddleware)
+# PATCH: the generic per-request ActivityLogMiddleware (design doc §6) has
+# been REMOVED — it wrote one ActivityLog row for every single GET/POST/PUT/
+# DELETE/PATCH request (page loads, status polls, list calls, ...), which
+# is exactly what was ballooning the table's storage with low-value "System
+# Logs" noise. Domain-significant events (run start, approve/reject, oracle
+# post, upload, config create, manual invoice mapping, role change, ...)
+# already log explicitly via log_activity() at their own call sites — that
+# coverage is unaffected. See app/bff/activity_log_routes.py's
+# purge-system-logs endpoint for a one-off cleanup of rows this middleware
+# already wrote in existing environments.
 
 
 @app.on_event("startup")
@@ -95,3 +97,4 @@ app.include_router(auth_routes.router,         prefix="/api/auth",          tags
 app.include_router(admin_routes.router,        prefix="/api/admin",         tags=["admin"])
 app.include_router(activity_log_routes.router, prefix="/api/activity-log",  tags=["activity-log"])
 app.include_router(ai_usage_routes.router,     prefix="/api/ai-usage",      tags=["ai-usage"])
+app.include_router(storage_routes.router,      prefix="/api/storage",       tags=["storage"])

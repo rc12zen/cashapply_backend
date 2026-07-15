@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
-from ..db.models import LineItem, RemittanceExtraction
+from ..db.models import LineItem, RemittanceExtraction, RemittanceInvoiceLine
 from ..bff.metrics import _category_for_row, GROUP_LABELS, GROUP_READY_FOR_ORACLE
 from ..oracle.fusion_client import build_receipt_creation_payload, build_remittance_reference_payloads
 from ..rule_engine.fx_service import get_ou_display_name
@@ -68,13 +68,46 @@ def build_row_detail(db: Session, record_id: int) -> dict:
     if r.remittance_extraction_id:
         ext = db.query(RemittanceExtraction).get(r.remittance_extraction_id)
         if ext:
+            lines = (
+                db.query(RemittanceInvoiceLine)
+                .filter(RemittanceInvoiceLine.extraction_id == ext.id)
+                .all()
+            )
             remittance = {
                 "subject": ext.subject,
+                "sender": ext.sender,
                 "payer": ext.raw_payer_text,
+                "customer_name": ext.raw_customer_text,
                 "payment_reference": ext.payment_reference,
                 "payment_date": ext.payment_date.isoformat() if ext.payment_date else None,
                 "payment_amount": float(ext.payment_amount) if ext.payment_amount else None,
+                "payment_currency": ext.payment_currency,
                 "storage_key": ext.storage_key,
+                "filename": ext.filename,
+                # PATCH: the actual email/document body — was never returned
+                # before (App2 extracted it for Claude but discarded it
+                # rather than persisting it, so this field was always empty
+                # regardless of frontend support for it). Now backed by
+                # RemittanceExtraction.raw_text — see agent/graph/
+                # remittance_graph.py's node_persist.
+                "raw_body": ext.raw_text,
+                # Per-invoice lines from the email, for the "Invoices in
+                # email" table the frontend already renders — previously
+                # never joined in here even though the data existed.
+                "invoices": [{
+                    "invoice_number": ln.invoice_number,
+                    "amount_paid": float(ln.amount_paid) if ln.amount_paid is not None else None,
+                    "document_amount": float(ln.document_amount) if ln.document_amount is not None else None,
+                    "document_currency": ln.document_currency,
+                } for ln in lines],
+                # A real, fetchable link for the original file (the raw
+                # .msg/.pdf/.eml App2 archived) — /api/storage/download
+                # proxies bytes straight through App1's own storage client,
+                # so this works the same whether ENVIRONMENT=local or azure.
+                "download_url": (
+                    f"/api/storage/download?bucket=remittance-inbox&key={ext.storage_key}"
+                    if ext.storage_key else None
+                ),
             }
 
     confirmed_invoices = [{

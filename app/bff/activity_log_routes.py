@@ -23,18 +23,24 @@ from sqlalchemy.orm import Session
 from ..db.models import ActivityLog, User
 from ..deps import get_db
 from ..auth import require_permission
+from ..audit.service import log_activity
 from .date_range import parse_date_from, parse_date_to
 
 router = APIRouter()
 
 # Category → action-prefix patterns (SQL LIKE) + optional actor constraint.
 # Kept in one place so the frontend pill labels and the backend filter never
-# drift apart. actor="user" → only real users (user_id NOT NULL);
-# actor="system" → only background/pipeline rows (user_id NULL).
+# drift apart.
+# PATCH: "system" category removed — it existed to surface the blanket
+# per-request rows the old ActivityLogMiddleware wrote (see app/main.py and
+# audit/middleware.py), which is exactly the noise that was bloating this
+# table. That middleware is gone, so there's nothing new to bucket here;
+# any legitimate user_id-less rows (e.g. statement.ingest_complete, written
+# by the background ingestion worker) still show up under "All Logs".
 _CATEGORIES: dict[str, dict] = {
     "analysis_run":      {"like": ["run.start%", "run.reset%"], "actor": "user"},
     "config_creation":   {"like": ["config.create%"]},
-    "system":            {"actor": "system"},                  # user_id IS NULL, any action
+    "manual_mapping":    {"like": ["hitl.manual_mapping%"]},
     "approved":          {"like": ["hitl.approve%", "oracle.retry%"]},
     "rejected":          {"like": ["hitl.reject%"]},
 }
@@ -147,3 +153,30 @@ def activity_users(
         .distinct().order_by(User.email).all()
     )
     return {"users": [r[0] for r in rows]}
+
+
+@router.delete("/purge-system-logs")
+def purge_system_logs(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("user:manage")),
+):
+    """
+    One-off cleanup for the rows the old ActivityLogMiddleware wrote — one
+    per GET/POST/PUT/DELETE/PATCH request, action stored literally as
+    "VERB /path" (e.g. "GET /api/run/status"). That's the exact pattern
+    that was bloating this table; the middleware is now disabled (see
+    app/main.py) so nothing new is written this way, but existing
+    environments still have the historical rows taking up space. Run this
+    once per environment to clear them out. Domain-specific rows
+    (run.start, hitl.approve, statement.upload, ...) never match this
+    pattern and are left untouched.
+    """
+    deleted = (
+        db.query(ActivityLog)
+        .filter(ActivityLog.action.op("~")(r"^(GET|POST|PUT|DELETE|PATCH) "))
+        .delete(synchronize_session=False)
+    )
+    log_activity(db, user, action="activity_log.purge_system_logs",
+                 metadata={"deleted_count": deleted})
+    db.commit()
+    return {"deleted_count": deleted}

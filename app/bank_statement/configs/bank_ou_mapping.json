@@ -1,65 +1,380 @@
 {
-  "452": {"ou": "281 Canada", "ou_number": "281", "bank": "Royal Bank of Canada", "bank_config": null},
-  "0481": {"ou": "AUSTRALIA(421)", "ou_number": "421", "bank": "CBA", "bank_config": null},
-  "7347": {"ou": "AUSTRALIA(421)", "ou_number": "421", "bank": "ANZ Australia", "bank_config": "ANZ_AUD"},
-  "1707": {"ou": "AUSTRALIA(421)", "ou_number": "421", "bank": "RBS Sydney", "bank_config": null},
-  "0906": {"ou": "BRIDGEVIEW(212)", "ou_number": "212", "bank": "PNC Bank", "bank_config": null},
-  "0248": {"ou": "BRIDGEVIEW(212)", "ou_number": "212", "bank": "Legacy Solutions", "bank_config": null},
-  "9134": {"ou": "BRIDGEVIEW(212)", "ou_number": "212", "bank": "Solutions Savings", "bank_config": null},
-  "5124": {"ou": "CESSNA BLR(167)", "ou_number": "167", "bank": "Citi Bank Pune", "bank_config": "CITI_INR"},
-  "2001": {"ou": "CESSNA BLR(167)", "ou_number": "167", "bank": "Zensar CESSNA BLR", "bank_config": null},
-  "6033": {"ou": "COLOMBIA(273)", "ou_number": "273", "bank": "BBVA Colombia", "bank_config": "BBVA_COP"},
-  "4046": {"ou": "EON(151)", "ou_number": "151", "bank": "KOTAK MAHINDRA", "bank_config": null},
-  "3826": {"ou": "EON(151)", "ou_number": "151", "bank": "ICICI Bank", "bank_config": null},
-  "1389": {"ou": "EON(152)", "ou_number": "152", "bank": "Kotak Mahindra", "bank_config": null},
-  "4002": {"ou": "EON(153)", "ou_number": "153", "bank": "HSBC EON III", "bank_config": null},
-  "5817": {"ou": "EON(153)", "ou_number": "153", "bank": "CITI Bank EON SEZ II", "bank_config": "CITI_INR"},
-  "2003": {"ou": "GERMANY(327)", "ou_number": "327", "bank": "HSBC Germany", "bank_config": "HSBC_EUR_DE"},
-  "7005": {"ou": "HYD SEZ II(163)", "ou_number": "163", "bank": "CITIBANK", "bank_config": "CITI_INR"},
-  "4001": {"ou": "HYD SEZ III(166)", "ou_number": "166", "bank": "HSBC HYD SEZ III", "bank_config": null},
-  "5825": {"ou": "HYD-SEZ(162)", "ou_number": "162", "bank": "CITI Bank DLF SEZ I", "bank_config": "CITI_INR"},
-  "9031": {"ou": "POLAND UK BRANCH(326)", "ou_number": "326", "bank": "HSBC France Poland", "bank_config": "HSBC_PLN"},
-  "1244": {"ou": "PUNE(111)", "ou_number": "111", "bank": "HSBC US", "bank_config": "HSBC_CASHPRO_USD_SOUTHERN"},
-  "8001": {"ou": "PUNE(111)", "ou_number": "111", "bank": "HSBC Bank", "bank_config": null},
-  "0170": {"ou": "PUNE(111)", "ou_number": "111", "bank": "Kotak Mahindra", "bank_config": null},
-  "2495": {"ou": "PUNE(111)", "ou_number": "111", "bank": "ICICI Bank CASH", "bank_config": null},
-  "0856": {"ou": "PUNE(111)", "ou_number": "111", "bank": "HDFC Bank", "bank_config": null},
-  "0709": {"ou": "PUNE(111)", "ou_number": "111", "bank": "STANCHART Main", "bank_config": null},
-  "5019": {"ou": "PUNE(111)", "ou_number": "111", "bank": "Citibank NA", "bank_config": "CITI_INR"},
-  "5043": {"ou": "PUNE(111)", "ou_number": "111", "bank": "CITI BANK USD EEFC", "bank_config": "CITI_INR"},
-  "5051": {"ou": "PUNE(111)", "ou_number": "111", "bank": "CITI BANK GBP EEFC", "bank_config": "CITI_INR"},
-  "5132": {"ou": "RMZ SEZ BLR(175)", "ou_number": "175", "bank": "Citi Bank Pune", "bank_config": "CITI_INR"},
-  "6709": {"ou": "RMZ SEZ BLR(175)", "ou_number": "175", "bank": "ICICI BANK", "bank_config": null},
-  "3600": {"ou": "SA HOLDINGS(515)", "ou_number": "515", "bank": "STANDARD CHARTERED", "bank_config": "SCB_ZAR"},
-  "3500": {"ou": "SA OPERATING-JV(513)", "ou_number": "513", "bank": "STANDARD CHARTERED", "bank_config": "SCB_ZAR"},
-  "0066": {"ou": "SERBIA(330)", "ou_number": "330", "bank": "UniCredit Serbia", "bank_config": null},
-  "8002": {"ou": "SERBIA(330)", "ou_number": "330", "bank": "UniCredit USD", "bank_config": null},
-  "8134": {"ou": "SINGAPORE(411)", "ou_number": "411", "bank": "DBS Singapore", "bank_config": "DBS_SGD"},
-  "6374": {"ou": "SWITZERLAND(323)", "ou_number": "323", "bank": "STANDARD CHARTERED CHF", "bank_config": "SCB_CHF"},
-  "8301": {"ou": "UK(312)", "ou_number": "312", "bank": "STANDARD CHARTERED GBP", "bank_config": "SCB_GBP"},
-  "8876": {"ou": "UK(312)", "ou_number": "312", "bank": "HSBC BANK PLC", "bank_config": "HSBC_GBP"},
-  "8884": {"ou": "UK(312)", "ou_number": "312", "bank": "HSBC BANK PLC", "bank_config": "HSBC_GBP"},
-  "8350": {"ou": "UK(312)", "ou_number": "312", "bank": "STANDARD CHARTERED USD", "bank_config": "SCB_USD"},
-  "8396": {"ou": "UK(312)", "ou_number": "312", "bank": "STANDARD CHARTERED EURO", "bank_config": "SCB_EUR"},
-  "2087": {"ou": "UK(312)", "ou_number": "312", "bank": "HSBC Bank UK USD", "bank_config": "HSBC_USD_UK"},
-  "6373": {"ou": "UK(312)", "ou_number": "312", "bank": "HSBC UK Interest USD", "bank_config": "HSBC_USD_INT"},
-  "4178": {"ou": "ZENSAR INC PRODUCT SALE(224)", "ou_number": "224", "bank": "HSBC Checking", "bank_config": "HSBC_CASHPRO_USD_INC"},
-  "1217": {"ou": "ZENSAR INC PRODUCT SALE(224)", "ou_number": "224", "bank": "BOA CHECKING", "bank_config": null},
-  "6000": {"ou": "ZENSAR US GAAP(211)", "ou_number": "211", "bank": "Bank of America Indigo Slate", "bank_config": null},
-  "5483": {"ou": "M3BI US(291)", "ou_number": "291", "bank": "PNC Bank M3BI", "bank_config": null},
-  "3829": {"ou": "M3BI PUNE(168)", "ou_number": "168", "bank": "ICICI Bank Pune", "bank_config": null},
-  "5883": {"ou": "M3BI PUNE(168)", "ou_number": "168", "bank": "HDFC Bank", "bank_config": null},
-  "4781": {"ou": "PA BLR(171)", "ou_number": "171", "bank": "ICICI BANK", "bank_config": "ICICI_INR"},
-  "0043": {"ou": "M3BI HYD(169)", "ou_number": "169", "bank": "ICICI Hyd WaveRock", "bank_config": null},
-  "5072": {"ou": "M3BI HYD(169)", "ou_number": "169", "bank": "HDFC Bank Current", "bank_config": null},
-  "8857": {"ou": "M3BI HYD(169)", "ou_number": "169", "bank": "HDFC Bank EEFC", "bank_config": null},
-  "2313": {"ou": "M3BI HYD(169)", "ou_number": "169", "bank": "HDFC Bank Dividend", "bank_config": null},
-  "1900": {"ou": "KENYA(512)", "ou_number": "512", "bank": "SCB KES", "bank_config": null},
-  "4145": {"ou": "KL MXN(271)", "ou_number": "271", "bank": "HSBC Mexico", "bank_config": null},
-  "0626": {"ou": "KL MXN(271)", "ou_number": "271", "bank": "HSBC Bank KLM", "bank_config": null},
-  "5116": {"ou": "KOL(193)", "ou_number": "193", "bank": "Citi Bank Pune", "bank_config": "CITI_INR"},
-  "3903": {"ou": "POLAND UK BRANCH(326)", "ou_number": "326", "bank": "HSBC France Poland", "bank_config": "HSBC_PLN"},
-  "2110": {"ou": "UK(312)", "ou_number": "312", "bank": "HSBC EUR Netherlands", "bank_config": "HSBC_EUR_NL"},
-  "0003": {"ou": "GERMANY(327)", "ou_number": "327", "bank": "HSBC Germany", "bank_config": "HSBC_EUR_DE"},
-  "9308": {"ou": "UK(312)", "ou_number": "312", "bank": "HSBC Ireland", "bank_config": "HSBC_EUR_IE"}
+  "452": {
+    "ou": "281 Canada",
+    "ou_number": "281",
+    "bank": "Royal Bank of Canada",
+    "bank_config": null
+  },
+  "0481": {
+    "ou": "AUSTRALIA(421)",
+    "ou_number": "421",
+    "bank": "CBA",
+    "bank_config": null
+  },
+  "7347": {
+    "ou": "AUSTRALIA(421)",
+    "ou_number": "421",
+    "bank": "ANZ Australia",
+    "bank_config": "ANZ_AUD"
+  },
+  "1707": {
+    "ou": "AUSTRALIA(421)",
+    "ou_number": "421",
+    "bank": "RBS Sydney",
+    "bank_config": null
+  },
+  "0906": {
+    "ou": "BRIDGEVIEW(212)",
+    "ou_number": "212",
+    "bank": "PNC Bank",
+    "bank_config": null
+  },
+  "0248": {
+    "ou": "BRIDGEVIEW(212)",
+    "ou_number": "212",
+    "bank": "Legacy Solutions",
+    "bank_config": null
+  },
+  "9134": {
+    "ou": "BRIDGEVIEW(212)",
+    "ou_number": "212",
+    "bank": "Solutions Savings",
+    "bank_config": null
+  },
+  "5124": {
+    "ou": "CESSNA BLR(167)",
+    "ou_number": "167",
+    "bank": "Citi Bank Pune",
+    "bank_config": "CITI_INR"
+  },
+  "2001": {
+    "ou": "CESSNA BLR(167)",
+    "ou_number": "167",
+    "bank": "Zensar CESSNA BLR",
+    "bank_config": null
+  },
+  "6033": {
+    "ou": "COLOMBIA(273)",
+    "ou_number": "273",
+    "bank": "BBVA Colombia",
+    "bank_config": "BBVA_COP"
+  },
+  "4046": {
+    "ou": "EON(151)",
+    "ou_number": "151",
+    "bank": "KOTAK MAHINDRA",
+    "bank_config": null
+  },
+  "3826": {
+    "ou": "EON(151)",
+    "ou_number": "151",
+    "bank": "ICICI Bank",
+    "bank_config": null
+  },
+  "1389": {
+    "ou": "EON(152)",
+    "ou_number": "152",
+    "bank": "Kotak Mahindra",
+    "bank_config": null
+  },
+  "4002": {
+    "ou": "EON(153)",
+    "ou_number": "153",
+    "bank": "HSBC EON III",
+    "bank_config": null
+  },
+  "5817": {
+    "ou": "EON(153)",
+    "ou_number": "153",
+    "bank": "CITI Bank EON SEZ II",
+    "bank_config": "CITI_INR"
+  },
+  "2003": {
+    "ou": "GERMANY(327)",
+    "ou_number": "327",
+    "bank": "HSBC Germany",
+    "bank_config": "HSBC_EUR_DE"
+  },
+  "7005": {
+    "ou": "HYD SEZ II(163)",
+    "ou_number": "163",
+    "bank": "CITIBANK",
+    "bank_config": "CITI_INR"
+  },
+  "4001": {
+    "ou": "HYD SEZ III(166)",
+    "ou_number": "166",
+    "bank": "HSBC HYD SEZ III",
+    "bank_config": null
+  },
+  "5825": {
+    "ou": "HYD-SEZ(162)",
+    "ou_number": "162",
+    "bank": "CITI Bank DLF SEZ I",
+    "bank_config": "CITI_INR"
+  },
+  "9031": {
+    "ou": "POLAND UK BRANCH(326)",
+    "ou_number": "326",
+    "bank": "HSBC France Poland",
+    "bank_config": "HSBC_PLN"
+  },
+  "1244": {
+    "ou": "PUNE(111)",
+    "ou_number": "111",
+    "bank": "HSBC US",
+    "bank_config": "HSBC_CASHPRO_USD_SOUTHERN"
+  },
+  "8001": {
+    "ou": "PUNE(111)",
+    "ou_number": "111",
+    "bank": "HSBC Bank",
+    "bank_config": null
+  },
+  "0170": {
+    "ou": "PUNE(111)",
+    "ou_number": "111",
+    "bank": "Kotak Mahindra",
+    "bank_config": null
+  },
+  "2495": {
+    "ou": "PUNE(111)",
+    "ou_number": "111",
+    "bank": "ICICI Bank CASH",
+    "bank_config": null
+  },
+  "0856": {
+    "ou": "PUNE(111)",
+    "ou_number": "111",
+    "bank": "HDFC Bank",
+    "bank_config": null
+  },
+  "0709": {
+    "ou": "PUNE(111)",
+    "ou_number": "111",
+    "bank": "STANCHART Main",
+    "bank_config": null
+  },
+  "5019": {
+    "ou": "PUNE(111)",
+    "ou_number": "111",
+    "bank": "Citibank NA",
+    "bank_config": "CITI_INR"
+  },
+  "5043": {
+    "ou": "PUNE(111)",
+    "ou_number": "111",
+    "bank": "CITI BANK USD EEFC",
+    "bank_config": "CITI_INR"
+  },
+  "5051": {
+    "ou": "PUNE(111)",
+    "ou_number": "111",
+    "bank": "CITI BANK GBP EEFC",
+    "bank_config": "CITI_INR"
+  },
+  "5132": {
+    "ou": "RMZ SEZ BLR(175)",
+    "ou_number": "175",
+    "bank": "Citi Bank Pune",
+    "bank_config": "CITI_INR"
+  },
+  "6709": {
+    "ou": "RMZ SEZ BLR(175)",
+    "ou_number": "175",
+    "bank": "ICICI BANK",
+    "bank_config": null
+  },
+  "3600": {
+    "ou": "SA HOLDINGS(515)",
+    "ou_number": "515",
+    "bank": "STANDARD CHARTERED",
+    "bank_config": "SCB_ZAR"
+  },
+  "3500": {
+    "ou": "SA OPERATING-JV(513)",
+    "ou_number": "513",
+    "bank": "STANDARD CHARTERED",
+    "bank_config": "SCB_ZAR"
+  },
+  "0066": {
+    "ou": "SERBIA(330)",
+    "ou_number": "330",
+    "bank": "UniCredit Serbia",
+    "bank_config": null
+  },
+  "8002": {
+    "ou": "SERBIA(330)",
+    "ou_number": "330",
+    "bank": "UniCredit USD",
+    "bank_config": null
+  },
+  "8134": {
+    "ou": "SINGAPORE(411)(411)",
+    "ou_number": "411",
+    "bank": "Development Bank of Singapore",
+    "bank_config": "0120128134"
+  },
+  "6374": {
+    "ou": "SWITZERLAND(323)",
+    "ou_number": "323",
+    "bank": "STANDARD CHARTERED CHF",
+    "bank_config": "SCB_CHF"
+  },
+  "8301": {
+    "ou": "UK(312)",
+    "ou_number": "312",
+    "bank": "STANDARD CHARTERED GBP",
+    "bank_config": "SCB_GBP"
+  },
+  "8876": {
+    "ou": "UK(312)",
+    "ou_number": "312",
+    "bank": "HSBC BANK PLC",
+    "bank_config": "HSBC_GBP"
+  },
+  "8884": {
+    "ou": "UK(312)",
+    "ou_number": "312",
+    "bank": "HSBC BANK PLC",
+    "bank_config": "HSBC_GBP"
+  },
+  "8350": {
+    "ou": "UK(312)",
+    "ou_number": "312",
+    "bank": "STANDARD CHARTERED USD",
+    "bank_config": "SCB_USD"
+  },
+  "8396": {
+    "ou": "UK(312)",
+    "ou_number": "312",
+    "bank": "STANDARD CHARTERED EURO",
+    "bank_config": "SCB_EUR"
+  },
+  "2087": {
+    "ou": "UK(312)",
+    "ou_number": "312",
+    "bank": "HSBC Bank UK USD",
+    "bank_config": "HSBC_USD_UK"
+  },
+  "6373": {
+    "ou": "UK(312)",
+    "ou_number": "312",
+    "bank": "HSBC UK Interest USD",
+    "bank_config": "HSBC_USD_INT"
+  },
+  "4178": {
+    "ou": "ZENSAR INC PRODUCT SALE(224)",
+    "ou_number": "224",
+    "bank": "HSBC Checking",
+    "bank_config": "HSBC_CASHPRO_USD_INC"
+  },
+  "1217": {
+    "ou": "ZENSAR INC PRODUCT SALE(224)",
+    "ou_number": "224",
+    "bank": "BOA CHECKING",
+    "bank_config": null
+  },
+  "6000": {
+    "ou": "ZENSAR US GAAP(211)",
+    "ou_number": "211",
+    "bank": "Bank of America Indigo Slate",
+    "bank_config": null
+  },
+  "5483": {
+    "ou": "M3BI US(291)",
+    "ou_number": "291",
+    "bank": "PNC Bank M3BI",
+    "bank_config": null
+  },
+  "3829": {
+    "ou": "M3BI PUNE(168)",
+    "ou_number": "168",
+    "bank": "ICICI Bank Pune",
+    "bank_config": null
+  },
+  "5883": {
+    "ou": "M3BI PUNE(168)",
+    "ou_number": "168",
+    "bank": "HDFC Bank",
+    "bank_config": null
+  },
+  "4781": {
+    "ou": "PA BLR(171)",
+    "ou_number": "171",
+    "bank": "ICICI BANK",
+    "bank_config": "ICICI_INR"
+  },
+  "0043": {
+    "ou": "M3BI HYD(169)",
+    "ou_number": "169",
+    "bank": "ICICI Hyd WaveRock",
+    "bank_config": null
+  },
+  "5072": {
+    "ou": "M3BI HYD(169)",
+    "ou_number": "169",
+    "bank": "HDFC Bank Current",
+    "bank_config": null
+  },
+  "8857": {
+    "ou": "M3BI HYD(169)",
+    "ou_number": "169",
+    "bank": "HDFC Bank EEFC",
+    "bank_config": null
+  },
+  "2313": {
+    "ou": "M3BI HYD(169)",
+    "ou_number": "169",
+    "bank": "HDFC Bank Dividend",
+    "bank_config": null
+  },
+  "1900": {
+    "ou": "KENYA(512)",
+    "ou_number": "512",
+    "bank": "SCB KES",
+    "bank_config": null
+  },
+  "4145": {
+    "ou": "KL MXN(271)",
+    "ou_number": "271",
+    "bank": "HSBC Mexico",
+    "bank_config": null
+  },
+  "0626": {
+    "ou": "KL MXN(271)",
+    "ou_number": "271",
+    "bank": "HSBC Bank KLM",
+    "bank_config": null
+  },
+  "5116": {
+    "ou": "KOL(193)",
+    "ou_number": "193",
+    "bank": "Citi Bank Pune",
+    "bank_config": "CITI_INR"
+  },
+  "3903": {
+    "ou": "POLAND UK BRANCH(326)",
+    "ou_number": "326",
+    "bank": "HSBC France Poland",
+    "bank_config": "HSBC_PLN"
+  },
+  "2110": {
+    "ou": "UK(312)",
+    "ou_number": "312",
+    "bank": "HSBC EUR Netherlands",
+    "bank_config": "HSBC_EUR_NL"
+  },
+  "0003": {
+    "ou": "GERMANY(327)",
+    "ou_number": "327",
+    "bank": "HSBC Germany",
+    "bank_config": "HSBC_EUR_DE"
+  },
+  "9308": {
+    "ou": "UK(312)",
+    "ou_number": "312",
+    "bank": "HSBC Ireland",
+    "bank_config": "HSBC_EUR_IE"
+  }
 }

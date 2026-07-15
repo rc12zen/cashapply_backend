@@ -409,7 +409,9 @@ class RemittanceExtraction(Base):
     id                    = Column(Integer, primary_key=True, autoincrement=True)
     source                = Column(String)
     storage_key           = Column(String)
+    filename              = Column(String, nullable=True)   # original filename, before storage_key's timestamp prefix
     subject               = Column(String, nullable=True)
+    sender                = Column(String, nullable=True)   # best-effort sender address/name (.msg only)
     raw_customer_text     = Column(String, nullable=True)
     raw_payer_text        = Column(String, nullable=True)
     payment_reference     = Column(String, nullable=True)
@@ -420,6 +422,10 @@ class RemittanceExtraction(Base):
     extraction_confidence = Column(Float, nullable=True)
     extracted_at          = Column(DateTime, default=dt.datetime.utcnow)
     raw_model_output      = Column(JSON, nullable=True)
+    # PATCH: full extracted email/document body text, written by App2
+    # (cashapply-remittance-agent). Row-detail's remittance panel "Raw" tab
+    # reads this as raw_body — see bff/row_detail.py.
+    raw_text              = Column(Text, nullable=True)
 
     invoice_lines = relationship("RemittanceInvoiceLine", back_populates="extraction")
 
