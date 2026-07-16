@@ -39,8 +39,9 @@ router = APIRouter()
 # by the background ingestion worker) still show up under "All Logs".
 _CATEGORIES: dict[str, dict] = {
     "analysis_run":      {"like": ["run.start%", "run.reset%"], "actor": "user"},
-    "config_creation":   {"like": ["config.create%"]},
-    "manual_mapping":    {"like": ["hitl.manual_mapping%"]},
+    # "Configure Creation" pill removed — config.create rows now surface
+    # under "Manual Invoice Mapping" instead (see PILLS in activity-log/page.tsx).
+    "manual_mapping":    {"like": ["hitl.manual_mapping%", "config.create%"]},
     "approved":          {"like": ["hitl.approve%", "oracle.retry%"]},
     "rejected":          {"like": ["hitl.reject%"]},
 }
@@ -66,11 +67,14 @@ def _summarize(r: ActivityLog, email: str | None) -> str:
     if a.startswith("statement.restore"):
         return f"{who} restored a statement"
     if a.startswith("statement.delete"):
-        return f"{who} deleted statement {id_}"
+        return f"{who} removed {id_}"
     if a.startswith("hitl.manual_mapping"):
         return f"{who} mapped line item #{id_} to invoice(s) {', '.join(m.get('invoice_numbers') or [])}"
     if a.startswith("config.create"):
-        return f"The config for {m.get('display_name')} has been created by {who}"
+        bank = m.get("bank") or "UNKNOWN"
+        last4 = (id_ or "")[-4:]
+        filename = m.get("filename") or "a file"
+        return f"{who} added a config for {bank}-{last4} using {filename}"
     if a.startswith("hitl.approve_bulk"):
         return f"{who} approved multiple line items"
     if a.startswith("hitl.approve"):
