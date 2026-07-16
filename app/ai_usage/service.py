@@ -7,13 +7,17 @@ entirely hardcoded placeholder values — see app/home/page.tsx).
 
 Scoping note: usage can be scoped by run_id OR by a created_at date range
 (the same two axes the dashboard's time pills use — "Last Analysis" => run,
-Today/WTD/MTD/Custom => date range). Date filtering is on created_at (when we
+Today/WTD/MTD/Custom => date range), and optionally further narrowed by user
+(matching AnalysisRun.triggered_by, the run starter's email — same field
+bff/metrics.py's run_by filter uses). Date filtering is on created_at (when we
 processed the call), mirroring bff/metrics.py — see backend CLAUDE.md gotcha
 #3 for why created_at, and why date_to needs an end-of-day bump.
 
-There is deliberately no bank/BU/user scoping here: AiUsageLog is tagged by
-run_id and time only, so token spend can't be attributed to those filters
-without a fragile join through run -> files -> account.
+There is deliberately no bank/BU scoping here: AiUsageLog is tagged by run_id
+and time only, so token spend can't be attributed to those filters without a
+fragile join through run -> files -> account. User scoping is different: it
+only needs AnalysisRun.triggered_by, a field already set the instant a run
+exists (see bff/run_routes.py's /run/start), so that join is cheap and exact.
 """
 from __future__ import annotations
 
@@ -21,12 +25,15 @@ import datetime as dt
 
 from sqlalchemy.orm import Session
 
-from ..db.models import AiUsageLog
+from ..db.models import AiUsageLog, AnalysisRun
 from ..db.settings import get_settings
 
 
-def _apply_scope(q, run_id: int | None, date_from: str | None, date_to: str | None):
-    """Filter an AiUsageLog query by run_id and/or a created_at date range.
+def _apply_scope(q, run_id: int | None, date_from: str | None, date_to: str | None,
+                  user: str | None = None):
+    """Filter an AiUsageLog query by run_id and/or a created_at date range,
+    and optionally by the run's starter (AnalysisRun.triggered_by — same
+    field bff/metrics.py's run_by filter uses, for consistency).
 
     date_from/date_to are 'YYYY-MM-DD' strings from the frontend. The
     end-of-day bump on date_to matches bff/metrics.py exactly: created_at has
@@ -48,6 +55,18 @@ def _apply_scope(q, run_id: int | None, date_from: str | None, date_to: str | No
             - dt.timedelta(microseconds=1)
         )
         q = q.filter(AiUsageLog.created_at <= end_of_day)
+    if user and not run_id:
+        # Same skip-if-run_id-set logic as bff/metrics.py's run_by: run_id
+        # already pins one specific run (with exactly one triggered_by), so
+        # ANDing a user filter on top only ever narrows to that same run
+        # (redundant) or zeroes every row out (whenever the selected user
+        # didn't happen to start that exact run).
+        matching_run_ids = (
+            q.session.query(AnalysisRun.run_id)
+            .filter(AnalysisRun.triggered_by == user)
+            .subquery()
+        )
+        q = q.filter(AiUsageLog.run_id.in_(matching_run_ids))
     return q
 
 
@@ -96,8 +115,9 @@ def get_usage_summary(
     run_id: int | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
+    user: str | None = None,
 ) -> dict:
-    rows = _apply_scope(db.query(AiUsageLog), run_id, date_from, date_to).all()
+    rows = _apply_scope(db.query(AiUsageLog), run_id, date_from, date_to, user).all()
 
     s = get_settings()
     summary = _summarize(rows)
@@ -116,6 +136,35 @@ def get_usage_summary(
     )
     summary["by_model"] = _breakdown_by_model(rows)
     return summary
+
+
+def get_recent_runs_usage(db: Session, user: str | None = None, limit: int = 5) -> list[dict]:
+    """
+    AI usage broken down per-run for the last `limit` completed analysis
+    runs (most recent first), optionally narrowed to one user's own runs
+    (AnalysisRun.triggered_by). Backs the "Last 5 Analyses" component on the
+    AI Usage page — the per-run scoping /summary already supports, just
+    applied across several runs at once instead of one at a time.
+    """
+    q = db.query(AnalysisRun).filter(AnalysisRun.status == "completed")
+    if user:
+        q = q.filter(AnalysisRun.triggered_by == user)
+    runs = q.order_by(AnalysisRun.completed_at.desc().nullslast(), AnalysisRun.run_id.desc()).limit(limit).all()
+
+    out = []
+    for run in runs:
+        rows = db.query(AiUsageLog).filter(AiUsageLog.run_id == run.run_id).all()
+        s = _summarize(rows)
+        out.append({
+            "run_id": run.run_id,
+            "completed_at": run.completed_at.isoformat() + "Z" if run.completed_at else None,
+            "triggered_by": run.triggered_by,
+            "model": rows[0].model if rows else None,
+            "call_count": s["call_count"],
+            "total_tokens": s["total_tokens"],
+            "total_cost_usd": s["total_cost_usd"],
+        })
+    return out
 
 
 def get_usage_totals(db: Session) -> dict:

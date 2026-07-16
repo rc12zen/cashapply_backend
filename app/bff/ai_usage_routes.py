@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from ..ai_usage.service import get_usage_summary, get_usage_totals
+from ..ai_usage.service import get_usage_summary, get_usage_totals, get_recent_runs_usage
 from ..deps import get_db
 
 router = APIRouter()
@@ -19,16 +19,32 @@ def get_ai_usage_summary(
     run_id: int | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
+    user: str | None = None,
     db: Session = Depends(get_db),
 ):
     """
     AI token consumption + cost, scoped to one run (run_id) OR a created_at
-    date range (date_from/date_to, 'YYYY-MM-DD'). Includes a per-model
-    breakdown. Backs the dashboard's "AI Run Details" panel (app/home/page.tsx)
-    — no permission gate here since it's read-only aggregate cost data, same
-    tier as /api/results/metrics.
+    date range (date_from/date_to, 'YYYY-MM-DD'), optionally further narrowed
+    to one user's own runs (user — matches AnalysisRun.triggered_by, same
+    convention as /api/results/metrics' run_by filter; ignored when run_id is
+    set, same reasoning as that filter). Includes a per-model breakdown.
+    Backs the AI Usage page — no permission gate here since it's read-only
+    aggregate cost data, same tier as /api/results/metrics.
     """
-    return get_usage_summary(db, run_id=run_id, date_from=date_from, date_to=date_to)
+    return get_usage_summary(db, run_id=run_id, date_from=date_from, date_to=date_to, user=user)
+
+
+@router.get("/recent")
+def get_ai_usage_recent(
+    user: str | None = None,
+    limit: int = 5,
+    db: Session = Depends(get_db),
+):
+    """
+    Per-run AI usage for the last `limit` completed analysis runs, optionally
+    narrowed to one user's own runs. Backs the "Last 5 Analyses" component.
+    """
+    return {"runs": get_recent_runs_usage(db, user=user, limit=limit)}
 
 
 @router.get("/totals")
@@ -45,14 +61,15 @@ def export_ai_usage_csv(
     run_id: int | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
+    user: str | None = None,
     db: Session = Depends(get_db),
 ):
     """
     CSV export of AI usage aggregated by model, honoring the same run_id /
-    date range scope as /summary. Read-only cost data — no permission gate,
-    matching /summary.
+    date range / user scope as /summary. Read-only cost data — no permission
+    gate, matching /summary.
     """
-    summary = get_usage_summary(db, run_id=run_id, date_from=date_from, date_to=date_to)
+    summary = get_usage_summary(db, run_id=run_id, date_from=date_from, date_to=date_to, user=user)
 
     buf = io.StringIO()
     writer = csv.writer(buf)
