@@ -33,9 +33,15 @@ app = FastAPI(title="CashApply Backend", version="1.1.0")
 # tracebacks/exception dumps never leave the server; see common/errors.py.
 register_exception_handlers(app)
 
+_settings = get_settings()
+_cors_origins = (
+    ["*"] if _settings.CORS_ALLOWED_ORIGINS.strip() == "*"
+    else [o.strip() for o in _settings.CORS_ALLOWED_ORIGINS.split(",") if o.strip()]
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # tighten to frontend origin in prod
+    allow_origins=_cors_origins,  # "*" for local dev; set CORS_ALLOWED_ORIGINS for UAT/prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
