@@ -20,6 +20,7 @@ Pipeline per file
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -33,6 +34,8 @@ from .extractor import ExtractorFactory
 from .credit_rules import eval_credit_rule
 from .transforms import apply_transforms
 from .ou_resolver import resolve_ou
+
+logger = logging.getLogger("cashapply.parser")
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +422,7 @@ def parse_credit_rows(
     default_bank = cfg.get("display_name") or ""
 
     out: list[NormalizedCreditRow] = []
+    invalid_amount_count = 0
 
     for _, row in df.iterrows():
         # 5a. Credit rule
@@ -440,9 +444,25 @@ def parse_credit_rows(
 
         # 5e. Convert credit_amount to float (robust: commas, parens, CR/DR, €)
         credit_amount = parse_amount(record.get("credit_amount"))
-        if credit_amount is None:
-            # Genuinely non-numeric amount on a row the credit rule accepted —
-            # skip it rather than store a misleading 0.0.
+        if credit_amount is None or credit_amount <= 0:
+            # A Credit Amount must be numeric and strictly POSITIVE (> 0)
+            # (TC-180). A credit-rule-accepted row whose amount is non-numeric,
+            # negative, or zero is INVALID — flag it (WARNING log, with context)
+            # and DROP it, never ingest it as a valid credit. A zero-value
+            # "credit" isn't an applicable payment, and negatives/zeros matter
+            # especially for flag-based credit rules (flag_matches), which only
+            # look at a CR/DR marker and never at the amount — so a negative or
+            # zero "credit" would otherwise slip through here as a real credit.
+            # This also keeps flag-based rules consistent with amount_positive,
+            # which already requires `amount > 0`.
+            reason = ("non-numeric" if credit_amount is None
+                      else "zero" if credit_amount == 0 else "negative")
+            invalid_amount_count += 1
+            logger.warning(
+                "Dropping row with %s credit amount %r (file=%s, ref=%s, date=%r)",
+                reason, record.get("credit_amount"), filename,
+                record.get("bank_reference"), record.get("date"),
+            )
             continue
 
         # 5f. OU resolution — strictly per row's own account (account_ou_map).
@@ -464,5 +484,11 @@ def parse_credit_rows(
             ou_number      = ou_number,
             business_unit  = business_unit,
         ))
+
+    if invalid_amount_count:
+        logger.warning(
+            "%s: dropped %d row(s) with invalid (non-numeric, zero, or negative) credit amounts",
+            filename, invalid_amount_count,
+        )
 
     return out
