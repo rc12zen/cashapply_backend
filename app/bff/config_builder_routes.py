@@ -157,6 +157,25 @@ async def builder_upload(file: UploadFile = File(...), db: Session = Depends(get
 
 # ── raw preview ─────────────────────────────────────────────────────────────────
 
+def _trim_trailing_empty_cols(rows: list[list[str]]) -> list[list[str]]:
+    """Normalize every row to equal width, then drop only the TRAILING columns
+    that are empty in every previewed row. This is what makes the wizard show
+    exactly the columns that carry data — a column is kept if it has a value in
+    the header OR any data row, so nothing with data is missed, while the run of
+    blank padding columns after the last real one is removed. Interior empty
+    columns are preserved (index position matters for column mapping)."""
+    if not rows:
+        return rows
+    width = max((len(r) for r in rows), default=0)
+    norm = [list(r) + [""] * (width - len(r)) for r in rows]
+    last_with_data = -1
+    for c in range(width):
+        if any((norm[r][c] or "").strip() for r in range(len(norm))):
+            last_with_data = c
+    keep = last_with_data + 1
+    return [r[:keep] for r in norm]
+
+
 @router.get("/builder/raw-preview/{filename}")
 def builder_raw_preview(filename: str, db: Session = Depends(get_db),
                         user: User = Depends(require_permission("config:manage"))):
@@ -164,7 +183,11 @@ def builder_raw_preview(filename: str, db: Session = Depends(get_db),
     record, local_path = _local_path(db, filename)
     ext = os.path.splitext(filename)[1].lower().lstrip(".")
 
-    MAX_ROWS, MAX_COLS = 40, 20
+    # MAX_COLS is a safety CEILING against pathologically wide files, not the
+    # display width — actual columns returned are trimmed to the last one that
+    # holds data (see _trim_trailing_empty_cols), so a normal statement shows
+    # all its real columns (e.g. 27) without hitting the ceiling.
+    MAX_ROWS, MAX_COLS = 40, 50
     sheets = []
     if ext in ("xlsx", "xlsm"):
         try:
@@ -174,7 +197,7 @@ def builder_raw_preview(filename: str, db: Session = Depends(get_db),
                 ws = wb[sh]
                 rows = [[str(v).strip() if v is not None else "" for v in row]
                         for row in ws.iter_rows(min_row=1, max_row=MAX_ROWS, max_col=MAX_COLS, values_only=True)]
-                sheets.append({"name": sh, "rows": rows})
+                sheets.append({"name": sh, "rows": _trim_trailing_empty_cols(rows)})
             wb.close()
         except Exception as e:
             logger.exception("raw-preview: failed to read xlsx %s", filename)
@@ -192,7 +215,7 @@ def builder_raw_preview(filename: str, db: Session = Depends(get_db),
                            for c in range(min(MAX_COLS, ws.ncols))]
                     row += [""] * (MAX_COLS - len(row))
                     rows.append(row)
-                sheets.append({"name": sh, "rows": rows})
+                sheets.append({"name": sh, "rows": _trim_trailing_empty_cols(rows)})
         except Exception as e:
             logger.exception("raw-preview: failed to read xls %s", filename)
             raise AppError(ErrorCode.CONFIG_FILE_UNREADABLE,
@@ -203,7 +226,7 @@ def builder_raw_preview(filename: str, db: Session = Depends(get_db),
             with open(local_path, encoding="utf-8", errors="replace") as f:
                 rows = [[str(v).strip() for v in row[:MAX_COLS]]
                         for i, row in enumerate(csv.reader(f)) if i < MAX_ROWS]
-            sheets.append({"name": "Sheet1", "rows": rows})
+            sheets.append({"name": "Sheet1", "rows": _trim_trailing_empty_cols(rows)})
         except Exception as e:
             logger.exception("raw-preview: failed to read csv %s", filename)
             raise AppError(ErrorCode.CONFIG_FILE_UNREADABLE,
