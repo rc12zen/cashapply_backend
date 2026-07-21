@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from ..common.errors import AppError
 from ..common.error_codes import ErrorCode
+from .date_range import parse_date_from, parse_date_to
 from ..db.models import AnalysisRun, BankAccount, LineItem, RunStatus, SourceFile, StatementTransactionRow, User
 from ..storage.client import get_storage_client
 from ..deps import get_db
@@ -350,9 +351,9 @@ def get_run_history(
 ):
     q = db.query(AnalysisRun)
     if date_from:
-        q = q.filter(AnalysisRun.started_at >= date_from)
+        q = q.filter(AnalysisRun.started_at >= parse_date_from(date_from))
     if date_to:
-        q = q.filter(AnalysisRun.started_at <= date_to)
+        q = q.filter(AnalysisRun.started_at <= parse_date_to(date_to))
     if triggered_by:
         # "User" filter for the Analysis History page — who STARTED the
         # run (a run-level concept), as distinct from the Home dashboard's
