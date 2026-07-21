@@ -28,6 +28,24 @@ from .errors import AppError
 # The only accepted bank-statement extensions (lower-case, no dot).
 ALLOWED_STATEMENT_EXTENSIONS: frozenset[str] = frozenset({"xlsx", "xls", "csv"})
 
+# Max upload size — 10 MB (binary), matching the frontend's "Max 10 MB each" hint.
+MAX_UPLOAD_BYTES: int = 10 * 1024 * 1024
+
+
+def _human_mb(num_bytes: int) -> str:
+    return f"{num_bytes / (1024 * 1024):.1f} MB"
+
+
+def validate_statement_size(num_bytes: int | None) -> None:
+    """Raise AppError(STATEMENT_FILE_TOO_LARGE) if `num_bytes` exceeds the
+    10 MB limit. A None size (unknown Content-Length) is a no-op — the caller
+    re-checks with the actual byte count after reading. No-op on success."""
+    if num_bytes is not None and num_bytes > MAX_UPLOAD_BYTES:
+        raise AppError(
+            ErrorCode.STATEMENT_FILE_TOO_LARGE,
+            detail=f"file is {_human_mb(num_bytes)} (limit {_human_mb(MAX_UPLOAD_BYTES)})",
+        )
+
 
 def validate_statement_upload(filename: str | None) -> None:
     """Raise AppError(STATEMENT_FILE_TYPE_UNSUPPORTED) unless `filename` ends

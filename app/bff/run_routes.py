@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 
 from ..common.errors import AppError
 from ..common.error_codes import ErrorCode
-from ..common.upload_validation import validate_statement_upload
+from ..common.upload_validation import validate_statement_upload, validate_statement_size
 from ..db.models import AnalysisRun, BankAccount, LineItem, RunStatus, SourceFile, StatementTransactionRow, User
 from ..storage.client import get_storage_client
 from ..deps import get_db
@@ -172,10 +172,14 @@ async def upload_statement(
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("statement:upload")),
 ):
-    # Reject anything that isn't Excel/CSV up front, with a clear message,
-    # before reading the bytes or touching storage.
+    # Reject the wrong file type / oversized files up front, with a clear
+    # message, before reading the bytes or touching storage. file.size is the
+    # declared Content-Length (early reject); len(data) is the authoritative
+    # re-check after reading.
     validate_statement_upload(file.filename)
+    validate_statement_size(file.size)
     data = await file.read()
+    validate_statement_size(len(data))
     result = handle_statement_upload_v2(db, file.filename, data, uploaded_by=user)
 
     if result.get("duplicate"):

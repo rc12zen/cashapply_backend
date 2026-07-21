@@ -173,6 +173,11 @@ class ErrorCode:
         "Only Excel (.xlsx, .xls) and CSV (.csv) bank statements are accepted. "
         "Please upload one of those formats.",
     )
+    STATEMENT_FILE_TOO_LARGE = ErrorDef(
+        2010, "STATEMENT_FILE_TOO_LARGE", 413,
+        "File too large",
+        "Bank statement files must be 10 MB or smaller. Please upload a smaller file.",
+    )
 
     # ── 3000-3999  Config / Config Builder ──────────────────────────────────
     CONFIG_NOT_FOUND = ErrorDef(
