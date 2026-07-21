@@ -60,8 +60,9 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from ..db.models import AnalysisRun, LineItem
+from ..db.models import AnalysisRun, LineItem, User
 from ..deps import get_db
+from ..auth import require_permission
 from .metrics import (
     GROUP_CONFLICT_EXCEPTION, GROUP_NEEDS_REMITTANCE, GROUP_POST_FAILED,
     GROUP_REJECTED, GROUP_UNIDENTIFIED, GROUP_LABELS, _category_for_row,
@@ -187,7 +188,8 @@ def _serialize_record(r: LineItem) -> dict:
 
 
 @router.get("/filters")
-def get_executive_filters(mode: str = "posted", db: Session = Depends(get_db)):
+def get_executive_filters(mode: str = "posted", db: Session = Depends(get_db),
+                          user: User = Depends(require_permission("run:view"))):
     """Dropdown options for Bank / Business Unit.
 
     `mode` scopes the population the options are drawn from, so the dropdown
@@ -232,6 +234,7 @@ def get_executive_summary(
     run_id: Optional[int] = None,
     run_by: Optional[str] = None,
     db: Session = Depends(get_db),
+    user: User = Depends(require_permission("run:view")),
 ):
     rows = _base_query(db, bank_name, business_unit, ou_number, date_from, date_to, run_id, run_by).all()
 
@@ -288,6 +291,7 @@ def get_executive_records(
     page: int = 1,
     page_size: int = 50,
     db: Session = Depends(get_db),
+    user: User = Depends(require_permission("run:view")),
 ):
     q = _base_query(db, bank_name, business_unit, ou_number, date_from, date_to, run_id, run_by)
     q = q.order_by(LineItem.reference_added_at.desc())  # PATCH: was oracle_posted_at — see _base_query note
@@ -319,6 +323,7 @@ def export_executive_csv(
     category: Optional[str] = None,
     run_by: Optional[str] = None,
     db: Session = Depends(get_db),
+    user: User = Depends(require_permission("run:view")),
 ):
     """Streams a CSV of every posted record matching the current filters —
     same filter contract as /records, so what the user sees on screen is
@@ -446,6 +451,7 @@ def get_non_posted_summary(
     run_id: Optional[int] = None,
     run_by: Optional[str] = None,
     db: Session = Depends(get_db),
+    user: User = Depends(require_permission("run:view")),
 ):
     rows = _non_posted_base_query(db, bank_name, business_unit, ou_number, date_from, date_to, run_id, run_by).all()
 
@@ -478,6 +484,7 @@ def get_non_posted_records(
     page: int = 1,
     page_size: int = 50,
     db: Session = Depends(get_db),
+    user: User = Depends(require_permission("run:view")),
 ):
     rows = _non_posted_base_query(db, bank_name, business_unit, ou_number, date_from, date_to, run_id, run_by).all()
 

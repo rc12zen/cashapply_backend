@@ -4,7 +4,10 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
+from ..db.models import User
 from ..deps import get_db
+from ..auth import require_permission
+from ..auth.permissions import get_user_permission_codes
 from .metrics import compute_metrics, compute_run_summary
 from .row_detail import build_row_detail
 from .shortage import compute_shortage_summary
@@ -16,30 +19,35 @@ router = APIRouter()
 def get_metrics(run_id: int | None = None, date_from: str | None = None,
                  date_to: str | None = None, bank_name: str | None = None,
                  business_unit: str | None = None, run_by: str | None = None,
-                 db: Session = Depends(get_db)):
+                 db: Session = Depends(get_db),
+                 user: User = Depends(require_permission("run:view"))):
     return compute_metrics(db, run_id=run_id, date_from=date_from, date_to=date_to,
                             bank_name=bank_name, business_unit=business_unit,
                             run_by=run_by)
 
 
 @router.get("/run-summary/{run_id}")
-def get_run_summary(run_id: int, db: Session = Depends(get_db)):
+def get_run_summary(run_id: int, db: Session = Depends(get_db),
+                     user: User = Depends(require_permission("run:view"))):
     return compute_run_summary(db, run_id)
 
 
 @router.get("/row-detail/{record_id}")
-def get_row_detail(record_id: int, db: Session = Depends(get_db)):
-    return build_row_detail(db, record_id)
+def get_row_detail(record_id: int, db: Session = Depends(get_db),
+                    user: User = Depends(require_permission("run:view"))):
+    return build_row_detail(db, record_id, user_permission_codes=get_user_permission_codes(db, user))
 
 
 @router.get("/not-found")
-def get_not_found(db: Session = Depends(get_db)):
+def get_not_found(db: Session = Depends(get_db),
+                   user: User = Depends(require_permission("run:view"))):
     from .metrics import get_unidentified_rows
     return get_unidentified_rows(db)
 
 
 @router.get("/validation-failures")
-def get_validation_failures(db: Session = Depends(get_db)):
+def get_validation_failures(db: Session = Depends(get_db),
+                             user: User = Depends(require_permission("run:view"))):
     from .metrics import get_conflict_rows
     return get_conflict_rows(db)
 
@@ -49,6 +57,7 @@ def get_processed_shortage_summary(
     run_id: int | None = None, date_from: str | None = None,
     date_to: str | None = None, bank_name: str | None = None,
     business_unit: str | None = None, db: Session = Depends(get_db),
+    user: User = Depends(require_permission("run:view")),
 ):
     return compute_shortage_summary(db, run_id=run_id, date_from=date_from, date_to=date_to,
                                      bank_name=bank_name, business_unit=business_unit)

@@ -37,7 +37,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -46,6 +45,7 @@ from ..schemas.extraction import IdentifiedPayment, UnknownPayment
 from ..aging.aging_map import AgingMap
 from .ou_prefixes import describe_ou
 from .debug_logger import dbg, dbg_block
+from .ai_providers import call_ai
 
 logger = logging.getLogger(__name__)
 
@@ -242,23 +242,9 @@ def _build_ou_grounding(aging_map: AgingMap, ou_number: str | None, run_id: int,
     return inv_lines, cust_lines, customers
 
 
-_client_singleton = None
-
-
-def _get_anthropic_client():
-    """
-    Single shared client per process instead of one `anthropic.Anthropic()`
-    per call. The SDK's client is safe to reuse across sequential calls
-    (each chunk thread only ever has one call in flight at a time).
-    """
-    global _client_singleton
-    if _client_singleton is not None:
-        return _client_singleton
-    import anthropic
-    from ..db.settings import get_settings
-    s = get_settings()
-    _client_singleton = anthropic.Anthropic(api_key=s.ANTHROPIC_API_KEY)
-    return _client_singleton
+_client_singleton = None  # unused, kept only so any external import of this
+                           # name doesn't break -- provider clients now live
+                           # in extraction/ai_providers.py
 
 
 # -- AI call -- BATCH path ---------------------------------------------------------
@@ -272,7 +258,12 @@ def _call_claude_batch(
     batch_ref: str,
 ) -> tuple[Optional[list[dict]], str]:
     """
-    Call the Anthropic API ONCE for a batch of rows sharing the same OU.
+    Call the configured AI provider (see extraction/ai_providers.py --
+    Settings.AI_PROVIDER, "anthropic" or "openai") ONCE for a batch of rows
+    sharing the same OU. Name kept as `_call_claude_batch` for a minimal
+    diff even though this is no longer Claude-specific -- the function's
+    job (build the batch prompt, parse the JSON array response, record
+    usage) is identical regardless of which provider actually answers.
 
     Returns (parsed_json_array, raw_text). parsed_json_array is None if the
     call failed outright OR the response could not be parsed as a JSON
@@ -281,11 +272,6 @@ def _call_claude_batch(
     """
     raw = ""
     try:
-        from ..db.settings import get_settings
-        s = get_settings()
-
-        client = _get_anthropic_client()
-
         grounding = _GROUNDING_TEMPLATE.format(
             ou_description=describe_ou(ou_number),
             max_inv=MAX_CANDIDATE_INVOICES_SHOWN,
@@ -314,25 +300,17 @@ def _call_claude_batch(
         dbg_block(run_id, "2B", batch_ref, "BATCH PROMPT SENT",
                    [_SYSTEM_PROMPT_BATCH, "---", user_msg])
 
-        _t0 = time.monotonic()
-        response = client.messages.create(
-            model=s.CLAUDE_MODEL,
-            max_tokens=max_tokens,
-            temperature=0,
-            system=_SYSTEM_PROMPT_BATCH,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        _latency_ms = int((time.monotonic() - _t0) * 1000)
+        result = call_ai(_SYSTEM_PROMPT_BATCH, user_msg, max_tokens)
 
         from ..ai_usage.tracker import record_usage
         record_usage(
             run_id=run_id, call_type="batch", batch_ref=batch_ref,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            latency_ms=_latency_ms, succeeded=True, model=s.CLAUDE_MODEL,
+            input_tokens=result.input_tokens, output_tokens=result.output_tokens,
+            latency_ms=result.latency_ms, succeeded=True,
+            model=result.model, provider=result.provider,
         )
 
-        raw = response.content[0].text.strip()
+        raw = result.text
         dbg_block(run_id, "2B", batch_ref, "BATCH RAW RESPONSE", [raw])
 
         cleaned = _strip_markdown_fences(raw)
@@ -356,10 +334,13 @@ def _call_claude_batch(
         try:
             from ..ai_usage.tracker import record_usage
             from ..db.settings import get_settings
+            s = get_settings()
+            provider = (s.AI_PROVIDER or "anthropic").strip().lower()
             record_usage(
                 run_id=run_id, call_type="batch", batch_ref=batch_ref,
                 input_tokens=0, output_tokens=0, succeeded=False,
-                model=get_settings().CLAUDE_MODEL,
+                model=s.OPENAI_MODEL if provider == "openai" else s.CLAUDE_MODEL,
+                provider=provider,
             )
         except Exception:
             pass
@@ -377,14 +358,11 @@ def _call_claude_single(
     """
     Fallback path: one call for one row. Only used when the batch containing
     this row could not be parsed as a whole, so a single malformed batch
-    response doesn't blank out every row in it.
+    response doesn't blank out every row in it. Same provider-agnostic
+    call_ai() as the batch path -- see _call_claude_batch's docstring.
     """
     raw = ""
     try:
-        from ..db.settings import get_settings
-        s = get_settings()
-
-        client = _get_anthropic_client()
         user_msg = _SINGLE_USER_TEMPLATE.format(
             narrative=narrative or "(empty)",
             ou_description=describe_ou(ou_number),
@@ -403,25 +381,17 @@ def _call_claude_single(
         dbg_block(run_id, "2B", row_ref, "FALLBACK SINGLE-ROW PROMPT SENT",
                    [_SYSTEM_PROMPT_SINGLE, "---", user_msg])
 
-        _t0 = time.monotonic()
-        response = client.messages.create(
-            model=s.CLAUDE_MODEL,
-            max_tokens=400,
-            temperature=0,
-            system=_SYSTEM_PROMPT_SINGLE,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        _latency_ms = int((time.monotonic() - _t0) * 1000)
+        result = call_ai(_SYSTEM_PROMPT_SINGLE, user_msg, 400)
 
         from ..ai_usage.tracker import record_usage
         record_usage(
             run_id=run_id, call_type="single", batch_ref=row_ref,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            latency_ms=_latency_ms, succeeded=True, model=s.CLAUDE_MODEL,
+            input_tokens=result.input_tokens, output_tokens=result.output_tokens,
+            latency_ms=result.latency_ms, succeeded=True,
+            model=result.model, provider=result.provider,
         )
 
-        raw = response.content[0].text.strip()
+        raw = result.text
         dbg_block(run_id, "2B", row_ref, "FALLBACK RAW RESPONSE", [raw])
 
         cleaned = _strip_markdown_fences(raw)
@@ -439,10 +409,13 @@ def _call_claude_single(
         try:
             from ..ai_usage.tracker import record_usage
             from ..db.settings import get_settings
+            s = get_settings()
+            provider = (s.AI_PROVIDER or "anthropic").strip().lower()
             record_usage(
                 run_id=run_id, call_type="single", batch_ref=row_ref,
                 input_tokens=0, output_tokens=0, succeeded=False,
-                model=get_settings().CLAUDE_MODEL,
+                model=s.OPENAI_MODEL if provider == "openai" else s.CLAUDE_MODEL,
+                provider=provider,
             )
         except Exception:
             pass

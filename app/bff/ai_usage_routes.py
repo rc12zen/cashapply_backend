@@ -9,7 +9,9 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from ..ai_usage.service import get_usage_summary, get_usage_totals, get_recent_runs_usage
+from ..db.models import User
 from ..deps import get_db
+from ..auth import require_permission
 
 router = APIRouter()
 
@@ -21,6 +23,7 @@ def get_ai_usage_summary(
     date_to: str | None = None,
     user: str | None = None,
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission("run:view")),
 ):
     """
     AI token consumption + cost, scoped to one run (run_id) OR a created_at
@@ -39,6 +42,7 @@ def get_ai_usage_recent(
     user: str | None = None,
     limit: int = 5,
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission("run:view")),
 ):
     """
     Per-run AI usage for the last `limit` completed analysis runs, optionally
@@ -48,7 +52,8 @@ def get_ai_usage_recent(
 
 
 @router.get("/totals")
-def get_ai_usage_totals(db: Session = Depends(get_db)):
+def get_ai_usage_totals(db: Session = Depends(get_db),
+                         current_user: User = Depends(require_permission("run:view"))):
     """
     Global all-time and current-month token/cost totals, independent of the
     panel's current run/date scope. Backs the "all-time" / "this month" tiles.
@@ -63,6 +68,7 @@ def export_ai_usage_csv(
     date_to: str | None = None,
     user: str | None = None,
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission("run:view")),
 ):
     """
     CSV export of AI usage aggregated by model, honoring the same run_id /

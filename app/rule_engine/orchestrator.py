@@ -73,7 +73,7 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from ..db.models import AnalysisRun, LineItem, RunStatus, SourceFile, StatementTransactionRow
+from ..db.models import AnalysisRun, BankAccount, LineItem, RunStatus, SourceFile, StatementTransactionRow
 from ..db.session import session_scope
 from ..db.settings import get_settings
 
@@ -360,6 +360,7 @@ def _build_rule_input(
         bank_ou_number=orig.ou_number,
         aging_map=aging_map,
         fuzzy_min_pct=60.0,
+        bank_ou_numbers=orig.bank_ou_numbers,
     )
 
     # ── Effective customer match pct ──────────────────────────────────────────
@@ -401,6 +402,15 @@ def _build_rule_input(
         },
         "ou_mismatch":                        ou_status.is_cross_ou,
         "customer_ou_numbers":                ou_status.customer_ous,
+        # Full evidence behind the two fields above -- see
+        # rule_engine/ou_resolver.py::OUResolverResult.customer_ou_details.
+        # Attached to RuleResult (see evaluator.py's R14 blocks + the
+        # post-hoc badge check) and persisted onto LineItem.ou_evidence so
+        # the Row Detail page can show its receipts, not just a verdict.
+        "ou_evidence": {
+            "bank_ou_numbers": orig.bank_ou_numbers or ([orig.ou_number] if orig.ou_number else []),
+            "customer_ou_details": ou_status.customer_ou_details,
+        },
         "duplicate_invoice_across_customers": False,
         "already_processed_match":            False,
     }
@@ -594,11 +604,37 @@ def _run_analysis(run_id: int, selected_files: list[str]) -> None:
                             StatementTransactionRow.consumed_by_run_id.is_(None),
                         )
 
+                    # PATCH — live Business Unit resolution: business_unit /
+                    # ou_number used to always come from whatever was frozen
+                    # into raw_row_json at INGESTION time (or the SourceFile's
+                    # own snapshot), so an administrator changing a bank
+                    # account's Business Unit via Config never affected
+                    # anything until the file was re-ingested. Resolved ONCE
+                    # here (not per row — same bank_account_id for every row
+                    # under this source) from the LIVE BankAccount ->
+                    # OrganizationUnit relationship instead, so a Business
+                    # Unit change takes effect on the very next run started
+                    # after the change — while every run that already
+                    # completed keeps whatever was current when IT ran,
+                    # since LineItem.business_unit is a permanent snapshot,
+                    # not a live join (see bff/bank_accounts_routes.py).
+                    live_business_unit = None
+                    live_ou_number = None
+                    live_bank_ou_numbers: list[str] | None = None
+                    if source.bank_account_id is not None:
+                        bank_account = db.query(BankAccount).get(source.bank_account_id)
+                        if bank_account and bank_account.organization_unit:
+                            live_ou_number = bank_account.organization_unit.ou_number
+                            live_business_unit = bank_account.organization_unit.ou_name
+                            live_bank_ou_numbers = bank_account.all_ou_numbers
+
                     unconsumed = row_query.all()
                     for row in unconsumed:
                         if row.id in seen_row_ids:
                             continue
                         seen_row_ids.add(row.id)
+                        row_business_unit = live_business_unit or (row.raw_row_json or {}).get("business_unit") or source.business_unit
+                        row_ou_number = live_ou_number or (row.raw_row_json or {}).get("ou_number") or source.ou_number
                         all_credit_rows.append(CreditRowSchema(
                             run_id=run_id,
                             source_filename=filename,
@@ -606,8 +642,9 @@ def _run_analysis(run_id: int, selected_files: list[str]) -> None:
                             bank_name=(row.raw_row_json or {}).get("bank_name") or "",
                             bank_config_key=source.bank_config_key or "UNKNOWN",
                             account_number=(row.raw_row_json or {}).get("account_number"),
-                            business_unit=(row.raw_row_json or {}).get("business_unit") or source.business_unit,
-                            ou_number=(row.raw_row_json or {}).get("ou_number") or source.ou_number,
+                            business_unit=row_business_unit,
+                            ou_number=row_ou_number,
+                            bank_ou_numbers=live_bank_ou_numbers or ([row_ou_number] if row_ou_number else None),
                             statement_date=row.statement_date,
                             narrative=row.narrative,
                             credit_amount=float(row.credit_amount or 0),

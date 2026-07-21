@@ -75,14 +75,31 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str | None = None
     CLAUDE_MODEL: str = "claude-sonnet-4-6"
 
+    # ── OpenAI (alternative extraction provider) ────────────────────────────
+    # SECURITY: no hardcoded default — must come from .env / real environment.
+    OPENAI_API_KEY: str | None = None
+    # Exact model string as OpenAI's API expects it -- confirm the current
+    # name in your OpenAI account/docs before relying on this default, model
+    # naming for the GPT-5 family has changed since this was written.
+    OPENAI_MODEL: str = "gpt-5-mini"
+
+    # ── AI provider switch (extraction Layer 2B — extraction/ai_providers.py) ──
+    # Which provider Layer 2B's AI fallback actually calls. Switching this is
+    # the ONLY change needed to move providers -- no code change. Set the
+    # matching *_API_KEY above for whichever provider you pick.
+    AI_PROVIDER: Literal["anthropic", "openai"] = "anthropic"
+
     # ── AI usage / cost tracking (app.ai_usage) ──────────────────────────────
-    # Per-token USD rates for whatever CLAUDE_MODEL currently points at.
-    # Defaults below are Claude Sonnet-class pricing at time of writing —
-    # update these (or override in .env) if CLAUDE_MODEL is changed to a
-    # different tier, since cost-per-token varies by model and isn't
-    # something this app can look up automatically.
-    AI_COST_PER_INPUT_TOKEN: float = 0.000003   # $3.00 / million input tokens
-    AI_COST_PER_OUTPUT_TOKEN: float = 0.000015  # $15.00 / million output tokens
+    # Per-token USD rates -- ONE pair per provider, since Anthropic and OpenAI
+    # price differently. The pair actually applied is chosen by whichever
+    # provider made that specific call (see ai_usage/tracker.py), not by
+    # AI_PROVIDER's CURRENT value -- so historical totals stay correct even
+    # after switching providers or changing prices. Defaults below are
+    # approximate at time of writing -- update in .env if pricing changes.
+    AI_COST_PER_INPUT_TOKEN: float = 0.000003   # Claude Sonnet-class: $3.00 / million input tokens
+    AI_COST_PER_OUTPUT_TOKEN: float = 0.000015  # Claude Sonnet-class: $15.00 / million output tokens
+    OPENAI_COST_PER_INPUT_TOKEN: float = 0.00000025   # GPT-5 mini-class: $0.25 / million input tokens
+    OPENAI_COST_PER_OUTPUT_TOKEN: float = 0.000002    # GPT-5 mini-class: $2.00 / million output tokens
 
     # ── Oracle Fusion (App1) ─────────────────────────────────────────────────
     # SECURITY: no hardcoded default — must come from .env / real environment.
@@ -131,6 +148,12 @@ class Settings(BaseSettings):
     # so this is also the ceiling on how many AI network calls are ever
     # in flight across the whole run at once.
     CHUNK_MAX_WORKERS: int = 4
+
+    # ── CORS ──────────────────────────────────────────────────────────────
+    # Comma-separated list of origins allowed to call this API, e.g.
+    # "https://cashapply-uat.zensar.com". "*" (default, local dev only) means
+    # any origin -- tighten this for UAT/prod, see main.py.
+    CORS_ALLOWED_ORIGINS: str = "*"
 
     # ── Layer 2B AI batching configuration ───────────────────────────────────
     # How many unresolved rows (sharing one OU) go into a single Claude

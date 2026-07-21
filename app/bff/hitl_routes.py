@@ -19,12 +19,15 @@ PATCH NOTES (original):
     skipped — not in Ready for Oracle").
 
 PATCH NOTES (auth/RBAC/audit integration):
-  - /approve, /approve-bulk, /retry-oracle require "oracle:post" — this is
-    the missing identity check the original docstring above flagged as a
-    gap (category gate existed, WHO was calling did not).
-  - /reject requires "hitl:reject" (Analyst + Oracle Operator both have it —
-    see scripts/seed_rbac.py).
-  - Read-only endpoints require "run:view" (also held by Auditor/Viewer).
+  - /approve, /approve-bulk, /retry-oracle require "oracle:post" — held by
+    Administrator and Oracle Operator only (see scripts/seed_rbac.py).
+  - /reject requires "hitl:reject" — held by Administrator and Oracle
+    Operator only (Analyst can map invoices but not approve/reject).
+  - /{id}/mapping-confirm and /{id}/recheck-remittance require "hitl:map" —
+    held by Administrator, Analyst, AND Oracle Operator (both can map
+    invoices; only Oracle Operator/Administrator can also approve/reject).
+  - Read-only endpoints require "run:view" (held by every role except
+    Viewer).
   - version_conflict (optimistic locking, hitl/service.py) is translated to
     HTTP 409 for the single-row endpoints, same treatment as not_approvable.
   - Every approve/reject/retry is logged via audit.service.log_activity().
@@ -37,6 +40,8 @@ from sqlalchemy.orm import Session
 from ..db.models import LineItem, RowState, User
 from ..deps import get_db
 from ..auth import require_permission
+from ..common.errors import AppError
+from ..common.error_codes import ErrorCode
 from ..audit.service import log_activity
 from ..hitl import (
     approve_row, reject_row, build_breakup_analysis,
@@ -67,7 +72,7 @@ def get_approval_preview(id: int, db: Session = Depends(get_db),
                           user: User = Depends(require_permission("run:view"))):
     row = db.query(LineItem).get(id)
     if not row:
-        raise HTTPException(404, "Not found")
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
     return serialize_line_item(row)
 
 
@@ -91,11 +96,11 @@ def approve(id: int, payload: dict, request: Request, db: Session = Depends(get_
     # instead of returning 200 with a body that looks like a success shape
     # but contains an "error" key the UI was never checking for.
     if result.get("error") == "not_approvable":
-        raise HTTPException(400, result.get("message") or "Row is not eligible for approval.")
+        raise AppError(ErrorCode.ROW_NOT_APPROVABLE, detail=result.get("message"))
     if result.get("error") == "version_conflict":
-        raise HTTPException(409, result.get("message") or "This row changed since you loaded it.")
+        raise AppError(ErrorCode.ROW_VERSION_CONFLICT, detail=result.get("message"))
     if result.get("error") == "not found":
-        raise HTTPException(404, "Line item not found.")
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
 
     log_activity(db, user, action="hitl.approve", entity_type="LineItem", entity_id=id,
                  ip_address=_client_ip(request),
@@ -113,9 +118,9 @@ def reject(id: int, payload: dict, request: Request, db: Session = Depends(get_d
         expected_version=payload.get("expected_version"),
     )
     if result.get("error") == "version_conflict":
-        raise HTTPException(409, result.get("message") or "This row changed since you loaded it.")
+        raise AppError(ErrorCode.ROW_VERSION_CONFLICT, detail=result.get("message"))
     if result.get("error") == "not found":
-        raise HTTPException(404, "Line item not found.")
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
 
     log_activity(db, user, action="hitl.reject", entity_type="LineItem", entity_id=id,
                  ip_address=_client_ip(request), metadata={"comment": payload.get("comment")})
@@ -178,7 +183,7 @@ def mapping_options(id: int, db: Session = Depends(get_db),
                      user: User = Depends(require_permission("run:view"))):
     result = get_mapping_options(db, id)
     if result.get("error"):
-        raise HTTPException(400, result["error"])
+        raise AppError(ErrorCode.MAPPING_INVALID, detail=result["error"])
     return result
 
 
@@ -187,7 +192,7 @@ def mapping_options_for_customer(id: int, customer_name: str, db: Session = Depe
                                   user: User = Depends(require_permission("run:view"))):
     result = get_invoices_for_customer(db, id, customer_name)
     if result.get("error"):
-        raise HTTPException(400, result["error"])
+        raise AppError(ErrorCode.MAPPING_INVALID, detail=result["error"])
     return result
 
 
@@ -197,17 +202,17 @@ def mapping_preview(id: int, body: dict, db: Session = Depends(get_db),
     invoice_numbers = body.get("invoice_numbers") or []
     result = preview_manual_mapping(db, id, invoice_numbers)
     if result.get("error"):
-        raise HTTPException(400, result["error"])
+        raise AppError(ErrorCode.MAPPING_INVALID, detail=result["error"])
     return result
 
 
 @router.post("/{id}/mapping-confirm")
 def mapping_confirm(id: int, body: dict, request: Request, db: Session = Depends(get_db),
-                     user: User = Depends(require_permission("hitl:reject"))):
+                     user: User = Depends(require_permission("hitl:map"))):
     invoice_numbers = body.get("invoice_numbers") or []
     result = confirm_manual_mapping(db, id, invoice_numbers, user)
     if result.get("error"):
-        raise HTTPException(400, result["error"])
+        raise AppError(ErrorCode.MAPPING_INVALID, detail=result["error"])
     log_activity(db, user, action="hitl.manual_mapping", entity_type="LineItem", entity_id=id,
                  ip_address=_client_ip(request),
                  metadata={"invoice_numbers": invoice_numbers, "rule_id": result.get("rule_id")})
@@ -217,7 +222,7 @@ def mapping_confirm(id: int, body: dict, request: Request, db: Session = Depends
 
 @router.post("/{id}/recheck-remittance")
 def recheck_remittance(id: int, request: Request, db: Session = Depends(get_db),
-                        user: User = Depends(require_permission("hitl:reject"))):
+                        user: User = Depends(require_permission("hitl:map"))):
     """
     Manual counterpart to the periodic remittance_recheck_worker — lets a
     SPOC re-check a SINGLE needs_remittance row on demand (e.g. "the
@@ -228,7 +233,7 @@ def recheck_remittance(id: int, request: Request, db: Session = Depends(get_db),
     """
     result = recheck_needs_remittance_rows(db, only_line_item_id=id)
     if result.get("error"):
-        raise HTTPException(400, result["error"])
+        raise AppError(ErrorCode.REMITTANCE_RECHECK_FAILED, detail=result["error"])
 
     row_result = result["results"][0] if result["results"] else None
     log_activity(db, user, action="hitl.recheck_remittance", entity_type="LineItem", entity_id=id,

@@ -106,6 +106,11 @@ class RuleResult:
     # Problem 2: True on ready_to_post/acceptable_short_payment rows where ou_mismatch=True.
     # Front-end badge + audit trail. No HITL required.
     is_cross_ou_currency: bool = False
+    # The actual evidence behind is_cross_ou_currency -- see
+    # rule_engine/ou_resolver.py::OUResolverResult.customer_ou_details and
+    # db/models.py's LineItem.ou_evidence. None when there was no customer
+    # signal to evaluate (ou_mismatch was never computed).
+    ou_evidence: Optional[dict] = None
 
 
 def _resolve_matched_invoices(input_: dict) -> list[MatchedInvoice]:
@@ -308,6 +313,7 @@ def evaluate_row(
                 f"received into bank account for OU {ou_number}. "
                 f"Re-route receipt to OU {customer_ous[0] if customer_ous else 'unknown'}."
             ),
+            ou_evidence=input_.get("ou_evidence"),
         )
 
     # R7 — customer confirmed, same OU, no invoice number, no remittance found
@@ -383,6 +389,7 @@ def evaluate_row(
                 f"Invoice resolved but customer OU(s) {customer_ous} != "
                 f"bank account OU {ou_number}. Re-route to correct OU."
             ),
+            ou_evidence=input_.get("ou_evidence"),
         )
 
     if shortfall_pct < 0:
@@ -411,5 +418,7 @@ def evaluate_row(
     # exactly (R9a) or within tolerance (R9b) but the payment still crossed OUs.
     if result.category in ("ready_to_post", "acceptable_short_payment"):
         result.is_cross_ou_currency = bool(input_.get("ou_mismatch"))
+        if result.is_cross_ou_currency:
+            result.ou_evidence = input_.get("ou_evidence")
 
     return result

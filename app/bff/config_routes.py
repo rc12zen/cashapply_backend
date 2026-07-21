@@ -21,8 +21,11 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
-from ..db.models import AppConfig, SourceFile
+from ..db.models import AppConfig, SourceFile, User
 from ..deps import get_db
+from ..auth import require_permission
+from ..common.errors import AppError
+from ..common.error_codes import ErrorCode
 from ..aging.uploader import handle_aging_upload
 from ..aging.parser import refresh_aging_map
 from ..aging.preview import preview_aging_file
@@ -30,15 +33,21 @@ from ..aging import aging_store
 
 router = APIRouter()
 
+# Read-only across this page requires just "run:view" (held by every role
+# except Viewer); mutating the active aging report / abbreviations requires
+# "config:manage" (Administrator only for now — see scripts/seed_rbac.py).
+
 
 @router.post("/upload-aging")
-async def upload_aging(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_aging(file: UploadFile = File(...), db: Session = Depends(get_db),
+                        user: User = Depends(require_permission("config:manage"))):
     data = await file.read()
     return handle_aging_upload(db, file.filename, data)
 
 
 @router.post("/refresh-aging")
-def refresh_aging(db: Session = Depends(get_db)):
+def refresh_aging(db: Session = Depends(get_db),
+                   user: User = Depends(require_permission("config:manage"))):
     latest = (
         db.query(SourceFile)
         .filter(SourceFile.kind == "aging_report", SourceFile.archived.is_(False))
@@ -61,7 +70,8 @@ def refresh_aging(db: Session = Depends(get_db)):
 
 
 @router.delete("/remove-aging")
-def remove_aging(db: Session = Depends(get_db)):
+def remove_aging(db: Session = Depends(get_db),
+                  user: User = Depends(require_permission("config:manage"))):
     latest = (
         db.query(SourceFile)
         .filter(SourceFile.kind == "aging_report", SourceFile.archived.is_(False))
@@ -81,15 +91,29 @@ def remove_aging(db: Session = Depends(get_db)):
 
 
 @router.get("/aging-status")
-def aging_status():
+def aging_status(user: User = Depends(require_permission("run:view"))):
     # Was: db.query(AgingInvoice).count() + a SourceFile query.
     # Now: aging_store already tracks filename/row_count/loaded_at from the
     # last refresh — zero DB round trip needed for this endpoint at all.
     return aging_store.get_status()
 
 
+@router.get("/ai-status")
+def ai_status(force: bool = False, user: User = Depends(require_permission("run:view"))):
+    """Is AI extraction (Layer 2B's fallback pass -- see
+    extraction/ai_providers.py) actually usable right now, not just
+    "is a key present". Shown on Home before a SPOC starts analysis, so
+    they know upfront whether the AI second pass will run or unresolved
+    rows will only get regex/pattern matching. Cached briefly server-side
+    (see ai_providers.get_ai_status) -- pass ?force=true to bypass that
+    (wired to a "Recheck" button on the frontend)."""
+    from ..extraction.ai_providers import get_ai_status
+    return get_ai_status(force_refresh=force)
+
+
 @router.get("/aging-history")
-def aging_history(db: Session = Depends(get_db)):
+def aging_history(db: Session = Depends(get_db),
+                   user: User = Depends(require_permission("run:view"))):
     """
     Every aging report ever loaded — via manual upload OR the watch-folder
     watcher (app.aging.watcher) — most recent first. Nothing here is ever
@@ -120,7 +144,8 @@ def aging_history(db: Session = Depends(get_db)):
 
 
 @router.post("/aging-select/{source_file_id}")
-def select_aging_source(source_file_id: int, db: Session = Depends(get_db)):
+def select_aging_source(source_file_id: int, db: Session = Depends(get_db),
+                         user: User = Depends(require_permission("config:manage"))):
     """
     Switches the ACTIVE aging report to a past upload chosen from the
     aging-history dropdown, and reloads it into the in-memory AgingMap
@@ -141,7 +166,7 @@ def select_aging_source(source_file_id: int, db: Session = Depends(get_db)):
         .first()
     )
     if not target:
-        raise HTTPException(404, "Aging report source file not found.")
+        raise AppError(ErrorCode.AGING_SOURCE_NOT_FOUND)
 
     db.query(SourceFile).filter(
         SourceFile.kind == "aging_report",
@@ -162,7 +187,7 @@ def select_aging_source(source_file_id: int, db: Session = Depends(get_db)):
         result = refresh_aging_map(db, target)
     except Exception as exc:
         db.rollback()
-        raise HTTPException(400, f"Could not load that aging snapshot: {exc}")
+        raise AppError(ErrorCode.AGING_REPORT_PARSE_FAILED, detail=str(exc))
 
     db.commit()
     db.refresh(target)
@@ -176,20 +201,23 @@ def select_aging_source(source_file_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/aging-preview")
-def aging_preview(max_rows: int = 200, db: Session = Depends(get_db)):
+def aging_preview(max_rows: int = 200, db: Session = Depends(get_db),
+                   user: User = Depends(require_permission("run:view"))):
     # Unchanged — reads the Excel file directly from storage, never touched
     # the AgingInvoice table.
     return preview_aging_file(db, max_rows)
 
 
 @router.get("/abbreviations")
-def get_abbreviations(db: Session = Depends(get_db)):
+def get_abbreviations(db: Session = Depends(get_db),
+                       user: User = Depends(require_permission("run:view"))):
     rows = db.query(AppConfig).filter(AppConfig.key.like("abbrev:%")).all()
     return {"abbreviations": {r.key.split(":", 1)[1]: r.value for r in rows}}
 
 
 @router.put("/abbreviations")
-def update_abbreviations(payload: dict, db: Session = Depends(get_db)):
+def update_abbreviations(payload: dict, db: Session = Depends(get_db),
+                          user: User = Depends(require_permission("config:manage"))):
     abbreviations: dict = payload.get("abbreviations", {})
     for alias, canonical in abbreviations.items():
         key = f"abbrev:{alias}"

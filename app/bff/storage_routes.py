@@ -26,6 +26,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 import io
 
+from ..common.errors import AppError
+from ..common.error_codes import ErrorCode
 from ..db.models import User
 from ..auth import require_permission
 from ..storage.client import get_storage_client
@@ -41,11 +43,11 @@ def download_file(
     user: User = Depends(require_permission("run:view")),
 ):
     if bucket not in _ALLOWED_BUCKETS:
-        raise HTTPException(400, f"Unknown bucket '{bucket}'.")
+        raise AppError(ErrorCode.STORAGE_BUCKET_UNKNOWN, detail=f"bucket '{bucket}'")
 
     storage = get_storage_client()
     if not storage.exists(bucket, key):
-        raise HTTPException(404, "File not found in storage.")
+        raise AppError(ErrorCode.STORAGE_FILE_NOT_FOUND)
 
     data = storage.read(bucket, key)
     content_type, _ = mimetypes.guess_type(key)

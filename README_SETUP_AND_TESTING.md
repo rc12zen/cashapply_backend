@@ -52,12 +52,14 @@ revision shipped real credentials as code defaults; removed).
 
 ```bash
 # Creates all tables (existing + new auth/RBAC/dedup/audit tables)
-python3 -c "from app.db.session import init_db; init_db()"
+python -c "from app.db.session import init_db; init_db()"
 
 # Seeds the 5 roles + permission set, and creates two dev-bypass users
-python -m scripts.seed_rbac --dev-user muni@zensar.com --dev-role Administrator
-python -m scripts.seed_rbac --dev-user muni_analyst@zensar.com --dev-role Analyst
-```
+# python -m scripts.seed_rbac --dev-user muni@zensar.com --dev-role Administrator
+# python -m scripts.seed_rbac --dev-user muni_analyst@zensar.com --dev-role Analyst
+# ```
+
+python -m scripts.seed_rbac --demo-users
 
 Re-running `seed_rbac` is safe — every insert is get-or-create.
 

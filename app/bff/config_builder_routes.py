@@ -39,10 +39,11 @@ from sqlalchemy.orm import Session
 
 from ..db.models import SourceFile, User, BankAccount, OrganizationUnit, AccountConfigRecipe
 from ..deps import get_db
-from ..auth import get_optional_current_user
+from ..auth import require_permission
 from ..audit.service import log_activity
 from ..storage.client import get_storage_client
 from ..common.errors import AppError
+from ..common.error_codes import ErrorCode
 from ..bank_statement.account_locator import extract_accounts, normalize_account, last4, match_key
 from ..bank_statement.configs.account_loader import (
     load_account_configs, load_account_ou_map, reload_account_configs,
@@ -64,7 +65,7 @@ def _local_path(db: Session, filename: str) -> tuple[SourceFile, str]:
         SourceFile.kind == "bank_statement", SourceFile.filename == filename
     ).first()
     if not record:
-        raise HTTPException(404, f"File '{filename}' not found")
+        raise AppError(ErrorCode.STATEMENT_NOT_FOUND, detail=f"file '{filename}'")
     storage = get_storage_client()
     return record, storage.local_path_for_read(_STATEMENT_BUCKET, record.storage_key)
 
@@ -74,7 +75,7 @@ def _local_path_by_key(db: Session, storage_key: str) -> tuple[SourceFile, str]:
         SourceFile.kind == "bank_statement", SourceFile.storage_key == storage_key
     ).first()
     if not record:
-        raise HTTPException(404, "File not found")
+        raise AppError(ErrorCode.STATEMENT_NOT_FOUND)
     storage = get_storage_client()
     return record, storage.local_path_for_read(_STATEMENT_BUCKET, record.storage_key)
 
@@ -108,7 +109,8 @@ def _test_recipe(local_path: str, recipe: dict, key: str, filename: str) -> dict
 # ── upload a file for the wizard (NO ingestion) ──────────────────────────────────
 
 @router.post("/builder/upload")
-async def builder_upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def builder_upload(file: UploadFile = File(...), db: Session = Depends(get_db),
+                          user: User = Depends(require_permission("config:manage"))):
     """
     Store an uploaded report so the Config Builder wizard can preview / locate /
     test against it — WITHOUT running the ingestion pipeline.
@@ -156,7 +158,8 @@ async def builder_upload(file: UploadFile = File(...), db: Session = Depends(get
 # ── raw preview ─────────────────────────────────────────────────────────────────
 
 @router.get("/builder/raw-preview/{filename}")
-def builder_raw_preview(filename: str, db: Session = Depends(get_db)):
+def builder_raw_preview(filename: str, db: Session = Depends(get_db),
+                        user: User = Depends(require_permission("config:manage"))):
     """Return raw cell data for all sheets — used by the wizard preview/header/locate steps."""
     record, local_path = _local_path(db, filename)
     ext = os.path.splitext(filename)[1].lower().lstrip(".")
@@ -175,9 +178,8 @@ def builder_raw_preview(filename: str, db: Session = Depends(get_db)):
             wb.close()
         except Exception as e:
             logger.exception("raw-preview: failed to read xlsx %s", filename)
-            raise AppError(422, "Could not read this file",
-                            f"'{filename}' doesn't look like a valid Excel (.xlsx) file — "
-                            f"it may be corrupted or actually be a different format ({e.__class__.__name__}).")
+            raise AppError(ErrorCode.CONFIG_FILE_UNREADABLE,
+                            detail=f"'{filename}' doesn't look like a valid Excel (.xlsx) file ({e.__class__.__name__})")
     elif ext == "xls":
         try:
             import xlrd
@@ -193,9 +195,8 @@ def builder_raw_preview(filename: str, db: Session = Depends(get_db)):
                 sheets.append({"name": sh, "rows": rows})
         except Exception as e:
             logger.exception("raw-preview: failed to read xls %s", filename)
-            raise AppError(422, "Could not read this file",
-                            f"'{filename}' doesn't look like a valid legacy Excel (.xls) file — "
-                            f"it may be corrupted or actually be a different format ({e.__class__.__name__}).")
+            raise AppError(ErrorCode.CONFIG_FILE_UNREADABLE,
+                            detail=f"'{filename}' doesn't look like a valid legacy Excel (.xls) file ({e.__class__.__name__})")
     elif ext in ("csv", "txt"):
         try:
             import csv
@@ -205,13 +206,10 @@ def builder_raw_preview(filename: str, db: Session = Depends(get_db)):
             sheets.append({"name": "Sheet1", "rows": rows})
         except Exception as e:
             logger.exception("raw-preview: failed to read csv %s", filename)
-            raise AppError(422, "Could not read this file",
-                            f"'{filename}' could not be parsed as a CSV file "
-                            f"({e.__class__.__name__}). Check the file isn't empty or binary.")
+            raise AppError(ErrorCode.CONFIG_FILE_UNREADABLE,
+                            detail=f"'{filename}' could not be parsed as CSV ({e.__class__.__name__})")
     else:
-        raise AppError(400, "Unsupported file type",
-                        f"Files with a '.{ext}' extension aren't supported here — "
-                        f"upload an xlsx, xls, csv, or txt bank statement.")
+        raise AppError(ErrorCode.CONFIG_FILE_TYPE_UNSUPPORTED, detail=f"'.{ext}' extension")
 
     return {"filename": filename, "storage_key": record.storage_key, "extension": ext, "sheets": sheets}
 
@@ -225,7 +223,8 @@ class LocateAccountRequest(BaseModel):
 
 
 @router.post("/builder/locate-account")
-def builder_locate_account(body: LocateAccountRequest, db: Session = Depends(get_db)):
+def builder_locate_account(body: LocateAccountRequest, db: Session = Depends(get_db),
+                           user: User = Depends(require_permission("config:manage"))):
     """Run a locator draft against the file and return the account(s) it finds,
     flagging any that are already registered."""
     _record, local_path = _local_path_by_key(db, body.storage_key)
@@ -254,7 +253,8 @@ class BuilderTestRequest(BaseModel):
 
 
 @router.post("/builder/test")
-def builder_test(body: BuilderTestRequest, db: Session = Depends(get_db)):
+def builder_test(body: BuilderTestRequest, db: Session = Depends(get_db),
+                 user: User = Depends(require_permission("config:manage"))):
     """Test a draft recipe against the uploaded file. Returns up to 50 normalized rows."""
     _record, local_path = _local_path_by_key(db, body.storage_key)
     return _test_recipe(local_path, body.config_draft, body.config_draft.get("key", "_DRAFT_"), _record.filename)
@@ -263,7 +263,8 @@ def builder_test(body: BuilderTestRequest, db: Session = Depends(get_db)):
 # ── OU/BU picklist for the wizard's OU step ────────────────────────────────────
 
 @router.get("/builder/available-ous")
-def available_ous(db: Session = Depends(get_db)):
+def available_ous(db: Session = Depends(get_db),
+                  user: User = Depends(require_permission("run:view"))):
     """
     OUs the wizard's OU/Business Unit step can offer, so onboarding an
     account picks from a real, known OU instead of free-typing one that
@@ -380,28 +381,24 @@ def _get_or_create_bank_account(db: Session, acct: str, body: "SaveRecipeRequest
 
 @router.post("/builder/save")
 def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
-                 user: User | None = Depends(get_optional_current_user)):
+                 user: User = Depends(require_permission("config:manage"))):
     """Save/attach a recipe. If the account exists, a new recipe version is added
     for the format; otherwise a new account is created — always linked to a real
     OrganizationUnit (OU + Business Unit), never saved without one."""
     acct = str(body.account_number).strip()
     if not acct:
-        raise AppError(400, "Account number required", "Enter the bank account number before saving.")
+        raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED, detail="account number")
     if not body.display_name.strip():
-        raise AppError(400, "Display name required", "Give this account a display name before saving.")
+        raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED, detail="display name")
     fmt = _FMT_ALIASES.get(body.format.lower(), body.format.lower())
     if fmt not in ("xlsx", "xls", "csv", "pdf"):
-        raise AppError(400, "Unsupported file format",
-                        f"'{body.format}' isn't supported — use xlsx, xls, csv, or pdf.")
+        raise AppError(ErrorCode.CONFIG_FILE_TYPE_UNSUPPORTED, detail=f"'{body.format}' -- use xlsx, xls, csv, or pdf")
     if not body.recipe.get("account_locator"):
-        raise AppError(400, "Recipe incomplete",
-                        "This recipe has no account locator — go back to the Account step and try again.")
+        raise AppError(ErrorCode.CONFIG_RECIPE_INVALID, detail="no account locator -- go back to the Account step")
     if not body.ou_number.strip():
-        raise AppError(400, "Organization Unit required",
-                        "Choose the Organization Unit this account belongs to before saving.")
+        raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED, detail="Organization Unit")
     if not body.business_unit.strip():
-        raise AppError(400, "Business Unit required",
-                        "Enter the Business Unit name for this Organization Unit before saving.")
+        raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED, detail="Business Unit")
 
     try:
         ou = _get_or_create_organization_unit(db, body.ou_number, body.business_unit, body.functional_currency)
@@ -424,12 +421,11 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
         )
         db.add(recipe_row)
 
-        if user is not None:
-            action = "config.create" if (created or format_created) else "config.version_added"
-            log_activity(db, user, action=action, entity_type="AccountConfig",
-                         entity_id=acct,
-                         metadata={"display_name": body.display_name, "format": fmt, "version": next_version,
-                                   "ou_number": ou.ou_number, "business_unit": ou.ou_name})
+        action = "config.create" if (created or format_created) else "config.version_added"
+        log_activity(db, user, action=action, entity_type="AccountConfig",
+                     entity_id=acct,
+                     metadata={"display_name": body.display_name, "format": fmt, "version": next_version,
+                               "ou_number": ou.ou_number, "business_unit": ou.ou_name})
 
         db.commit()
     except AppError:
@@ -438,9 +434,7 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
     except Exception as e:
         db.rollback()
         logger.exception("builder_save failed for account %s", acct)
-        raise AppError(400, "Could not save this config",
-                        f"The account or recipe data didn't save ({e.__class__.__name__}). "
-                        f"Nothing was changed — check the recipe fields and try again.")
+        raise AppError(ErrorCode.CONFIG_SAVE_FAILED, detail=f"{e.__class__.__name__} -- nothing was changed")
 
     if created:
         message = f"Created account {acct} with {fmt} recipe (v1)."
@@ -466,7 +460,7 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
 # ── list / fetch accounts (Manage + Clone-from-existing) ─────────────────────────
 
 @router.get("/builder/accounts")
-def list_accounts():
+def list_accounts(user: User = Depends(require_permission("run:view"))):
     """List all account configs (light) for the manage dialog and clone picker."""
     out = []
     for acct, entry in load_account_configs().items():
@@ -485,11 +479,11 @@ def list_accounts():
 
 
 @router.get("/builder/account/{account_number}")
-def get_account(account_number: str):
+def get_account(account_number: str, user: User = Depends(require_permission("run:view"))):
     """Full account entry (incl. recipes) — used to clone an existing config."""
     entry = load_account_configs().get(account_number)
     if not entry:
-        raise HTTPException(404, f"Account '{account_number}' not found")
+        raise AppError(ErrorCode.CONFIG_NOT_FOUND, detail=f"account '{account_number}'")
     return entry
 
 
@@ -502,28 +496,30 @@ class TestExistingRequest(BaseModel):
 
 
 @router.post("/test-existing")
-def test_existing(body: TestExistingRequest, db: Session = Depends(get_db)):
+def test_existing(body: TestExistingRequest, db: Session = Depends(get_db),
+                  user: User = Depends(require_permission("config:manage"))):
     """Run a saved account recipe against the uploaded file (preview + row count)."""
     entry = load_account_configs().get(body.account_number)
     if not entry:
-        raise HTTPException(404, f"Account '{body.account_number}' not found")
+        raise AppError(ErrorCode.CONFIG_NOT_FOUND, detail=f"account '{body.account_number}'")
     record, local_path = _local_path(db, body.filename)
     fmt = body.format or _file_format(body.filename)
     recipe = active_recipe(entry, fmt)   # test always runs the active (latest) version
     if not recipe:
-        raise HTTPException(404, f"Account '{body.account_number}' has no '{fmt}' recipe")
+        raise AppError(ErrorCode.CONFIG_NOT_FOUND, detail=f"account '{body.account_number}' has no '{fmt}' recipe")
     return _test_recipe(local_path, recipe, body.account_number, record.filename)
 
 
 # ── delete account / recipe ──────────────────────────────────────────────────────
 
 @router.delete("/builder/{account_number}")
-def delete_account(account_number: str, db: Session = Depends(get_db)):
+def delete_account(account_number: str, db: Session = Depends(get_db),
+                   user: User = Depends(require_permission("config:manage"))):
     """Delete an entire account config (all its recipes). The OU itself is left
     alone — other accounts may still reference it."""
     account = db.query(BankAccount).filter(BankAccount.account_number == account_number).first()
     if not account:
-        raise AppError(404, "Account not found", f"No config exists for account '{account_number}'.")
+        raise AppError(ErrorCode.CONFIG_NOT_FOUND, detail=f"account '{account_number}'")
     db.query(AccountConfigRecipe).filter(AccountConfigRecipe.bank_account_id == account.id).delete()
     db.delete(account)
     db.commit()
@@ -532,21 +528,22 @@ def delete_account(account_number: str, db: Session = Depends(get_db)):
 
 
 @router.delete("/builder/{account_number}/{fmt}")
-def delete_recipe(account_number: str, fmt: str, db: Session = Depends(get_db)):
+def delete_recipe(account_number: str, fmt: str, db: Session = Depends(get_db),
+                  user: User = Depends(require_permission("config:manage"))):
     """Delete every version of a single format recipe. If it was the account's
     last format, the account itself is removed too."""
     fmt = _FMT_ALIASES.get(fmt.lower(), fmt.lower())
     account = db.query(BankAccount).filter(BankAccount.account_number == account_number).first()
     if not account:
-        raise AppError(404, "Account not found", f"No config exists for account '{account_number}'.")
+        raise AppError(ErrorCode.CONFIG_NOT_FOUND, detail=f"account '{account_number}'")
     versions = (
         db.query(AccountConfigRecipe)
         .filter(AccountConfigRecipe.bank_account_id == account.id, AccountConfigRecipe.format == fmt)
         .all()
     )
     if not versions:
-        raise AppError(404, "Recipe not found",
-                        f"Account '{account_number}' has no '{fmt}' recipe to delete.")
+        raise AppError(ErrorCode.CONFIG_NOT_FOUND,
+                        detail=f"account '{account_number}' has no '{fmt}' recipe to delete")
     for v in versions:
         db.delete(v)
     db.flush()
@@ -565,7 +562,8 @@ def delete_recipe(account_number: str, fmt: str, db: Session = Depends(get_db)):
 # ── detect / candidates ──────────────────────────────────────────────────────────
 
 @router.get("/detect/{filename}")
-def detect_for_file(filename: str, db: Session = Depends(get_db)):
+def detect_for_file(filename: str, db: Session = Depends(get_db),
+                    user: User = Depends(require_permission("run:view"))):
     """Re-run account-based detection and list matching accounts (picker/reconfigure)."""
     record, local_path = _local_path(db, filename)
     from ..bank_statement.detector import detect_config, list_matching_configs

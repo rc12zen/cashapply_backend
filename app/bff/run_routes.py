@@ -24,6 +24,8 @@ from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
 
+from ..common.errors import AppError
+from ..common.error_codes import ErrorCode
 from ..db.models import AnalysisRun, BankAccount, LineItem, RunStatus, SourceFile, StatementTransactionRow, User
 from ..storage.client import get_storage_client
 from ..deps import get_db
@@ -198,7 +200,7 @@ def reingest_statement(source_file_id: int, request: Request, db: Session = Depe
     """
     record = db.query(SourceFile).get(source_file_id)
     if not record or record.kind != "bank_statement":
-        raise HTTPException(404, "Source file not found")
+        raise AppError(ErrorCode.STATEMENT_NOT_FOUND, detail="not a bank statement")
     record.ingest_status = "processing"
     record.ingest_error = None
     db.commit()
@@ -212,7 +214,7 @@ def get_ingest_status(source_file_id: int, db: Session = Depends(get_db),
                        user: User = Depends(require_permission("run:view"))):
     record = db.query(SourceFile).get(source_file_id)
     if not record:
-        raise HTTPException(404, "Source file not found")
+        raise AppError(ErrorCode.STATEMENT_NOT_FOUND)
     return {
         "source_file_id": record.id,
         "filename": record.filename,
@@ -258,7 +260,7 @@ def start_run(payload: dict, request: Request, db: Session = Depends(get_db),
               user: User = Depends(require_permission("run:start"))):
     selected_files = payload.get("selected_files", [])
     if not selected_files:
-        raise HTTPException(400, "No files selected.")
+        raise AppError(ErrorCode.RUN_NO_FILES_SELECTED)
 
     # Guard: at least one selected statement must be analyzable — i.e. resolve
     # to a bank account that still has unconsumed rows. The orchestrator
@@ -282,11 +284,7 @@ def start_run(payload: dict, request: Request, db: Session = Depends(get_db),
         if account_ids else 0
     )
     if pending_rows == 0:
-        raise HTTPException(
-            400,
-            "None of the selected statements are analyzable — they're either "
-            "unrecognised (configure the account first) or have no pending rows.",
-        )
+        raise AppError(ErrorCode.RUN_NO_ANALYZABLE_FILES)
 
     # Fast-fail check (UX layer) — the advisory lock in
     # _run_analysis_locked() is the actual correctness guarantee for true
@@ -294,7 +292,7 @@ def start_run(payload: dict, request: Request, db: Session = Depends(get_db),
     # case ever reaching it. See design doc §4.
     existing_running = db.query(AnalysisRun).filter(AnalysisRun.status == RunStatus.RUNNING).first()
     if existing_running:
-        raise HTTPException(409, "A run is already in progress.")
+        raise AppError(ErrorCode.RUN_ALREADY_IN_PROGRESS)
 
     run = AnalysisRun(
         status=RunStatus.RUNNING,

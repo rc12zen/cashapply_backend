@@ -4,14 +4,16 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from ..db.models import AnalysisRun, LineItem
+from ..db.models import AnalysisRun, LineItem, User
 from ..deps import get_db
+from ..auth import require_permission
 
 router = APIRouter()
 
 
 @router.get("/options")
-def get_filter_options(run_id: int | None = None, db: Session = Depends(get_db)):
+def get_filter_options(run_id: int | None = None, db: Session = Depends(get_db),
+                       user: User = Depends(require_permission("run:view"))):
     q = db.query(LineItem)
     if run_id:
         q = q.filter(LineItem.run_id == run_id)

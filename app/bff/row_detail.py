@@ -13,6 +13,7 @@ from ..db.models import LineItem, RemittanceExtraction, RemittanceInvoiceLine
 from ..bff.metrics import _category_for_row, GROUP_LABELS, GROUP_READY_FOR_ORACLE
 from ..oracle.fusion_client import build_receipt_creation_payload, build_remittance_reference_payloads
 from ..rule_engine.fx_service import get_ou_display_name
+from ..hitl.actions_registry import get_available_actions
 
 
 def _build_pipeline(r: LineItem) -> list[dict]:
@@ -59,7 +60,7 @@ def _build_pipeline(r: LineItem) -> list[dict]:
     return nodes
 
 
-def build_row_detail(db: Session, record_id: int) -> dict:
+def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str] | None = None) -> dict:
     r = db.query(LineItem).get(record_id)
     if not r:
         return {"error": "not found"}
@@ -168,10 +169,26 @@ def build_row_detail(db: Session, record_id: int) -> dict:
         "id":                r.id,
         "category":          _cat,
         "category_label":    GROUP_LABELS.get(_cat, ""),
+        # Data-driven action list (see hitl/actions_registry.py /
+        # db/models.py's ActionDefinition) -- already filtered by both
+        # this row's current state AND the caller's permissions, so the
+        # frontend renders this directly rather than re-deriving
+        # eligibility itself. Empty list if no permission context was
+        # supplied (e.g. an internal/background caller).
+        "available_actions": (
+            get_available_actions(db, r, user_permission_codes) if user_permission_codes is not None else []
+        ),
         "run_id":            r.run_id,
         "is_cross_currency": bool(r.is_cross_currency) if hasattr(r, "is_cross_currency") else None,
         "is_cross_ledger":   bool(r.is_cross_ledger)   if hasattr(r, "is_cross_ledger")   else None,
         "is_cross_ou":       bool(getattr(r, "is_cross_ou_currency", False)),
+        # The actual evidence behind is_cross_ou above -- which OU(s) the
+        # bank account belongs to, and for each OU where the customer was
+        # found: the exact matched name, fuzzy match score, and open
+        # invoice count/amount. None for rows where cross-OU was never
+        # evaluated (no customer signal) or predates this field. See
+        # rule_engine/ou_resolver.py::OUResolverResult.customer_ou_details.
+        "ou_evidence":       r.ou_evidence,
         # PATCH: persistent record of whether this row's CURRENT mapping
         # came from a SPOC manually picking invoice(s) — see
         # LineItem.manually_mapped's comment in db/models.py. Lets the

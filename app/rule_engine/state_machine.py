@@ -37,6 +37,15 @@ def apply_transition(db: Session, line_item: LineItem, rule_result, trigger: str
     line_item.passed_validation = rule_result.category in ("ready_to_post", "acceptable_short_payment")
     line_item.target_total = rule_result.target_total
     line_item.shortfall_pct = rule_result.shortfall_pct
+    # PATCH: these two were computed on RuleResult (evaluator.py) but never
+    # actually copied onto the LineItem here -- is_cross_ou_currency stayed
+    # permanently False in the DB regardless of what the rule engine
+    # decided (the frontend worked around this by deriving cross-OU status
+    # from reason_code/WRONG_OU_* instead — see analysis-history/row/[id]/
+    # page.tsx's `isCrossOU` fallback). Fixed while wiring up ou_evidence,
+    # since both describe the same decision and belong together.
+    line_item.is_cross_ou_currency = bool(rule_result.is_cross_ou_currency)
+    line_item.ou_evidence = rule_result.ou_evidence
     line_item.matched_invoices = [
         {
             "invoice_number": m.invoice_number,

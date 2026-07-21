@@ -123,16 +123,20 @@ def get_usage_summary(
     summary = _summarize(rows)
 
     # Model + rates: prefer what was actually recorded (accurate even if
-    # pricing/model has since changed in .env); fall back to current
-    # Settings when there's no usage yet for this scope (e.g. a run that
-    # hasn't needed any AI fallback calls — Layer 2A regex resolved
-    # everything).
-    summary["model"] = rows[0].model if rows else s.CLAUDE_MODEL
+    # pricing/model/provider has since changed in .env); fall back to
+    # whichever provider is CURRENTLY configured (Settings.AI_PROVIDER) when
+    # there's no usage yet for this scope (e.g. a run that hasn't needed any
+    # AI fallback calls — Layer 2A regex resolved everything).
+    _current_model = s.OPENAI_MODEL if s.AI_PROVIDER == "openai" else s.CLAUDE_MODEL
+    _current_cost_in = s.OPENAI_COST_PER_INPUT_TOKEN if s.AI_PROVIDER == "openai" else s.AI_COST_PER_INPUT_TOKEN
+    _current_cost_out = s.OPENAI_COST_PER_OUTPUT_TOKEN if s.AI_PROVIDER == "openai" else s.AI_COST_PER_OUTPUT_TOKEN
+
+    summary["model"] = rows[0].model if rows else _current_model
     summary["cost_per_input_token"] = (
-        rows[0].cost_per_input_token if rows else s.AI_COST_PER_INPUT_TOKEN
+        rows[0].cost_per_input_token if rows else _current_cost_in
     )
     summary["cost_per_output_token"] = (
-        rows[0].cost_per_output_token if rows else s.AI_COST_PER_OUTPUT_TOKEN
+        rows[0].cost_per_output_token if rows else _current_cost_out
     )
     summary["by_model"] = _breakdown_by_model(rows)
     return summary

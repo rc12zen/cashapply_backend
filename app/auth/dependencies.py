@@ -17,6 +17,8 @@ from fastapi import Depends, Header, HTTPException, Request
 from fastapi.security import OAuth2AuthorizationCodeBearer
 from sqlalchemy.orm import Session
 
+from ..common.errors import AppError
+from ..common.error_codes import ErrorCode
 from ..db.models import User
 from ..db.settings import get_settings
 from ..deps import get_db
@@ -46,11 +48,11 @@ async def _validate_azure_and_load_user(token: str, db: Session) -> User:
     try:
         claims = validate_azure_token(token)
     except TokenValidationError as e:
-        raise HTTPException(status_code=401, detail=str(e))
+        raise AppError(ErrorCode.TOKEN_INVALID, detail=str(e))
 
     azure_oid = claims.get("oid")
     if not azure_oid:
-        raise HTTPException(status_code=401, detail="Token missing 'oid' claim")
+        raise AppError(ErrorCode.TOKEN_INVALID, detail="token missing 'oid' claim")
 
     # Invite-only (closed) onboarding — see PLAN-users-tab.md. There is NO
     # just-in-time auto-provisioning: an unknown SSO user is rejected. A user
@@ -71,13 +73,10 @@ async def _validate_azure_and_load_user(token: str, db: Session) -> User:
             pending.azure_oid = azure_oid
             user = pending
         else:
-            raise HTTPException(
-                status_code=403,
-                detail="This account has not been onboarded. Contact an administrator.",
-            )
+            raise AppError(ErrorCode.ACCOUNT_NOT_ONBOARDED)
 
     if not user.is_active:
-        raise HTTPException(status_code=403, detail="Account is disabled — contact an administrator")
+        raise AppError(ErrorCode.ACCOUNT_DISABLED)
 
     user.last_login_at = dt.datetime.utcnow()
     db.commit()
@@ -104,19 +103,16 @@ async def get_current_user(
             # Deactivated users can't sign in, even via the dev bypass — mirror
             # the SSO path's is_active enforcement.
             if not user.is_active:
-                raise HTTPException(status_code=403, detail="Account is disabled — contact an administrator")
+                raise AppError(ErrorCode.ACCOUNT_DISABLED)
             user.last_login_at = dt.datetime.utcnow()
             db.commit()
             request.state.current_user = user  # picked up by audit/middleware.py
             return user
-        raise HTTPException(
-            status_code=401,
-            detail=f"'{x_dev_user}' has not been onboarded. Ask an administrator to add you in the Users tab.",
-        )
+        raise AppError(ErrorCode.ACCOUNT_NOT_ONBOARDED, detail=f"'{x_dev_user}' -- ask an administrator to add you in the Users tab")
 
     token = _extract_bearer_token(request)
     if not token:
-        raise HTTPException(status_code=401, detail="Missing credentials")
+        raise AppError(ErrorCode.NOT_SIGNED_IN)
     user = await _validate_azure_and_load_user(token, db)
     request.state.current_user = user  # picked up by audit/middleware.py
     return user
@@ -132,5 +128,5 @@ async def get_optional_current_user(
     (none currently, but kept available)."""
     try:
         return await get_current_user(request, x_dev_user, db)
-    except HTTPException:
+    except (HTTPException, AppError):
         return None

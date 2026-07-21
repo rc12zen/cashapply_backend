@@ -79,8 +79,20 @@ def _summarize(r: ActivityLog, email: str | None) -> str:
         return f"{who} rejected line item #{id_}"
     if a.startswith("oracle.retry"):
         return f"{who} retried Oracle posting for line item #{id_}"
-    if a.startswith("user.role_changed"):
-        return f"{who} changed {m.get('target_email')}'s role from {m.get('from_role')} to {m.get('to_role')}"
+    if a.startswith("user.updated"):
+        changes = m.get("changes") or {}
+        parts = []
+        if "roles" in changes:
+            frm = ", ".join(changes["roles"].get("from") or []) or "none"
+            to = ", ".join(changes["roles"].get("to") or []) or "none"
+            parts.append(f"roles from [{frm}] to [{to}]")
+        if "display_name" in changes:
+            parts.append(f"name from '{changes['display_name'].get('from')}' to '{changes['display_name'].get('to')}'")
+        detail = "; ".join(parts) or "profile"
+        return f"{who} changed {m.get('target_email')}'s {detail}"
+    if a.startswith("user.onboarded"):
+        roles = ", ".join(m.get("roles") or []) or "no roles"
+        return f"{who} onboarded {m.get('target_email')} ({roles})"
     if a.startswith("user.active_changed"):
         return f"{who} {'activated' if m.get('to_active') else 'deactivated'} {m.get('target_email')}"
     for verb in ("GET ", "POST ", "PUT ", "DELETE ", "PATCH "):

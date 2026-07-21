@@ -19,10 +19,11 @@ from .db.session import init_db
 from .db.settings import get_settings
 from .aging.watcher import start_watcher
 from .common.errors import register_exception_handlers
+from .common.request_context import RequestIdMiddleware
 from .bff import (
     run_routes, results_routes, hitl_routes, config_routes, filters_routes,
     executive_summary, config_builder_routes, auth_routes, admin_routes,
-    activity_log_routes, ai_usage_routes, storage_routes,
+    activity_log_routes, ai_usage_routes, storage_routes, bank_accounts_routes,
 )
 
 app = FastAPI(title="CashApply Backend", version="1.1.0")
@@ -39,6 +40,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Every request gets a short trace reference (reused if the caller already
+# sent one via X-Request-Id) -- echoed back as a response header AND inside
+# every error body (see common/errors.py), so a user-reported error can be
+# traced to its exact log entry. Registered AFTER CORSMiddleware so it runs
+# on the inside of the middleware stack (Starlette applies middleware in
+# reverse registration order) and still sees every request, including ones
+# CORS would otherwise short-circuit as a preflight.
+app.add_middleware(RequestIdMiddleware)
 
 # PATCH: the generic per-request ActivityLogMiddleware (design doc §6) has
 # been REMOVED — it wrote one ActivityLog row for every single GET/POST/PUT/
@@ -116,3 +126,4 @@ app.include_router(admin_routes.router,        prefix="/api/admin",         tags
 app.include_router(activity_log_routes.router, prefix="/api/activity-log",  tags=["activity-log"])
 app.include_router(ai_usage_routes.router,     prefix="/api/ai-usage",      tags=["ai-usage"])
 app.include_router(storage_routes.router,      prefix="/api/storage",       tags=["storage"])
+app.include_router(bank_accounts_routes.router, prefix="/api/bank-accounts", tags=["bank-accounts"])

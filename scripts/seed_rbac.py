@@ -1,127 +1,233 @@
 """
 scripts/seed_rbac.py
-======================
-One-time (idempotent) seed for roles/permissions and, optionally, a first
-local dev user so you can log in via the X-Dev-User bypass without waiting
-on real Azure SSO. Safe to re-run — every insert is get-or-create.
+=======================
+Seeds the fixed 5-role RBAC model referenced throughout the backend
+(auth/jit_provision.py, auth/permissions.py, bff/admin_routes.py's Role
+Legend, etc.) Roles are seed-defined, not created through the UI — the
+Users page only assigns EXISTING role(s) to a user, it never invents a
+new one.
 
-Usage:
+Run once per environment (idempotent — safe to re-run; it upserts):
+
     python -m scripts.seed_rbac
+
+Optionally also bootstrap a first local/dev user in the same run — useful
+right after a fresh DB, since the Users tab itself needs an existing
+Administrator to call it (chicken-and-egg on a brand-new database). Accepts
+one or more roles (an Administrator can hold multiple roles — see
+db/models.py's UserRole join table):
+
     python -m scripts.seed_rbac --dev-user you@example.com --dev-role Administrator
+    python -m scripts.seed_rbac --dev-user you@example.com --dev-role Analyst --dev-role "Oracle Operator"
+
+Or seed 4 standard demo users in one go — Administrator, Viewer, Auditor,
+and a multi-role Analyst + Oracle Operator user (see DEMO_USERS below):
+
+    python -m scripts.seed_rbac --demo-users
 
 Run this AFTER the app has started at least once (so init_db()'s
 create_all() has already created the tables), or run `python -c
 "from app.db.session import init_db; init_db()"` first.
+
+── THE 5 ROLES & WHAT THEY CAN DO ──────────────────────────────────────────
+Administrator   — everything. Holds the wildcard "*" permission, which
+                  satisfies every require_permission(...) check.
+Analyst         — can run analysis (run:start), can view data everywhere
+                  (run:view), can map invoices (hitl:map) but CANNOT
+                  approve or reject (no oracle:post / hitl:reject).
+Oracle Operator — can view data everywhere (run:view), CANNOT run analysis
+                  (no run:start), but CAN map invoices (hitl:map) AND
+                  approve/reject for Oracle posting (oracle:post,
+                  hitl:reject).
+Auditor         — read-only. Can view data everywhere (run:view,
+                  activity_log:view) but cannot run analysis, map, approve,
+                  reject, upload, or manage config/users.
+Viewer          — the default role a brand-new SSO/JIT user lands on (see
+                  db/settings.py's DEFAULT_NEW_USER_ROLE). Holds NO
+                  permissions at all — the frontend keeps a Viewer on the
+                  single Welcome page until an Administrator assigns them
+                  a real role.
+
+── PERMISSION CODES ─────────────────────────────────────────────────────────
+"*"                — wildcard, Administrator only.
+run:view           — view data across Home/Overview/Analysis History/
+                     Executive Summary/AI Usage/Config/Results/Filters
+                     (kept as one broad "view" permission rather than one
+                     per page, since every non-Viewer role that can see
+                     anything can see everything — see requirements).
+run:start          — start a new analysis run.
+statement:upload   — upload a bank statement (part of "running analysis").
+hitl:map           — confirm a manual invoice mapping (does NOT post to
+                     Oracle by itself — see hitl/manual_mapping.py).
+hitl:reject        — reject a HITL row.
+oracle:post        — approve a row / post to Oracle Fusion / retry a post.
+activity_log:view  — view the Activity Log (Administrator, Auditor).
+user:manage        — onboard/edit/activate/deactivate users (Users tab).
+config:manage       — write/mutate Config or Config Builder data (upload/
+                     refresh/remove aging, edit abbreviations, save/delete
+                     a bank-format recipe). Administrator only for now —
+                     no other role was given config-write access by the
+                     current requirements; broaden this set later if that
+                     changes.
 """
 from __future__ import annotations
 
 import argparse
-import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from app.db.models import Permission, Role, RolePermission, User, UserRole
+from app.db.session import session_scope
+from app.auth.onboarding import pending_oid
 
-from app.db.session import session_scope  # noqa: E402
-from app.db.models import Permission, Role, RolePermission, User  # noqa: E402
-from app.auth.onboarding import pending_oid  # noqa: E402
-
-# role_name -> [permission codes]. "*" = every permission (Administrator).
-# NOTE: "user:manage" gates the admin Users tab. Administrator holds "*", which
-# already satisfies every check, so listing it here is for catalog completeness
-# and explicit intent — no other role gets it.
-ROLE_PERMISSIONS: dict[str, list[str]] = {
-    "Administrator": ["*"],
-    "Analyst": ["statement:upload", "run:start", "run:view", "hitl:reject"],
-    "Oracle Operator": ["oracle:post", "oracle:retry", "run:view", "hitl:reject"],
-    "Auditor": ["run:view", "report:download", "activity_log:view"],
-    "Viewer": ["dashboard:view", "run:view"],
+# role name -> (description, [permission codes])
+ROLE_PERMISSIONS: dict[str, tuple[str, list[str]]] = {
+    "Administrator": (
+        "Full access — every permission, no constraints.",
+        ["*"],
+    ),
+    "Analyst": (
+        "Runs analysis and maps invoices; views data everywhere; cannot approve or reject.",
+        ["run:view", "run:start", "statement:upload", "hitl:map"],
+    ),
+    "Oracle Operator": (
+        "Maps invoices and approves/rejects for Oracle posting; views data everywhere; cannot run analysis.",
+        ["run:view", "hitl:map", "hitl:reject", "oracle:post"],
+    ),
+    "Auditor": (
+        "Read-only — views data and the activity log everywhere; cannot run, map, approve, reject, or manage anything.",
+        ["run:view", "activity_log:view"],
+    ),
+    "Viewer": (
+        "Default role for a brand-new user. No permissions — restricted to the single Welcome page until an administrator assigns a real role.",
+        [],
+    ),
 }
 
 ALL_PERMISSION_CODES = sorted({
     code
-    for codes in ROLE_PERMISSIONS.values()
+    for _desc, codes in ROLE_PERMISSIONS.values()
     for code in codes
-    if code != "*"
-} | {
-    "statement:upload", "run:start", "run:view", "oracle:post", "oracle:retry",
-    "hitl:reject", "report:download", "activity_log:view", "dashboard:view",
-    "user:manage", "*",
-})
-
-
-def get_or_create_permission(db, code: str) -> Permission:
-    p = db.query(Permission).filter(Permission.code == code).first()
-    if p is None:
-        p = Permission(code=code)
-        db.add(p)
-        db.flush()
-    return p
-
-
-def get_or_create_role(db, name: str, description: str = "") -> Role:
-    r = db.query(Role).filter(Role.name == name).first()
-    if r is None:
-        r = Role(name=name, description=description)
-        db.add(r)
-        db.flush()
-    return r
+} | {"activity_log:view", "user:manage", "config:manage"})  # ensure admin-only codes exist as rows too
 
 
 def seed_rbac() -> None:
     with session_scope() as db:
-        permissions_by_code = {code: get_or_create_permission(db, code) for code in ALL_PERMISSION_CODES}
+        # 1. Ensure every permission code exists as a row.
+        existing_perms = {p.code: p for p in db.query(Permission).all()}
+        for code in ALL_PERMISSION_CODES:
+            if code not in existing_perms:
+                perm = Permission(code=code)
+                db.add(perm)
+                db.flush()
+                existing_perms[code] = perm
 
-        for role_name, codes in ROLE_PERMISSIONS.items():
-            role = get_or_create_role(db, role_name)
-            for code in codes:
-                perm = permissions_by_code[code]
-                exists = (
-                    db.query(RolePermission)
-                    .filter(RolePermission.role_id == role.id, RolePermission.permission_id == perm.id)
-                    .first()
-                )
-                if not exists:
-                    db.add(RolePermission(role_id=role.id, permission_id=perm.id))
+        # 2. Ensure every role exists (create if missing, update description
+        #    if it changed — never delete a role or touch its users).
+        existing_roles = {r.name: r for r in db.query(Role).all()}
+        for name, (description, codes) in ROLE_PERMISSIONS.items():
+            role = existing_roles.get(name)
+            if role is None:
+                role = Role(name=name, description=description)
+                db.add(role)
+                db.flush()
+                existing_roles[name] = role
+            elif role.description != description:
+                role.description = description
 
-        print(f"Seeded {len(ROLE_PERMISSIONS)} roles and {len(ALL_PERMISSION_CODES)} permissions.")
+            # Administrator gets ONLY "*" (wildcard already satisfies every
+            # check — see auth/permissions.py) so it isn't cluttered with
+            # every other code too; every other role gets exactly its list.
+            wanted_codes = set(codes)
+            current = {
+                rp.permission.code
+                for rp in db.query(RolePermission).filter(RolePermission.role_id == role.id).all()
+            }
+            for code in wanted_codes - current:
+                db.add(RolePermission(role_id=role.id, permission_id=existing_perms[code].id))
+            for rp in db.query(RolePermission).filter(RolePermission.role_id == role.id).all():
+                if rp.permission.code not in wanted_codes:
+                    db.delete(rp)
+
+        print("RBAC seed complete:")
+        for name, (_desc, codes) in ROLE_PERMISSIONS.items():
+            print(f"  {name:16s} -> {codes}")
 
 
-def seed_dev_user(email: str, role_name: str, azure_oid: str | None = None) -> None:
+def seed_dev_user(email: str, role_names: list[str], azure_oid: str | None = None) -> None:
+    """Creates (or updates the role assignment of) a local/dev user with
+    one or more roles — an Administrator can hold multiple roles at once
+    (see db/models.py's UserRole join table), so this takes a LIST, not a
+    single role name.
+
+    Placeholder azure_oid defaults to "pending:<email>" (same scheme the
+    Users tab uses for onboarding) — this matters for the FIRST-admin
+    bootstrap on a production/SSO deployment: on that admin's first real
+    SSO login, the reconciliation path (auth/dependencies.py) matches by
+    email and adopts their real Entra oid, but ONLY for "pending:"
+    placeholders. Local dev-bypass identifies users by email regardless,
+    so this placeholder works there too.
+    """
+    email = email.strip().lower()
     with session_scope() as db:
-        role = db.query(Role).filter(Role.name == role_name).first()
-        if role is None:
-            raise SystemExit(f"Role '{role_name}' not found — run seed_rbac() first.")
+        roles = db.query(Role).filter(Role.name.in_(role_names)).all()
+        found_names = {r.name for r in roles}
+        missing = [n for n in role_names if n not in found_names]
+        if missing:
+            raise SystemExit(f"Role(s) not found: {', '.join(missing)} — run seed_rbac() first.")
 
-        existing = db.query(User).filter(User.email == email.lower()).first()
+        existing = db.query(User).filter(User.email == email).first()
         if existing:
-            existing.role_id = role.id
-            print(f"Updated existing user {email} -> role {role_name}")
+            existing.user_roles = [UserRole(role_id=r.id) for r in roles]
+            db.flush()
+            db.expire(existing, ["roles"])
+            print(f"Updated existing user {email} -> role(s) {', '.join(role_names)}")
             return
 
-        # Placeholder azure_oid = "pending:<email>" (same scheme the Users tab
-        # uses for onboarding). This matters for the FIRST-admin bootstrap on a
-        # production/SSO deployment: on that admin's first real SSO login, the
-        # reconciliation path (app/auth/dependencies.py) matches by email and
-        # adopts their real Entra oid — but ONLY for "pending:" placeholders. A
-        # non-pending oid (the old "local-dev-*") would leave the seeded admin
-        # locked out in prod. Local bypass identifies users by email, so this
-        # placeholder works there too.
-        db.add(User(
+        user = User(
             azure_oid=azure_oid or pending_oid(email),
-            email=email.lower(),
+            email=email,
             display_name=email.split("@")[0].title(),
-            role_id=role.id,
             is_active=True,
-        ))
-        print(f"Created dev user {email} with role {role_name}")
+        )
+        db.add(user)
+        db.flush()
+        user.user_roles = [UserRole(role_id=r.id) for r in roles]
+        print(f"Created dev user {email} with role(s) {', '.join(role_names)}")
+
+
+DEMO_USERS: list[tuple[str, list[str]]] = [
+    ("admin@example.com", ["Administrator"]),
+    ("viewer@example.com", ["Viewer"]),
+    ("auditor@example.com", ["Auditor"]),
+    ("multi@example.com", ["Analyst", "Oracle Operator"]),
+]
+
+
+def seed_demo_users() -> None:
+    """Seeds the 4 standard demo users covering every role combination:
+    Administrator, Viewer, Auditor, and a multi-role Analyst + Oracle
+    Operator user. Handy for exercising RBAC locally without onboarding
+    each one by hand via the Users tab."""
+    for email, role_names in DEMO_USERS:
+        seed_dev_user(email, role_names)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dev-user", help="Email to create/update as a local dev user (bypass login)")
-    parser.add_argument("--dev-role", default="Administrator", help="Role to assign the dev user")
+    parser.add_argument(
+        "--dev-role", action="append", default=[],
+        help="Role to assign the dev user. Repeat for multiple roles, e.g. "
+             "--dev-role Analyst --dev-role \"Oracle Operator\". Defaults to Administrator.",
+    )
+    parser.add_argument(
+        "--demo-users", action="store_true",
+        help="Also seed the 4 standard demo users: Administrator, Viewer, "
+             "Auditor, and a multi-role Analyst + Oracle Operator user.",
+    )
     args = parser.parse_args()
 
     seed_rbac()
     if args.dev_user:
-        seed_dev_user(args.dev_user, args.dev_role)
+        seed_dev_user(args.dev_user, args.dev_role or ["Administrator"])
+    if args.demo_users:
+        seed_demo_users()

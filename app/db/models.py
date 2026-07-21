@@ -210,6 +210,15 @@ class LineItem(Base):
     # Visible on the front-end review screen; recorded in the audit trail.
     # Does NOT require HITL — amounts matched — but finance needs visibility.
     is_cross_ou_currency            = Column(Boolean, default=False)
+    # Evidence behind the is_cross_ou_currency decision above -- which OU(s)
+    # the bank account belongs to, and for each OU where the customer was
+    # found, the exact matched name / fuzzy score / outstanding amount (see
+    # rule_engine/ou_resolver.py::OUResolverResult.customer_ou_details).
+    # Persisted (not recomputed live against today's aging map) so the Row
+    # Detail page shows what was ACTUALLY true when this row was evaluated,
+    # same principle as every other historical field on this row. Shape:
+    #   {"bank_ou_numbers": ["111"], "customer_ou_details": [...]}
+    ou_evidence                      = Column(JSON, nullable=True)
 
     # ── Extraction layer output ───────────────────────────────────────────────
     extracted_customer_name   = Column(String, nullable=True)
@@ -333,6 +342,49 @@ class LineItem(Base):
         self.fx_credit_to_invoice_source = value
 
 
+# ── HITL row actions (data-driven) ────────────────────────────────────────────
+
+class ActionDefinition(Base):
+    """
+    One ROW-LEVEL action a SPOC/Oracle Operator/Analyst can potentially take
+    on a LineItem (Approve, Reject, Map Invoice, Recheck Remittance, Retry
+    Oracle, and any future ones) — seed-defined here rather than hardcoded
+    in the frontend, so "which actions can I do on THIS row" is answered
+    once, server-side, from state + permission, instead of drifting across
+    frontend JSX conditions and backend gates independently over time. See
+    hitl/actions_registry.py for how this is resolved into an actual
+    per-row list, and scripts/seed_actions.py for the seeded rows.
+
+    `applicable_categories`: JSON list of the row categories (see
+    bff/metrics.py's GROUP_* constants) this action is offered for. NULL/
+    empty list = every category (subject to `condition_key` below).
+
+    `condition_key`: an extra, code-level eligibility check beyond category
+    — e.g. "not_rejected" for Reject, "reference_status_failed" for Retry.
+    This is intentionally NOT free-form data (business logic isn't safe to
+    store as an arbitrary expression) — it's a fixed key that
+    hitl/actions_registry.py's CONDITION_CHECKS dict knows how to evaluate.
+    NULL = no extra condition beyond the category match.
+
+    `permission_code`: the permission a user must hold for this action to
+    even be considered (checked via auth/permissions.py, same as every
+    other permission check in the app).
+    """
+    __tablename__ = "action_definitions"
+
+    id                     = Column(Integer, primary_key=True, autoincrement=True)
+    code                   = Column(String(50), unique=True, nullable=False)   # "approve", "reject", ...
+    label                  = Column(String(100), nullable=False)               # "Approve & Post"
+    icon                   = Column(String(50), nullable=True)                # frontend lucide-react icon key
+    permission_code        = Column(String(100), nullable=False)
+    applicable_categories  = Column(JSON, nullable=True)                      # None/[] = any category
+    condition_key          = Column(String(50), nullable=True)
+    confirm_required       = Column(Boolean, default=False)
+    is_danger              = Column(Boolean, default=False)                   # red/destructive styling
+    sort_order             = Column(Integer, default=0)
+    is_active              = Column(Boolean, default=True)                    # disable without a deploy
+
+
 # ── App1: Audit trail ─────────────────────────────────────────────────────────
 
 class RowStatusHistory(Base):
@@ -355,12 +407,14 @@ class RowStatusHistory(Base):
 
 class AiUsageLog(Base):
     """
-    One row per Claude API call made during Layer 2B AI extraction (see
-    extraction/layer_2b_ai.py). Model + per-token cost are read from
-    Settings at call time (CLAUDE_MODEL / AI_COST_PER_INPUT_TOKEN /
-    AI_COST_PER_OUTPUT_TOKEN — all overridable via .env), and the actual
-    rate used is stored alongside the token counts on each row so historical
-    cost figures stay accurate even if pricing is changed later.
+    One row per AI call made during Layer 2B extraction (see
+    extraction/ai_providers.py / extraction/layer_2b_ai.py) — either
+    Anthropic Claude or OpenAI, whichever Settings.AI_PROVIDER pointed at
+    when the call happened. Model + the per-token rate for THAT provider
+    are read from Settings at call time, and the actual rate used is
+    stored alongside the token counts on each row, so historical cost
+    figures stay accurate even if pricing changes later or AI_PROVIDER is
+    switched.
     """
     __tablename__ = "ai_usage_logs"
 
@@ -483,6 +537,18 @@ class BankAccount(Base):
     copied into a side JSON file — this table + OrganizationUnit together
     are now the single source of truth for OU/BU, replacing
     account_configs.json + bank_ou_mapping.json + account_ou_map.json.
+
+    MULTI-BU: most accounts belong to exactly one Business Unit — that's
+    `ou_id`/`organization_unit` below, unchanged. Some accounts legitimately
+    receive payments for MORE than one Business Unit though (see
+    BankAccountOU) — `additional_ous` holds those. `all_organization_units`
+    returns the full set (primary first). See rule_engine/ou_resolver.py
+    for how the full set is used for cross-OU detection, and
+    bff/bank_accounts_routes.py for the admin-facing "change Business
+    Unit(s)" endpoint — changing this only affects NEW analysis runs (see
+    rule_engine/orchestrator.py's live re-resolution at run start); already-
+    completed runs keep the Business Unit that was in effect when they ran,
+    since LineItem.business_unit is a permanent snapshot, not a live join.
     """
     __tablename__ = "bank_accounts"
 
@@ -499,8 +565,44 @@ class BankAccount(Base):
     __table_args__ = (UniqueConstraint("account_number", "bank_name", name="uq_bank_account_number_name"),)
 
     organization_unit = relationship("OrganizationUnit", back_populates="bank_accounts")
+    additional_ou_links = relationship("BankAccountOU", back_populates="bank_account",
+                                        cascade="all, delete-orphan")
+    additional_ous = relationship("OrganizationUnit", secondary="bank_account_ous", viewonly=True)
     recipes           = relationship("AccountConfigRecipe", back_populates="bank_account",
                                       order_by="AccountConfigRecipe.version")
+
+    @property
+    def all_organization_units(self) -> list["OrganizationUnit"]:
+        """Primary OU first, then any additional ones (de-duplicated) — see
+        the class docstring above and rule_engine/ou_resolver.py, which
+        uses this full set for cross-OU detection on multi-BU accounts."""
+        seen = {self.organization_unit.id} if self.organization_unit else set()
+        result = [self.organization_unit] if self.organization_unit else []
+        for ou in self.additional_ous:
+            if ou.id not in seen:
+                seen.add(ou.id)
+                result.append(ou)
+        return result
+
+    @property
+    def all_ou_numbers(self) -> list[str]:
+        return [ou.ou_number for ou in self.all_organization_units]
+
+
+class BankAccountOU(Base):
+    """Join row for a bank account's ADDITIONAL Business Units, beyond its
+    primary one (BankAccount.ou_id). Most accounts have zero rows here (one
+    account = one BU, via the primary FK alone) — this table exists only
+    for the "one bank account receives payments for multiple Business
+    Units" case. See BankAccount.all_organization_units /
+    bff/bank_accounts_routes.py."""
+    __tablename__ = "bank_account_ous"
+
+    bank_account_id = Column(Integer, ForeignKey("bank_accounts.id"), primary_key=True)
+    ou_id           = Column(Integer, ForeignKey("organization_units.id"), primary_key=True)
+
+    bank_account = relationship("BankAccount", back_populates="additional_ou_links")
+    organization_unit = relationship("OrganizationUnit")
 
 
 class AccountConfigRecipe(Base):
@@ -539,7 +641,7 @@ class Role(Base):
     description = Column(Text, nullable=True)
 
     role_permissions = relationship("RolePermission", back_populates="role")
-    users            = relationship("User", back_populates="role")
+    user_roles        = relationship("UserRole", back_populates="role")
 
 
 class Permission(Base):
@@ -561,6 +663,22 @@ class RolePermission(Base):
     permission = relationship("Permission", back_populates="role_permissions")
 
 
+class UserRole(Base):
+    """Join row for the User <-> Role many-to-many relationship. An
+    Administrator can assign a user ANY NUMBER of roles at once (e.g. both
+    Analyst and Oracle Operator) — the user's effective permission set is
+    the UNION of every assigned role's permissions (see
+    auth/permissions.py::user_has_permission). Replaces the earlier
+    single User.role_id FK."""
+    __tablename__ = "user_roles"
+
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    role_id = Column(Integer, ForeignKey("roles.id"), primary_key=True)
+
+    user = relationship("User", back_populates="user_roles")
+    role = relationship("Role", back_populates="user_roles")
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -568,12 +686,25 @@ class User(Base):
     azure_oid      = Column(String(64), unique=True, nullable=False, index=True)  # Azure Entra object id
     email          = Column(String(320), unique=True, nullable=False, index=True)
     display_name   = Column(String(200), nullable=True)
-    role_id        = Column(Integer, ForeignKey("roles.id"), nullable=False)
     is_active      = Column(Boolean, default=True)
     provisioned_at = Column(DateTime, default=dt.datetime.utcnow)
     last_login_at  = Column(DateTime, nullable=True)
 
-    role = relationship("Role", back_populates="users")
+    user_roles = relationship("UserRole", back_populates="user", cascade="all, delete-orphan")
+    # Convenience read-only view of the assigned Role objects (in id order,
+    # not any semantic "priority" order — see auth/role_priority.py for
+    # display/label ordering). Assign roles via UserRole rows, not this
+    # association_proxy directly (see bff/admin_routes.py::_set_user_roles).
+    roles = relationship(
+        "Role",
+        secondary="user_roles",
+        viewonly=True,
+        order_by="Role.id",
+    )
+
+    @property
+    def role_names(self) -> list[str]:
+        return [r.name for r in self.roles]
 
 
 # ── Duplicate detection ───────────────────────────────────────────────────────

@@ -35,6 +35,14 @@ class CreditRowSchema(BaseModel):
     account_number: Optional[str] = None
     business_unit: Optional[str] = None
     ou_number: Optional[str] = None
+    # Full set of Business Unit OU numbers this bank account currently
+    # belongs to (primary + any additional -- see db/models.py's
+    # BankAccount.all_ou_numbers), resolved FRESH at run start time (see
+    # orchestrator.py). None for the legacy direct-parse fallback path,
+    # where it falls back to just [ou_number]. Used by
+    # rule_engine/ou_resolver.py so a multi-BU account's cross-OU check
+    # considers ALL of its linked Business Units, not just one.
+    bank_ou_numbers: Optional[list[str]] = None
     statement_date: Optional[dt.datetime] = None
     narrative: Optional[str] = Field(None, description="Raw memo / description text from bank")
     credit_amount: float
