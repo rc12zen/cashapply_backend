@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from ..common.errors import AppError
 from ..common.error_codes import ErrorCode
+from ..common.upload_validation import validate_statement_upload
 from ..db.models import AnalysisRun, BankAccount, LineItem, RunStatus, SourceFile, StatementTransactionRow, User
 from ..storage.client import get_storage_client
 from ..deps import get_db
@@ -171,6 +172,9 @@ async def upload_statement(
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("statement:upload")),
 ):
+    # Reject anything that isn't Excel/CSV up front, with a clear message,
+    # before reading the bytes or touching storage.
+    validate_statement_upload(file.filename)
     data = await file.read()
     result = handle_statement_upload_v2(db, file.filename, data, uploaded_by=user)
 
