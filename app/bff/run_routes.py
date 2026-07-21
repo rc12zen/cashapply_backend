@@ -345,6 +345,7 @@ def get_run_history(
     date_from: str | None = None, date_to: str | None = None,
     bank_name: str | None = None, business_unit: str | None = None,
     triggered_by: str | None = None,
+    status: str | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("run:view")),
 ):
@@ -353,6 +354,17 @@ def get_run_history(
         q = q.filter(AnalysisRun.started_at >= date_from)
     if date_to:
         q = q.filter(AnalysisRun.started_at <= date_to)
+    if status:
+        # Validate against the real enum rather than filtering on a raw
+        # string -- a typo'd/stale status value (e.g. "complete" instead
+        # of "completed") would otherwise just silently match zero rows,
+        # which is a confusing, hard-to-diagnose "no data" bug for the
+        # caller rather than a clear error.
+        try:
+            status_enum = RunStatus(status)
+        except ValueError:
+            raise AppError(ErrorCode.VALIDATION_FAILED, detail=f"unknown run status '{status}'")
+        q = q.filter(AnalysisRun.status == status_enum)
     if triggered_by:
         # "User" filter for the Analysis History page — who STARTED the
         # run (a run-level concept), as distinct from the Home dashboard's
