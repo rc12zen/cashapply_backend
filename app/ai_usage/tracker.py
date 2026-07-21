@@ -43,8 +43,8 @@ def record_usage(
         s = get_settings()
         resolved_provider = (provider or s.AI_PROVIDER or "anthropic").strip().lower()
 
-        if resolved_provider == "openai":
-            resolved_model = model or s.OPENAI_MODEL
+        if resolved_provider in ("openai", "azure_openai"):
+            resolved_model = model or (s.AZURE_OPENAI_DEPLOYMENT if resolved_provider == "azure_openai" else s.OPENAI_MODEL)
             cost_per_input = s.OPENAI_COST_PER_INPUT_TOKEN
             cost_per_output = s.OPENAI_COST_PER_OUTPUT_TOKEN
         else:

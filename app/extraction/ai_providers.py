@@ -71,6 +71,32 @@ def _get_openai_client():
     return _openai_client_singleton
 
 
+_azure_openai_client_singleton = None
+
+
+def _get_azure_openai_client():
+    """Azure OpenAI Service -- a model deployed into your own Azure tenant's
+    resource group, NOT the same product as direct OpenAI above.
+
+    Uses Azure's newer unified "v1" endpoint (confirmed against Azure AI
+    Foundry's own sample code for this exact resource): the plain `OpenAI`
+    client pointed at a custom base_url ending in `/openai/v1`, with the
+    resource's API key -- NOT the older `AzureOpenAI` class + separate
+    `api_version` parameter, which is a different (older) connection shape.
+    `model=` at call time is the DEPLOYMENT NAME (often same as the model
+    name itself, e.g. "gpt-5.4-mini" -- confirm in Azure AI Foundry's
+    Deployments page, NOT assumed)."""
+    global _azure_openai_client_singleton
+    if _azure_openai_client_singleton is not None:
+        return _azure_openai_client_singleton
+    import openai
+    from ..db.settings import get_settings
+    s = get_settings()
+    base_url = s.AZURE_OPENAI_ENDPOINT.rstrip("/") + "/openai/v1"
+    _azure_openai_client_singleton = openai.OpenAI(api_key=s.AZURE_OPENAI_API_KEY, base_url=base_url)
+    return _azure_openai_client_singleton
+
+
 def _call_anthropic(system_prompt: str, user_message: str, max_tokens: int) -> AiCallResult:
     from ..db.settings import get_settings
     s = get_settings()
@@ -127,6 +153,39 @@ def _call_openai(system_prompt: str, user_message: str, max_tokens: int) -> AiCa
     )
 
 
+def _call_azure_openai(system_prompt: str, user_message: str, max_tokens: int) -> AiCallResult:
+    """Uses the Responses API (client.responses.create), NOT
+    chat.completions -- confirmed against Azure AI Foundry's own sample
+    code for this exact deployment/endpoint (the v1 unified endpoint).
+    Response shape is different from chat.completions: text comes back on
+    `response.output_text`, and token counts are `response.usage.
+    input_tokens`/`output_tokens` (not `prompt_tokens`/`completion_tokens`).
+    """
+    from ..db.settings import get_settings
+    s = get_settings()
+    client = _get_azure_openai_client()
+
+    t0 = time.monotonic()
+    response = client.responses.create(
+        model=s.AZURE_OPENAI_DEPLOYMENT,  # Azure addresses models by DEPLOYMENT NAME
+        instructions=system_prompt,
+        input=user_message,
+        max_output_tokens=max_tokens,
+    )
+    latency_ms = int((time.monotonic() - t0) * 1000)
+
+    text = getattr(response, "output_text", None) or ""
+    usage = getattr(response, "usage", None)
+    return AiCallResult(
+        text=text.strip(),
+        input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
+        output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
+        model=s.AZURE_OPENAI_DEPLOYMENT,
+        provider="azure_openai",
+        latency_ms=latency_ms,
+    )
+
+
 def call_ai(system_prompt: str, user_message: str, max_tokens: int) -> AiCallResult:
     """Calls whichever provider Settings.AI_PROVIDER currently points at.
     Raises on failure -- callers (layer_2b_ai.py) already wrap this in
@@ -136,11 +195,13 @@ def call_ai(system_prompt: str, user_message: str, max_tokens: int) -> AiCallRes
     s = get_settings()
     provider = (s.AI_PROVIDER or "anthropic").strip().lower()
 
+    if provider == "azure_openai":
+        return _call_azure_openai(system_prompt, user_message, max_tokens)
     if provider == "openai":
         return _call_openai(system_prompt, user_message, max_tokens)
     if provider == "anthropic":
         return _call_anthropic(system_prompt, user_message, max_tokens)
-    raise ValueError(f"Unknown AI_PROVIDER '{provider}' -- must be 'anthropic' or 'openai'")
+    raise ValueError(f"Unknown AI_PROVIDER '{provider}' -- must be 'anthropic', 'openai', or 'azure_openai'")
 
 
 # ── Status check ──────────────────────────────────────────────────────────
@@ -188,6 +249,38 @@ def _check_openai_reachable() -> tuple[bool, str | None]:
         return False, str(exc)
 
 
+def _check_azure_openai_reachable() -> tuple[bool, str | None]:
+    from ..db.settings import get_settings
+    s = get_settings()
+    missing = [
+        name for name, val in [
+            ("AZURE_OPENAI_API_KEY", s.AZURE_OPENAI_API_KEY),
+            ("AZURE_OPENAI_ENDPOINT", s.AZURE_OPENAI_ENDPOINT),
+            ("AZURE_OPENAI_DEPLOYMENT", s.AZURE_OPENAI_DEPLOYMENT),
+        ] if not val
+    ]
+    if missing:
+        return False, f"Missing: {', '.join(missing)}"
+    try:
+        client = _get_azure_openai_client()
+        # Azure OpenAI's deployment-scoped resources don't expose a cheap
+        # "retrieve one model" metadata call the way direct OpenAI does --
+        # the reliable equivalent is a minimal real completion against the
+        # deployment (1 output token, negligible cost) to confirm the
+        # endpoint/key/deployment name are all valid together. Uses the
+        # same responses.create() shape as the real extraction call -- see
+        # _call_azure_openai's docstring for why (Azure's own confirmed
+        # working sample for this endpoint, not chat.completions).
+        client.responses.create(
+            model=s.AZURE_OPENAI_DEPLOYMENT,
+            input="ping",
+            max_output_tokens=16,
+        )
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
 def get_ai_status(force_refresh: bool = False) -> dict:
     """Returns:
         {"provider": "openai", "model": "gpt-5-mini", "configured": bool,
@@ -208,7 +301,11 @@ def get_ai_status(force_refresh: bool = False) -> dict:
     s = get_settings()
     provider = (s.AI_PROVIDER or "anthropic").strip().lower()
 
-    if provider == "openai":
+    if provider == "azure_openai":
+        model = s.AZURE_OPENAI_DEPLOYMENT
+        active, error = _check_azure_openai_reachable()
+        configured = bool(s.AZURE_OPENAI_API_KEY and s.AZURE_OPENAI_ENDPOINT and s.AZURE_OPENAI_DEPLOYMENT)
+    elif provider == "openai":
         model = s.OPENAI_MODEL
         active, error = _check_openai_reachable()
         configured = bool(s.OPENAI_API_KEY)

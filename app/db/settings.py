@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str | None = None
     CLAUDE_MODEL: str = "claude-sonnet-4-6"
 
-    # ── OpenAI (alternative extraction provider) ────────────────────────────
+    # ── OpenAI (direct — platform.openai.com) ────────────────────────────────
     # SECURITY: no hardcoded default — must come from .env / real environment.
     OPENAI_API_KEY: str | None = None
     # Exact model string as OpenAI's API expects it -- confirm the current
@@ -83,19 +83,45 @@ class Settings(BaseSettings):
     # naming for the GPT-5 family has changed since this was written.
     OPENAI_MODEL: str = "gpt-5-mini"
 
+    # ── Azure OpenAI Service (a model deployed into your own Azure tenant's
+    # resource group -- NOT the same product as direct OpenAI above, and uses
+    # a different connection shape. Confirmed against Azure AI Foundry's own
+    # sample code for a real deployment: the plain OpenAI client pointed at
+    # a custom base_url ending in /openai/v1 (Azure's newer unified
+    # endpoint), NOT the older AzureOpenAI class + api_version parameter.
+    # Use this AI_PROVIDER value when the model lives in your own Azure
+    # OpenAI resource rather than platform.openai.com. See
+    # extraction/ai_providers.py's Azure branch -- it also uses the
+    # Responses API (client.responses.create), not chat.completions, to
+    # match that same confirmed-working sample.
+    AZURE_OPENAI_API_KEY: str | None = None
+    # The resource's OWN endpoint as shown on its "Keys and Endpoint" page,
+    # e.g. https://<your-resource-name>.services.ai.azure.com -- the code
+    # appends /openai/v1 itself, don't include that here.
+    AZURE_OPENAI_ENDPOINT: str | None = None
+    # The DEPLOYMENT NAME chosen when the model was deployed in Azure AI
+    # Foundry -- confirmed to often just be the model name itself by
+    # default (e.g. deployment "gpt-5.4-mini" running the "gpt-5.4-mini"
+    # model) -- get this from the Deployments page, not guessed.
+    AZURE_OPENAI_DEPLOYMENT: str | None = None
+
     # ── AI provider switch (extraction Layer 2B — extraction/ai_providers.py) ──
     # Which provider Layer 2B's AI fallback actually calls. Switching this is
     # the ONLY change needed to move providers -- no code change. Set the
-    # matching *_API_KEY above for whichever provider you pick.
-    AI_PROVIDER: Literal["anthropic", "openai"] = "anthropic"
+    # matching *_API_KEY (+ endpoint/deployment for azure_openai) above for
+    # whichever provider you pick.
+    AI_PROVIDER: Literal["anthropic", "openai", "azure_openai"] = "anthropic"
 
     # ── AI usage / cost tracking (app.ai_usage) ──────────────────────────────
-    # Per-token USD rates -- ONE pair per provider, since Anthropic and OpenAI
-    # price differently. The pair actually applied is chosen by whichever
-    # provider made that specific call (see ai_usage/tracker.py), not by
-    # AI_PROVIDER's CURRENT value -- so historical totals stay correct even
-    # after switching providers or changing prices. Defaults below are
-    # approximate at time of writing -- update in .env if pricing changes.
+    # Per-token USD rates -- ONE pair per provider family, since pricing
+    # differs. azure_openai reuses the OPENAI_* rates below (Azure OpenAI's
+    # per-token pricing for the same underlying model is typically close to
+    # direct OpenAI's, though your actual negotiated/regional rate may
+    # differ -- override these two if your Azure agreement's pricing is
+    # different). The pair actually applied is chosen by whichever provider
+    # made that specific call (see ai_usage/tracker.py), not by AI_PROVIDER's
+    # CURRENT value -- so historical totals stay correct even after
+    # switching providers or changing prices.
     AI_COST_PER_INPUT_TOKEN: float = 0.000003   # Claude Sonnet-class: $3.00 / million input tokens
     AI_COST_PER_OUTPUT_TOKEN: float = 0.000015  # Claude Sonnet-class: $15.00 / million output tokens
     OPENAI_COST_PER_INPUT_TOKEN: float = 0.00000025   # GPT-5 mini-class: $0.25 / million input tokens
