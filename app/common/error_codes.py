@@ -167,6 +167,17 @@ class ErrorCode:
         "File not found",
         "That file could not be found in storage.",
     )
+    STATEMENT_FILE_TYPE_UNSUPPORTED = ErrorDef(
+        2009, "STATEMENT_FILE_TYPE_UNSUPPORTED", 400,
+        "Unsupported file type",
+        "Only Excel (.xlsx, .xls) and CSV (.csv) bank statements are accepted. "
+        "Please upload one of those formats.",
+    )
+    STATEMENT_FILE_TOO_LARGE = ErrorDef(
+        2010, "STATEMENT_FILE_TOO_LARGE", 413,
+        "File too large",
+        "Bank statement files must be 10 MB or smaller. Please upload a smaller file.",
+    )
 
     # ── 3000-3999  Config / Config Builder ──────────────────────────────────
     CONFIG_NOT_FOUND = ErrorDef(
