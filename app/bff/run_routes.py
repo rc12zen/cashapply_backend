@@ -354,7 +354,7 @@ def get_run_history(
     if date_from:
         q = q.filter(AnalysisRun.started_at >= parse_date_from(date_from))
     if date_to:
-        q = q.filter(AnalysisRun.started_at <= date_to)
+        q = q.filter(AnalysisRun.started_at <= parse_date_from(date_to))
     if status:
         # Validate against the real enum rather than filtering on a raw
         # string -- a typo'd/stale status value (e.g. "complete" instead

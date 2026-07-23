@@ -77,6 +77,10 @@ uvicorn app.main:app --reload --port 8000
 # Terminal 2 — background worker (this is the "one new process" —
 # no new infra, it just polls the same Postgres via SELECT ... FOR UPDATE SKIP LOCKED)
 python -m app.tasks.worker
+
+# Terminal 3 — remittance recheck loop (scans needs_remittance rows on an
+# interval; see app/tasks/remittance_recheck_worker.py)
+python -m app.tasks.remittance_recheck_worker
 ```
 
 Visit `http://localhost:8000/docs` — you should see ~60 routes including the
