@@ -44,6 +44,7 @@ from ..audit.service import log_activity
 from ..storage.client import get_storage_client
 from ..common.errors import AppError
 from ..common.error_codes import ErrorCode
+from ..common.upload_validation import validate_statement_upload, validate_statement_size
 from ..bank_statement.account_locator import extract_accounts, normalize_account, last4, match_key
 from ..bank_statement.configs.account_loader import (
     load_account_configs, load_account_ou_map, reload_account_configs,
@@ -128,8 +129,13 @@ async def builder_upload(file: UploadFile = File(...), db: Session = Depends(get
     - The row is created archived=True so it never shows in the Home statements
       list; the wizard reads it by (kind, filename) regardless of archived state.
     """
+    # Only Excel/CSV, 10 MB max — reject anything else with a clear message
+    # before reading the bytes or touching storage.
+    validate_statement_upload(file.filename)
+    validate_statement_size(file.size)
     filename = file.filename or "upload"
     data = await file.read()
+    validate_statement_size(len(data))
 
     storage = get_storage_client()
     storage.save(_STATEMENT_BUCKET, filename, data)

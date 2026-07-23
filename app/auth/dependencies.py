@@ -23,6 +23,7 @@ from ..db.models import User
 from ..db.settings import get_settings
 from ..deps import get_db
 from .azure_validator import TokenValidationError, validate_azure_token
+from .jit_provision import jit_provision_user
 from .onboarding import is_pending_oid
 
 # authorizationUrl/tokenUrl here are informational only (used for OpenAPI docs /
@@ -54,16 +55,20 @@ async def _validate_azure_and_load_user(token: str, db: Session) -> User:
     if not azure_oid:
         raise AppError(ErrorCode.TOKEN_INVALID, detail="token missing 'oid' claim")
 
-    # Invite-only (closed) onboarding — see PLAN-users-tab.md. There is NO
-    # just-in-time auto-provisioning: an unknown SSO user is rejected. A user
-    # must have been onboarded by an admin first.
+    # JIT provisioning (see auth/jit_provision.py): a verified Azure AD
+    # identity with no existing row is auto-created here on
+    # settings.DEFAULT_NEW_USER_ROLE (Viewer — zero permissions), same as
+    # any other brand-new SSO user. An admin can also pre-provision a user
+    # with a real role ahead of time via the Users tab ("pending:"
+    # placeholder oid), which the block below adopts on first login instead
+    # of creating a fresh Viewer row.
     user = db.query(User).filter(User.azure_oid == azure_oid).first()
     if user is None:
-        # First login for a pre-onboarded user: match by email against a row
-        # that still carries a "pending:" placeholder oid, and adopt the real
-        # Entra oid into it (keeping the admin-assigned role). Any other case
-        # (no such email, or an email already bound to a different real oid) is
-        # treated as not-onboarded.
+        # First login for this identity: match by email against a row that
+        # still carries a "pending:" placeholder oid (pre-provisioned by an
+        # admin) and adopt the real Entra oid into it, keeping the
+        # admin-assigned role(s). Otherwise, auto-provision a brand-new
+        # Viewer via jit_provision_user() below.
         email = (claims.get("preferred_username") or claims.get("upn")
                  or claims.get("email") or "").strip().lower()
         pending = (
@@ -72,8 +77,14 @@ async def _validate_azure_and_load_user(token: str, db: Session) -> User:
         if pending is not None and is_pending_oid(pending.azure_oid):
             pending.azure_oid = azure_oid
             user = pending
-        else:
+        elif pending is not None:
+            # Email already belongs to a different real, already-linked
+            # account — never silently take it over.
             raise AppError(ErrorCode.ACCOUNT_NOT_ONBOARDED)
+        else:
+            if not email:
+                raise AppError(ErrorCode.TOKEN_INVALID, detail="token missing email claim")
+            user = jit_provision_user(db, azure_oid, email, claims.get("name"))
 
     if not user.is_active:
         raise AppError(ErrorCode.ACCOUNT_DISABLED)
