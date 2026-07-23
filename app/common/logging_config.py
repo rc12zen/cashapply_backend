@@ -46,7 +46,7 @@ secret-shaped substrings (password=..., token=..., api key=..., Bearer ...)
 out of every formatted line before it's written anywhere, console or file.
 This is a best-effort safety net, not a substitute for not logging secrets
 in the first place -- don't rely on it to log a raw credentials blob "because
-it'll get redacted anyway". 
+it'll get redacted anyway".
 """
 from __future__ import annotations
 

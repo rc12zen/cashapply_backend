@@ -412,4 +412,4 @@ def get_run_history_filter_options(db: Session = Depends(get_db),
 def get_file_preview(filename: str, bucket: str = "active", max_rows: int = 200,
                       db: Session = Depends(get_db),
                       user: User = Depends(require_permission("run:view"))):
-    return preview_bank_file(db, filename, max_rows) 
+    return preview_bank_file(db, filename, max_rows)

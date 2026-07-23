@@ -190,4 +190,3 @@ Then check `/api/activity-log?action=user.role_changed` — the entry's
   `ingestion/row_hash.py`, `auth/bypass.py`'s environment guard, and
   `rule_engine/orchestrator.py`'s advisory-lock key — happy to write these
   next if useful.
- 
