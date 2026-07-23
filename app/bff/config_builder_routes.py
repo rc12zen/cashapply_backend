@@ -111,7 +111,7 @@ def _test_recipe(local_path: str, recipe: dict, key: str, filename: str) -> dict
 
 @router.post("/builder/upload")
 async def builder_upload(file: UploadFile = File(...), db: Session = Depends(get_db),
-                          user: User = Depends(require_permission("config:manage"))):
+                          user: User = Depends(require_permission("config:author"))):
     """
     Store an uploaded report so the Config Builder wizard can preview / locate /
     test against it — WITHOUT running the ingestion pipeline.
@@ -184,7 +184,7 @@ def _trim_trailing_empty_cols(rows: list[list[str]]) -> list[list[str]]:
 
 @router.get("/builder/raw-preview/{filename}")
 def builder_raw_preview(filename: str, db: Session = Depends(get_db),
-                        user: User = Depends(require_permission("config:manage"))):
+                        user: User = Depends(require_permission("config:author"))):
     """Return raw cell data for all sheets — used by the wizard preview/header/locate steps."""
     record, local_path = _local_path(db, filename)
     ext = os.path.splitext(filename)[1].lower().lstrip(".")
@@ -253,7 +253,7 @@ class LocateAccountRequest(BaseModel):
 
 @router.post("/builder/locate-account")
 def builder_locate_account(body: LocateAccountRequest, db: Session = Depends(get_db),
-                           user: User = Depends(require_permission("config:manage"))):
+                           user: User = Depends(require_permission("config:author"))):
     """Run a locator draft against the file and return the account(s) it finds,
     flagging any that are already registered."""
     _record, local_path = _local_path_by_key(db, body.storage_key)
@@ -283,7 +283,7 @@ class BuilderTestRequest(BaseModel):
 
 @router.post("/builder/test")
 def builder_test(body: BuilderTestRequest, db: Session = Depends(get_db),
-                 user: User = Depends(require_permission("config:manage"))):
+                 user: User = Depends(require_permission("config:author"))):
     """Test a draft recipe against the uploaded file. Returns up to 50 normalized rows."""
     _record, local_path = _local_path_by_key(db, body.storage_key)
     return _test_recipe(local_path, body.config_draft, body.config_draft.get("key", "_DRAFT_"), _record.filename)
@@ -293,7 +293,7 @@ def builder_test(body: BuilderTestRequest, db: Session = Depends(get_db),
 
 @router.get("/builder/available-ous")
 def available_ous(db: Session = Depends(get_db),
-                  user: User = Depends(require_permission("run:view"))):
+                  user: User = Depends(require_permission("config:author"))):
     """
     OUs the wizard's OU/Business Unit step can offer, so onboarding an
     account picks from a real, known OU instead of free-typing one that
@@ -410,7 +410,7 @@ def _get_or_create_bank_account(db: Session, acct: str, body: "SaveRecipeRequest
 
 @router.post("/builder/save")
 def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
-                 user: User = Depends(require_permission("config:manage"))):
+                 user: User = Depends(require_permission("config:author"))):
     """Save/attach a recipe. If the account exists, a new recipe version is added
     for the format; otherwise a new account is created — always linked to a real
     OrganizationUnit (OU + Business Unit), never saved without one."""
@@ -489,7 +489,7 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
 # ── list / fetch accounts (Manage + Clone-from-existing) ─────────────────────────
 
 @router.get("/builder/accounts")
-def list_accounts(user: User = Depends(require_permission("run:view"))):
+def list_accounts(user: User = Depends(require_permission("config:view"))):
     """List all account configs (light) for the manage dialog and clone picker."""
     out = []
     for acct, entry in load_account_configs().items():
@@ -508,7 +508,7 @@ def list_accounts(user: User = Depends(require_permission("run:view"))):
 
 
 @router.get("/builder/account/{account_number}")
-def get_account(account_number: str, user: User = Depends(require_permission("run:view"))):
+def get_account(account_number: str, user: User = Depends(require_permission("config:view"))):
     """Full account entry (incl. recipes) — used to clone an existing config."""
     entry = load_account_configs().get(account_number)
     if not entry:
@@ -526,7 +526,7 @@ class TestExistingRequest(BaseModel):
 
 @router.post("/test-existing")
 def test_existing(body: TestExistingRequest, db: Session = Depends(get_db),
-                  user: User = Depends(require_permission("config:manage"))):
+                  user: User = Depends(require_permission("config:author"))):
     """Run a saved account recipe against the uploaded file (preview + row count)."""
     entry = load_account_configs().get(body.account_number)
     if not entry:
@@ -592,7 +592,7 @@ def delete_recipe(account_number: str, fmt: str, db: Session = Depends(get_db),
 
 @router.get("/detect/{filename}")
 def detect_for_file(filename: str, db: Session = Depends(get_db),
-                    user: User = Depends(require_permission("run:view"))):
+                    user: User = Depends(require_permission("config:view"))):
     """Re-run account-based detection and list matching accounts (picker/reconfigure)."""
     record, local_path = _local_path(db, filename)
     from ..bank_statement.detector import detect_config, list_matching_configs
