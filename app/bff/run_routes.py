@@ -219,7 +219,7 @@ def reingest_statement(source_file_id: int, request: Request, db: Session = Depe
 
 @router.get("/files/{source_file_id}/ingest-status")
 def get_ingest_status(source_file_id: int, db: Session = Depends(get_db),
-                       user: User = Depends(require_permission("run:view"))):
+                       user: User = Depends(require_permission("run:monitor"))):
     record = db.query(SourceFile).get(source_file_id)
     if not record:
         raise AppError(ErrorCode.STATEMENT_NOT_FOUND)
@@ -322,7 +322,7 @@ def start_run(payload: dict, request: Request, db: Session = Depends(get_db),
 
 
 @router.get("/status")
-def get_status(db: Session = Depends(get_db), user: User = Depends(require_permission("run:view"))):
+def get_status(db: Session = Depends(get_db), user: User = Depends(require_permission("run:monitor"))):
     run = db.query(AnalysisRun).order_by(desc(AnalysisRun.run_id)).first()
     if not run:
         return {"status": "idle", "message": "", "progress_current": 0}
@@ -410,5 +410,5 @@ def get_run_history_filter_options(db: Session = Depends(get_db),
 @router.get("/file-preview/{filename}")
 def get_file_preview(filename: str, bucket: str = "active", max_rows: int = 200,
                       db: Session = Depends(get_db),
-                      user: User = Depends(require_permission("run:view"))):
+                      user: User = Depends(require_permission("run:monitor"))):
     return preview_bank_file(db, filename, max_rows)

@@ -210,14 +210,14 @@ def aging_preview(max_rows: int = 200, db: Session = Depends(get_db),
 
 @router.get("/abbreviations")
 def get_abbreviations(db: Session = Depends(get_db),
-                       user: User = Depends(require_permission("run:view"))):
+                       user: User = Depends(require_permission("config:view"))):
     rows = db.query(AppConfig).filter(AppConfig.key.like("abbrev:%")).all()
     return {"abbreviations": {r.key.split(":", 1)[1]: r.value for r in rows}}
 
 
 @router.put("/abbreviations")
 def update_abbreviations(payload: dict, db: Session = Depends(get_db),
-                          user: User = Depends(require_permission("config:manage"))):
+                          user: User = Depends(require_permission("config:author"))):
     abbreviations: dict = payload.get("abbreviations", {})
     for alias, canonical in abbreviations.items():
         key = f"abbrev:{alias}"

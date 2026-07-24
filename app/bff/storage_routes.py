@@ -40,7 +40,7 @@ _ALLOWED_BUCKETS = {"bank-statements", "aging-reports", "remittance-inbox"}
 @router.get("/download")
 def download_file(
     bucket: str, key: str,
-    user: User = Depends(require_permission("run:view")),
+    user: User = Depends(require_permission("file:download")),
 ):
     if bucket not in _ALLOWED_BUCKETS:
         raise AppError(ErrorCode.STORAGE_BUCKET_UNKNOWN, detail=f"bucket '{bucket}'")
