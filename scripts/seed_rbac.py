@@ -32,16 +32,25 @@ create_all() has already created the tables), or run `python -c
 ── THE 5 ROLES & WHAT THEY CAN DO ──────────────────────────────────────────
 Administrator   — everything. Holds the wildcard "*" permission, which
                   satisfies every require_permission(...) check.
-Analyst         — can run analysis (run:start), can view data everywhere
-                  (run:view), can map invoices (hitl:map) but CANNOT
-                  approve or reject (no oracle:post / hitl:reject).
-Oracle Operator — can view data everywhere (run:view), CANNOT run analysis
-                  (no run:start), but CAN map invoices (hitl:map) AND
-                  approve/reject for Oracle posting (oracle:post,
-                  hitl:reject).
-Auditor         — read-only. Can view data everywhere (run:view,
-                  activity_log:view) but cannot run analysis, map, approve,
-                  reject, upload, or manage config/users.
+Analyst         — preparer + config author. Uploads statements
+                  (statement:upload), starts & monitors runs (run:start,
+                  run:monitor), maps invoices (hitl:map), authors config &
+                  bank-format recipes (config:view, config:author),
+                  downloads files (file:download), and views the activity
+                  log (activity_log:view). CANNOT approve/reject/post
+                  (no oracle:post / hitl:reject), manage the aging report,
+                  delete recipes (both config:manage, Admin-only), or
+                  manage users.
+Oracle Operator — approver/poster. Views data everywhere (run:view), maps
+                  invoices (hitl:map), rejects (hitl:reject), and
+                  approves/posts to Oracle (oracle:post); downloads files
+                  (file:download); views the activity log. CANNOT run or
+                  monitor analysis, nor see/author config (no run:start,
+                  run:monitor, config:view, config:author).
+Auditor         — read-only. Views data (run:view), config (config:view),
+                  and the activity log (activity_log:view). CANNOT run,
+                  monitor, map, approve, reject, download files, or manage
+                  anything.
 Viewer          — the default role a brand-new SSO/JIT user lands on (see
                   db/settings.py's DEFAULT_NEW_USER_ROLE). Holds NO
                   permissions at all — the frontend keeps a Viewer on the
@@ -50,25 +59,35 @@ Viewer          — the default role a brand-new SSO/JIT user lands on (see
 
 ── PERMISSION CODES ─────────────────────────────────────────────────────────
 "*"                — wildcard, Administrator only.
-run:view           — view data across Home/Overview/Analysis History/
-                     Executive Summary/AI Usage/Config/Results/Filters
-                     (kept as one broad "view" permission rather than one
-                     per page, since every non-Viewer role that can see
-                     anything can see everything — see requirements).
-run:start          — start a new analysis run.
-statement:upload   — upload a bank statement (part of "running analysis").
-hitl:map           — confirm a manual invoice mapping (does NOT post to
-                     Oracle by itself — see hitl/manual_mapping.py).
+run:view           — broad read across Home dashboard / Overview / Analysis
+                     History / Results / Executive Summary / AI Usage /
+                     aging status-history-preview / bank-account list /
+                     Filters / HITL read.
+run:monitor        — view live run status/progress, file preview, and ingest
+                     status (Analyst only).
+run:start          — start / reset an analysis run.
+statement:upload   — upload / delete / re-ingest a bank statement.
+config:view        — view config data (abbreviations, AI status, format
+                     detection), the Config tab, AND the saved bank-format
+                     recipe list / account detail (read-only). Analyst,
+                     Auditor.
+config:author      — config WRITES: edit abbreviations, test config, Config
+                     Builder upload/raw-preview/locate/test/save, edit
+                     account→business-unit mapping; plus the Config Builder
+                     OU list (available-ous) used while authoring. Analyst
+                     only.
+hitl:map           — confirm a manual invoice mapping / recheck remittance
+                     (does NOT post to Oracle by itself).
 hitl:reject        — reject a HITL row.
 oracle:post        — approve a row / post to Oracle Fusion / retry a post.
-activity_log:view  — view the Activity Log (Administrator, Auditor).
-user:manage        — onboard/edit/activate/deactivate users (Users tab).
-config:manage       — write/mutate Config or Config Builder data (upload/
-                     refresh/remove aging, edit abbreviations, save/delete
-                     a bank-format recipe). Administrator only for now —
-                     no other role was given config-write access by the
-                     current requirements; broaden this set later if that
-                     changes.
+file:download      — download a stored file (Analyst, Oracle Operator).
+activity_log:view  — view the Activity Log (Analyst, Oracle Operator,
+                     Auditor, Administrator).
+user:manage        — onboard/edit/activate/deactivate users + purge system
+                     logs (Users tab). Administrator only.
+config:manage      — Admin-only config that stays locked: aging
+                     upload/select/refresh/remove and DELETE a bank-format
+                     recipe. Administrator only.
 """
 from __future__ import annotations
 
@@ -85,16 +104,24 @@ ROLE_PERMISSIONS: dict[str, tuple[str, list[str]]] = {
         ["*"],
     ),
     "Analyst": (
-        "Runs analysis and maps invoices; views data everywhere; cannot approve or reject.",
-        ["run:view", "run:start", "statement:upload", "hitl:map"],
+        "Preparer + config author: uploads statements, runs & monitors analysis, "
+        "maps invoices, authors config/recipes, downloads files, views the activity "
+        "log. Cannot approve/reject/post, manage aging, delete recipes, or manage users.",
+        ["run:view", "run:start", "statement:upload", "run:monitor",
+         "config:view", "config:author", "hitl:map", "file:download",
+         "activity_log:view"],
     ),
     "Oracle Operator": (
-        "Maps invoices and approves/rejects for Oracle posting; views data everywhere; cannot run analysis.",
-        ["run:view", "hitl:map", "hitl:reject", "oracle:post"],
+        "Approver/poster: reviews, maps, rejects, and approves/posts to Oracle; "
+        "downloads files; views the activity log. Cannot run analysis, monitor runs, "
+        "or see/author config.",
+        ["run:view", "hitl:map", "hitl:reject", "oracle:post",
+         "file:download", "activity_log:view"],
     ),
     "Auditor": (
-        "Read-only — views data and the activity log everywhere; cannot run, map, approve, reject, or manage anything.",
-        ["run:view", "activity_log:view"],
+        "Read-only — views data, config, and the activity log everywhere; cannot run, "
+        "monitor, map, approve, reject, download files, or manage anything.",
+        ["run:view", "config:view", "activity_log:view"],
     ),
     "Viewer": (
         "Default role for a brand-new user. No permissions — restricted to the single Welcome page until an administrator assigns a real role.",
@@ -102,11 +129,14 @@ ROLE_PERMISSIONS: dict[str, tuple[str, list[str]]] = {
     ),
 }
 
+# Admin-only codes that appear in no non-admin role list above, but must still
+# exist as Permission rows: config:manage (aging writes + delete recipe) and
+# user:manage (user administration + purge system logs).
 ALL_PERMISSION_CODES = sorted({
     code
     for _desc, codes in ROLE_PERMISSIONS.values()
     for code in codes
-} | {"activity_log:view", "user:manage", "config:manage"})  # ensure admin-only codes exist as rows too
+} | {"user:manage", "config:manage"})
 
 
 def seed_rbac() -> None:
@@ -195,7 +225,7 @@ def seed_dev_user(email: str, role_names: list[str], azure_oid: str | None = Non
 
 
 DEMO_USERS: list[tuple[str, list[str]]] = [
-    ("admin@example.com", ["Administrator"]),
+    ("muni@zensar.com", ["Administrator"]),
     ("viewer@example.com", ["Viewer"]),
     ("auditor@example.com", ["Auditor"]),
     ("multi@example.com", ["Analyst", "Oracle Operator"]),

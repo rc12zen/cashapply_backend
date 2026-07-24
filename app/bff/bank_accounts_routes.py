@@ -99,7 +99,7 @@ class UpdateBusinessUnitsRequest(BaseModel):
 @router.put("/{account_id}/business-units")
 def update_business_units(account_id: int, body: UpdateBusinessUnitsRequest, request: Request,
                            db: Session = Depends(get_db),
-                           user: User = Depends(require_permission("config:manage"))):
+                           user: User = Depends(require_permission("config:author"))):
     """Administrator-only: change which Business Unit(s) a bank account
     belongs to. ONLY affects analysis runs started from now on — see
     module docstring. Nothing here touches any past run/LineItem."""
