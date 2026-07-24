@@ -1,5 +1,5 @@
 """
-app.bff.config_builder_routes — /api/config/*  (Account-Based Ingestion)
+app.bff.config_builder_routes — /api/config/*  (Account-Based Ingestion) 
 ========================================================================
 Config Builder + account-config management for the account-based engine.
 

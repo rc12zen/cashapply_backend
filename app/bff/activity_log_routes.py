@@ -1,5 +1,5 @@
 """
-app.bff.activity_log_routes
+app.bff.activity_log_routes 
 =============================
 /api/activity-log/* — read-only audit trail view (design doc §6). Now
 wired to the frontend's app/activity-log/page.tsx (previously that page had
