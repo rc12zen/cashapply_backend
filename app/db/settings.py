@@ -193,6 +193,15 @@ class Settings(BaseSettings):
     # org's rate limits before raising both at the same time.
     AI_BATCH_MAX_CONCURRENCY: int = 4
 
+    # ── Oracle receipt-creation concurrency (Step 4.5) ───────────────────────
+    # ThreadPoolExecutor size for the bare-receipt-creation fan-out in
+    # rule_engine/orchestrator.py. Each worker thread opens its OWN DB
+    # session (SQLAlchemy sessions aren't thread-safe) and makes its own
+    # Oracle HTTP call, so this is also the ceiling on how many Oracle
+    # standardReceipts POSTs are ever in flight at once for a single run.
+    # Keep this at/under Oracle Fusion's per-client rate limit.
+    ORACLE_RECEIPT_MAX_WORKERS: int = 8
+
 
 @lru_cache
 def get_settings() -> Settings:

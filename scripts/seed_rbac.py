@@ -195,7 +195,7 @@ def seed_dev_user(email: str, role_names: list[str], azure_oid: str | None = Non
 
 
 DEMO_USERS: list[tuple[str, list[str]]] = [
-    ("admin@example.com", ["Administrator"]),
+    ("muni@zensar.com", ["Administrator"]),
     ("viewer@example.com", ["Viewer"]),
     ("auditor@example.com", ["Auditor"]),
     ("multi@example.com", ["Analyst", "Oracle Operator"]),

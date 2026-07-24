@@ -68,6 +68,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from sqlalchemy import text
@@ -770,32 +771,83 @@ def _run_analysis(run_id: int, selected_files: list[str]) -> None:
             # happens later, only for ready_for_oracle rows, at SPOC-approval
             # time — see hitl/service.py.
             #
-            # Runs synchronously here (this whole function already executes
-            # inside the background worker, so a per-row HTTP call to Oracle
-            # doesn't block the user) and commits after each row so a
-            # mid-loop failure doesn't lose progress already made.
-            all_line_items_this_run = (
-                db.query(LineItem).filter(LineItem.run_id == run_id).all()
-            )
-            dbg(run_id, "ORACLE", "batch", f"Step 4.5: creating receipts for {len(all_line_items_this_run)} row(s)...")
+            # PARALLELIZED via ThreadPoolExecutor (mirrors extraction/
+            # chunk_processor.py's dispatch_chunks pattern) — each row's
+            # Oracle HTTP call is independent of every other row's, so
+            # rows are fanned out across Settings.ORACLE_RECEIPT_MAX_WORKERS
+            # threads instead of one-at-a-time. Each worker thread opens its
+            # OWN DB session via session_scope() (the outer `db` session used
+            # for the rest of this function is NOT thread-safe and must never
+            # be shared across threads) — it re-fetches the LineItem by id,
+            # runs create_receipt_for_line_item against ITS session, and
+            # session_scope() commits/rolls back and closes that session when
+            # the thread's work is done. This keeps the existing
+            # "commit after each row so a mid-batch failure doesn't lose
+            # progress" guarantee, just per-thread instead of per-iteration
+            # of a single loop.
+            all_line_item_ids_this_run = [
+                li.id for li in db.query(LineItem.id).filter(LineItem.run_id == run_id).all()
+            ]
+            total_receipt_rows = len(all_line_item_ids_this_run)
+            max_workers = max(1, get_settings().ORACLE_RECEIPT_MAX_WORKERS)
+            dbg(run_id, "ORACLE", "batch",
+                f"Step 4.5: creating receipts for {total_receipt_rows} row(s) "
+                f"across up to {max_workers} worker thread(s)...")
+
+            def _create_receipt_in_own_session(line_item_id: int) -> bool:
+                """Runs in a worker thread — own session, own commit/rollback.
+                Returns True on a successful receipt creation, False otherwise
+                (including if an exception was raised)."""
+                try:
+                    with session_scope() as thread_db:
+                        li = thread_db.query(LineItem).get(line_item_id)
+                        if li is None:
+                            dbg(run_id, "ORACLE", f"row={line_item_id}", "Row vanished before receipt creation — skipped.")
+                            return False
+                        result = create_receipt_for_line_item(thread_db, li)
+                        if result.get("success"):
+                            dbg(run_id, "ORACLE", f"row={li.id}",
+                                f"Receipt created — StandardReceiptId={li.standard_receipt_id} ReceiptNumber={li.oracle_ref_no}")
+                            return True
+                        dbg(run_id, "ORACLE", f"row={li.id}", f"Receipt creation FAILED — {li.post_message}")
+                        return False
+                except Exception as receipt_exc:
+                    # Mirror the old per-row except-and-continue behavior, but
+                    # in a fresh session (the one above may have already been
+                    # rolled back/closed by session_scope's own except clause).
+                    dbg(run_id, "ORACLE", f"row={line_item_id}", f"Receipt creation RAISED — {receipt_exc}")
+                    try:
+                        with session_scope() as failure_db:
+                            li = failure_db.query(LineItem).get(line_item_id)
+                            if li is not None:
+                                li.oracle_post_status = "failed"
+                                li.post_message = f"Receipt creation raised: {receipt_exc}"
+                    except Exception:
+                        pass  # don't let failure-path bookkeeping mask the original exception
+                    return False
+
             receipt_success_count = 0
             receipt_failed_count = 0
-            for li in all_line_items_this_run:
-                try:
-                    result = create_receipt_for_line_item(db, li)
-                    if result.get("success"):
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(_create_receipt_in_own_session, li_id): li_id
+                    for li_id in all_line_item_ids_this_run
+                }
+                for future in as_completed(futures):
+                    if future.result():
                         receipt_success_count += 1
-                        dbg(run_id, "ORACLE", f"row={li.id}", f"Receipt created — StandardReceiptId={li.standard_receipt_id} ReceiptNumber={li.oracle_ref_no}")
                     else:
                         receipt_failed_count += 1
-                        dbg(run_id, "ORACLE", f"row={li.id}", f"Receipt creation FAILED — {li.post_message}")
-                except Exception as receipt_exc:
-                    receipt_failed_count += 1
-                    li.oracle_post_status = "failed"
-                    li.post_message = f"Receipt creation raised: {receipt_exc}"
-                    dbg(run_id, "ORACLE", f"row={li.id}", f"Receipt creation RAISED — {receipt_exc}")
-                db.commit()
-            dbg(run_id, "ORACLE", "batch", f"Step 4.5 complete: {receipt_success_count} succeeded, {receipt_failed_count} failed out of {len(all_line_items_this_run)} row(s).")
+
+            # The outer `db` session above hasn't seen any of the per-thread
+            # commits — refresh its identity map so downstream code (e.g. the
+            # run-summary computed after Step 5) reads the up-to-date rows
+            # rather than stale pre-receipt-creation state.
+            db.expire_all()
+
+            dbg(run_id, "ORACLE", "batch",
+                f"Step 4.5 complete: {receipt_success_count} succeeded, {receipt_failed_count} failed "
+                f"out of {total_receipt_rows} row(s).")
 
             # ── Step 5: Mark run complete ─────────────────────────────────────
             run = db.query(AnalysisRun).get(run_id)
