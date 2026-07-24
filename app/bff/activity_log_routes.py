@@ -43,6 +43,7 @@ _CATEGORIES: dict[str, dict] = {
     "manual_mapping":    {"like": ["hitl.manual_mapping%"]},
     "approved":          {"like": ["hitl.approve%", "oracle.retry%"]},
     "rejected":          {"like": ["hitl.reject%"]},
+    "role_modification": {"like": ["user.updated%", "user.onboarded%"]},
 }
 
 

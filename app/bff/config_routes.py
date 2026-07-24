@@ -18,7 +18,10 @@ frontend changes required for this swap.
 """
 from __future__ import annotations
 
+import io
+
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from ..db.models import AppConfig, SourceFile, User
@@ -28,7 +31,7 @@ from ..common.errors import AppError
 from ..common.error_codes import ErrorCode
 from ..aging.uploader import handle_aging_upload
 from ..aging.parser import refresh_aging_map
-from ..aging.preview import preview_aging_file
+from ..aging.preview import preview_aging_file, load_active_aging_file
 from ..aging import aging_store
 
 router = APIRouter()
@@ -206,6 +209,20 @@ def aging_preview(max_rows: int = 200, db: Session = Depends(get_db),
     # Unchanged — reads the Excel file directly from storage, never touched
     # the AgingInvoice table.
     return preview_aging_file(db, max_rows)
+
+
+@router.get("/aging-download")
+def aging_download(db: Session = Depends(get_db),
+                    user: User = Depends(require_permission("run:view"))):
+    result = load_active_aging_file(db)
+    if not result:
+        raise AppError(ErrorCode.STORAGE_FILE_NOT_FOUND)
+    filename, data = result
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/abbreviations")
