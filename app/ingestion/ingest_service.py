@@ -302,6 +302,12 @@ def ingest_and_parse(db: Session, source_file_id: int) -> dict:
     try:
         storage = get_storage_client()
         local_path = storage.local_path_for_read(STATEMENT_BUCKET, record.storage_key)
+        logger.info(
+            "[ingest] source_file_id=%s filename=%r -- running detect_config() (see "
+            "cashapply.ingestion.detector logs above/below for the full candidate-by-"
+            "candidate matching trace)",
+            source_file_id, record.filename,
+        )
         detection = detect_config(local_path)
         if not detection.success:
             # Same distinction as handle_statement_upload_v2 above: no config
