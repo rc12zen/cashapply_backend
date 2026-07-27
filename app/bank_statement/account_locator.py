@@ -20,6 +20,7 @@ Public API
 ----------
 normalize_account(value)          -> normalized string ("" if empty)
 last4(value)                      -> last-4 of the normalized value
+split_accounts(value)             -> list[str]  (one cell → 1+ accounts; splits "A & B")
 extract_accounts(filepath, locator, source) -> set[str]  (normalized full accounts)
 """
 from __future__ import annotations
@@ -56,6 +57,45 @@ def match_key(value) -> str:
     """
     n = normalize_account(value)
     return n.lstrip("0") or n
+
+
+# Explicit separators that join several accounts in one cell (e.g. a main +
+# sub-account header like "41678876 & 41678884"). Deliberately does NOT include
+# spaces, so a single grouped account like "0002 0502 4781" stays intact.
+_ACCT_SEP = re.compile(r"\s*(?:&|,|/|\+|\band\b)\s*", re.IGNORECASE)
+
+
+def _looks_like_account(n: str) -> bool:
+    """A normalized token that plausibly is an account: 6+ chars with a digit."""
+    return len(n) >= 6 and any(ch.isdigit() for ch in n)
+
+
+def split_accounts(value) -> list[str]:
+    """Split a cell that may hold several accounts into normalized account tokens.
+
+    Handles main/sub-account headers such as "41678876 & 41678884" by splitting on
+    explicit separators (& , / + 'and') only — never on spaces — then normalizing
+    each piece. If no piece looks like an account (e.g. a lone value with no
+    separator), falls back to the whole normalized cell so single-account files are
+    unaffected. Order-preserving and de-duplicated.
+    """
+    if value is None:
+        return []
+    raw = str(value).strip()
+    if not raw or raw.lower() in ("nan", "none", "nat"):
+        return []
+    tokens = [normalize_account(p) for p in _ACCT_SEP.split(raw)]
+    acct_like = [t for t in tokens if t and _looks_like_account(t)]
+    if not acct_like:
+        whole = normalize_account(raw)
+        return [whole] if whole else []
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in acct_like:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 
 def _regex_texts(locator: dict, filepath: str, source: dict, snap: FileSnapshot) -> list[str]:
@@ -95,9 +135,8 @@ def extract_accounts(filepath: str, locator: dict, source: dict | None = None) -
         if t == "cell":
             snap = FileSnapshot.from_path(filepath)
             val = snap.cell(locator.get("row", 0), locator.get("col", 0), locator.get("sheet"))
-            n = normalize_account(val)
-            if n:
-                out.add(n)
+            # A header cell may list several accounts (main & sub) — split them.
+            out.update(split_accounts(val))
 
         elif t == "column":
             from .extractor import ExtractorFactory
@@ -105,9 +144,7 @@ def extract_accounts(filepath: str, locator: dict, source: dict | None = None) -
             name = locator.get("name")
             if name and name in df.columns:
                 for v in df[name].tolist():
-                    n = normalize_account(v)
-                    if n:
-                        out.add(n)
+                    out.update(split_accounts(v))
 
         elif t == "regex":
             pattern = re.compile(locator.get("pattern", ""))
@@ -115,9 +152,9 @@ def extract_accounts(filepath: str, locator: dict, source: dict | None = None) -
             for text in _regex_texts(locator, filepath, source, snap):
                 if not text:
                     continue
-                m = pattern.search(str(text))
-                if m:
-                    # last captured group if any, else whole match
+                # finditer (not search) so a cell holding several account-like
+                # values (main & sub) yields every one, not just the first.
+                for m in pattern.finditer(str(text)):
                     captured = m.group(m.lastindex) if m.lastindex else m.group(0)
                     n = normalize_account(captured)
                     if n:

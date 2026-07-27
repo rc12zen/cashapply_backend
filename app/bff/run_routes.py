@@ -21,7 +21,7 @@ from __future__ import annotations
 import datetime as dt
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
-from sqlalchemy import desc, func
+from sqlalchemy import desc, func, or_
 from sqlalchemy.orm import Session
 
 from ..common.errors import AppError
@@ -50,11 +50,28 @@ def _client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
+def _visible_to(user: User):
+    """Per-user gating for the Home statement lists.
+
+    A statement is visible to the current user if THEY uploaded it, or if it
+    has no recorded owner (legacy/shared rows created before per-user gating —
+    uploaded_by_user_id IS NULL). Every new upload records the uploader (see
+    ingest_service.handle_statement_upload_v2), so NULL only ever means "old
+    row", never a new leak. Scopes the file/account LISTS only — runs, results
+    and history remain global by design (a run consumes rows account-wide,
+    regardless of who uploaded them)."""
+    return or_(
+        SourceFile.uploaded_by_user_id == user.id,
+        SourceFile.uploaded_by_user_id.is_(None),
+    )
+
+
 @router.get("/files")
 def get_files(db: Session = Depends(get_db), user: User = Depends(require_permission("run:view"))):
     rows = (
         db.query(SourceFile)
         .filter(SourceFile.kind == "bank_statement", SourceFile.archived.is_(False))
+        .filter(_visible_to(user))
         .all()
     )
     storage = get_storage_client()
@@ -103,6 +120,7 @@ def get_pending_by_account(db: Session = Depends(get_db), user: User = Depends(r
     files = (
         db.query(SourceFile)
         .filter(SourceFile.kind == "bank_statement", SourceFile.archived.is_(False))
+        .filter(_visible_to(user))
         .all()
     )
 
@@ -224,6 +242,22 @@ def get_ingest_status(source_file_id: int, db: Session = Depends(get_db),
     record = db.query(SourceFile).get(source_file_id)
     if not record:
         raise AppError(ErrorCode.STATEMENT_NOT_FOUND)
+    # Rows still awaiting a run for this file's account (consumed_by_run_id IS
+    # NULL). This is the "can it actually be analyzed?" signal — distinct from
+    # new_row_count (an INGESTION-dedup number). A re-uploaded file can ingest
+    # 0 new rows yet still have pending rows to run (they were ingested by an
+    # earlier upload but never consumed by a completed run), so the UI must
+    # key "ready to analyze" off this, not off new_row_count.
+    pending_row_count = 0
+    if record.bank_account_id is not None:
+        pending_row_count = (
+            db.query(StatementTransactionRow)
+            .filter(
+                StatementTransactionRow.bank_account_id == record.bank_account_id,
+                StatementTransactionRow.consumed_by_run_id.is_(None),
+            )
+            .count()
+        )
     return {
         "source_file_id": record.id,
         "filename": record.filename,
@@ -231,6 +265,7 @@ def get_ingest_status(source_file_id: int, db: Session = Depends(get_db),
         "ingest_error": record.ingest_error,
         "new_row_count": record.new_row_count,
         "duplicate_row_count": record.duplicate_row_count,
+        "pending_row_count": pending_row_count,
     }
 
 
