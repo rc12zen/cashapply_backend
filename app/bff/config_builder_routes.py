@@ -46,6 +46,8 @@ from ..common.errors import AppError
 from ..common.error_codes import ErrorCode
 from ..common.upload_validation import validate_statement_upload, validate_statement_size
 from ..bank_statement.account_locator import extract_accounts, normalize_account, last4, match_key
+from ..bank_statement.account_validation import account_reject_reason
+from ..bank_statement.field_sanity import check_field_values
 from ..bank_statement.configs.account_loader import (
     load_account_configs, load_account_ou_map, reload_account_configs,
     active_recipe, format_summaries,
@@ -102,9 +104,26 @@ def _test_recipe(local_path: str, recipe: dict, key: str, filename: str) -> dict
                 d["statement_date"] = str(d["statement_date"])
             return d
 
-        return {"success": True, "row_count": len(rows), "rows": [_ser(r) for r in rows[:50]]}
+        # Value-level sanity checks over the REAL parsed values (account/date/
+        # currency/narrative). account_number failures are severity "error";
+        # everything else is "warn". `account_ok` is the single flag the wizard
+        # gates on — a config can parse cleanly yet still be wired to the wrong
+        # columns (e.g. a metadata label cell as the account number), which is
+        # exactly the "passed the test but was wrong" hole this closes.
+        warnings = check_field_values(rows)
+        account_ok = not any(
+            w["field"] == "account_number" and w["severity"] == "error" for w in warnings
+        )
+        return {
+            "success": True,
+            "row_count": len(rows),
+            "rows": [_ser(r) for r in rows[:50]],
+            "warnings": warnings,
+            "account_ok": account_ok,
+        }
     except (ColumnValidationError, Exception) as e:
-        return {"success": False, "error": str(e), "row_count": 0, "rows": []}
+        return {"success": False, "error": str(e), "row_count": 0, "rows": [],
+                "warnings": [], "account_ok": False}
 
 
 # ── upload a file for the wizard (NO ingestion) ──────────────────────────────────
@@ -266,11 +285,16 @@ def builder_locate_account(body: LocateAccountRequest, db: Session = Depends(get
         for k, entry in configs.items():
             if match_key(entry.get("account_number", k)) == mk:
                 existing[acct] = sorted((entry.get("recipes") or {}).keys())
+    # Flag candidates that don't look like real account numbers (e.g. the locator
+    # landed on a label/heading cell) so the wizard can grey them out or warn
+    # BEFORE one is chosen as the account identity. {account: reason-or-None}.
+    account_issues = {a: account_reject_reason(a) for a in found}
     return {
         "accounts": found,
         "count": len(found),
         "last4s": sorted({last4(a) for a in found}),
         "existing": existing,   # {account: [formats already configured]}
+        "account_issues": account_issues,   # {account: reason string | null}
     }
 
 
@@ -352,6 +376,13 @@ class SaveRecipeRequest(BaseModel):
     # prevent). Not required when ou_number already exists — an existing
     # OU's currency, once set, is never overwritten by a later save.
     functional_currency: str | None = None
+    # Explicit SPOC override of the account-number structural gate. False by
+    # default: a value that fails account_reject_reason() is hard-blocked at
+    # save (it's the join key that corrupts detection across configs when
+    # wrong). The wizard only sets this True when the user ticks the
+    # "I confirm this is the real account number" checkbox for a rare
+    # legitimately-unusual account.
+    override_account_validation: bool = False
     storage_key: str | None = None    # (unused for keying; kept for symmetry)
     # Best-effort author of this version, read from the login_user_email_stub
     # cookie by the wizard (this module's axios has no dev-user interceptor).
@@ -438,6 +469,13 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
     acct = str(body.account_number).strip()
     if not acct:
         raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED, detail="account number")
+    # Structural gate on the account identity — the fix for the config-corruption
+    # class of bug. A value that doesn't look like an account (label cell, no
+    # digits, too short/long) is refused unless the SPOC explicitly overrode it.
+    if not body.override_account_validation:
+        reason = account_reject_reason(acct)
+        if reason:
+            raise AppError(ErrorCode.CONFIG_RECIPE_INVALID, detail=reason)
     if not body.display_name.strip():
         raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED, detail="display name")
     fmt = _FMT_ALIASES.get(body.format.lower(), body.format.lower())
