@@ -149,6 +149,17 @@ def configure_logging() -> None:
     root.addHandler(console_handler)
     root.addHandler(file_handler)
 
+    # uvicorn installs its own console-only handlers on these loggers with
+    # propagate=False, so without this their startup banner + access lines
+    # (and the app's own uvicorn.error startup warnings in main.py) never
+    # reach the root file/console handlers above. Drop uvicorn's own handlers
+    # and let the records bubble to root -> app.txt + console. Safe when
+    # uvicorn isn't running: these loggers just have no records to emit.
+    for _name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        _ulog = logging.getLogger(_name)
+        _ulog.handlers.clear()
+        _ulog.propagate = True
+
     logging.getLogger(__name__).info(
         "Logging configured: level=%s, dir=%s (one .txt file per day, %s-day retention)",
         level_name, log_dir.resolve(), retention_days,

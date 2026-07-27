@@ -111,7 +111,7 @@ def _test_recipe(local_path: str, recipe: dict, key: str, filename: str) -> dict
 
 @router.post("/builder/upload")
 async def builder_upload(file: UploadFile = File(...), db: Session = Depends(get_db),
-                          user: User = Depends(require_permission("config:author"))):
+                          user: User = Depends(require_permission("config:manage"))):
     """
     Store an uploaded report so the Config Builder wizard can preview / locate /
     test against it — WITHOUT running the ingestion pipeline.
@@ -184,7 +184,7 @@ def _trim_trailing_empty_cols(rows: list[list[str]]) -> list[list[str]]:
 
 @router.get("/builder/raw-preview/{filename}")
 def builder_raw_preview(filename: str, db: Session = Depends(get_db),
-                        user: User = Depends(require_permission("config:author"))):
+                        user: User = Depends(require_permission("config:manage"))):
     """Return raw cell data for all sheets — used by the wizard preview/header/locate steps."""
     record, local_path = _local_path(db, filename)
     ext = os.path.splitext(filename)[1].lower().lstrip(".")
@@ -253,7 +253,7 @@ class LocateAccountRequest(BaseModel):
 
 @router.post("/builder/locate-account")
 def builder_locate_account(body: LocateAccountRequest, db: Session = Depends(get_db),
-                           user: User = Depends(require_permission("config:author"))):
+                           user: User = Depends(require_permission("config:manage"))):
     """Run a locator draft against the file and return the account(s) it finds,
     flagging any that are already registered."""
     _record, local_path = _local_path_by_key(db, body.storage_key)
@@ -283,7 +283,7 @@ class BuilderTestRequest(BaseModel):
 
 @router.post("/builder/test")
 def builder_test(body: BuilderTestRequest, db: Session = Depends(get_db),
-                 user: User = Depends(require_permission("config:author"))):
+                 user: User = Depends(require_permission("config:manage"))):
     """Test a draft recipe against the uploaded file. Returns up to 50 normalized rows."""
     _record, local_path = _local_path_by_key(db, body.storage_key)
     return _test_recipe(local_path, body.config_draft, body.config_draft.get("key", "_DRAFT_"), _record.filename)
@@ -293,7 +293,7 @@ def builder_test(body: BuilderTestRequest, db: Session = Depends(get_db),
 
 @router.get("/builder/available-ous")
 def available_ous(db: Session = Depends(get_db),
-                  user: User = Depends(require_permission("config:author"))):
+                  user: User = Depends(require_permission("run:view"))):
     """
     OUs the wizard's OU/Business Unit step can offer, so onboarding an
     account picks from a real, known OU instead of free-typing one that
@@ -345,9 +345,12 @@ class SaveRecipeRequest(BaseModel):
     business_unit: str
     # Ledger/functional currency for this OU — required for Oracle FX Leg 2
     # resolution (rule_engine/fx_service.py's get_functional_currency()).
-    # Only used if ou_number is genuinely new (see builder_save); falls
-    # back to `currency` (the bank account's own statement currency) if
-    # left blank.
+    # REQUIRED whenever ou_number is genuinely new (see
+    # _get_or_create_organization_unit) — there is no fallback/default
+    # anymore (it used to silently default to "USD" if left blank, which is
+    # exactly the kind of wrong-and-invisible data this field exists to
+    # prevent). Not required when ou_number already exists — an existing
+    # OU's currency, once set, is never overwritten by a later save.
     functional_currency: str | None = None
     storage_key: str | None = None    # (unused for keying; kept for symmetry)
     # Best-effort author of this version, read from the login_user_email_stub
@@ -362,10 +365,28 @@ def _get_or_create_organization_unit(db: Session, ou_number: str, business_unit:
     business_unit = business_unit.strip()
     ou = db.query(OrganizationUnit).filter(OrganizationUnit.ou_number == ou_number).first()
     if ou is None:
+        # PATCH: this used to silently default to `functional_currency or "USD"`
+        # -- meaning an OU created without an explicit currency (e.g. the
+        # wizard's field left blank, or a caller forgetting the field) got
+        # stamped USD with no warning, no error, nothing in the UI to flag
+        # it. Since functional_currency drives real Oracle FX Leg 2
+        # resolution (rule_engine/fx_service.py's get_functional_currency())
+        # and, once set, is NOT updated on subsequent saves (only ou_name
+        # is kept in sync below), a wrong default here is effectively
+        # permanent until someone finds and fixes it by hand in the DB.
+        # A brand-new OU now REQUIRES an explicit functional_currency from
+        # the caller -- no fallback. An OU that already exists doesn't hit
+        # this branch at all, so re-saving an existing account never needs
+        # to re-supply it.
+        if not functional_currency or not functional_currency.strip():
+            raise AppError(
+                ErrorCode.CONFIG_FIELD_REQUIRED,
+                detail=f"Functional Currency -- OU '{ou_number}' is new and has no currency on record yet",
+            )
         ou = OrganizationUnit(
             ou_number=ou_number,
             ou_name=business_unit,
-            functional_currency=(functional_currency or "USD").upper(),
+            functional_currency=functional_currency.strip().upper(),
         )
         db.add(ou)
         db.flush()
@@ -410,7 +431,7 @@ def _get_or_create_bank_account(db: Session, acct: str, body: "SaveRecipeRequest
 
 @router.post("/builder/save")
 def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
-                 user: User = Depends(require_permission("config:author"))):
+                 user: User = Depends(require_permission("config:manage"))):
     """Save/attach a recipe. If the account exists, a new recipe version is added
     for the format; otherwise a new account is created — always linked to a real
     OrganizationUnit (OU + Business Unit), never saved without one."""
@@ -489,7 +510,7 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
 # ── list / fetch accounts (Manage + Clone-from-existing) ─────────────────────────
 
 @router.get("/builder/accounts")
-def list_accounts(user: User = Depends(require_permission("config:view"))):
+def list_accounts(user: User = Depends(require_permission("run:view"))):
     """List all account configs (light) for the manage dialog and clone picker."""
     out = []
     for acct, entry in load_account_configs().items():
@@ -508,7 +529,7 @@ def list_accounts(user: User = Depends(require_permission("config:view"))):
 
 
 @router.get("/builder/account/{account_number}")
-def get_account(account_number: str, user: User = Depends(require_permission("config:view"))):
+def get_account(account_number: str, user: User = Depends(require_permission("run:view"))):
     """Full account entry (incl. recipes) — used to clone an existing config."""
     entry = load_account_configs().get(account_number)
     if not entry:
@@ -526,7 +547,7 @@ class TestExistingRequest(BaseModel):
 
 @router.post("/test-existing")
 def test_existing(body: TestExistingRequest, db: Session = Depends(get_db),
-                  user: User = Depends(require_permission("config:author"))):
+                  user: User = Depends(require_permission("config:manage"))):
     """Run a saved account recipe against the uploaded file (preview + row count)."""
     entry = load_account_configs().get(body.account_number)
     if not entry:
@@ -592,7 +613,7 @@ def delete_recipe(account_number: str, fmt: str, db: Session = Depends(get_db),
 
 @router.get("/detect/{filename}")
 def detect_for_file(filename: str, db: Session = Depends(get_db),
-                    user: User = Depends(require_permission("config:view"))):
+                    user: User = Depends(require_permission("run:view"))):
     """Re-run account-based detection and list matching accounts (picker/reconfigure)."""
     record, local_path = _local_path(db, filename)
     from ..bank_statement.detector import detect_config, list_matching_configs

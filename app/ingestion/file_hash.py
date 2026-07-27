@@ -20,10 +20,16 @@ def compute_file_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def check_duplicate_file(db: Session, file_hash: str) -> dict | None:
+def check_duplicate_file(db: Session, file_hash: str, current_user_id: int | None = None) -> dict | None:
     """
     Returns a duplicate-info dict if this exact file was already uploaded,
     else None. Does not mutate anything — safe to call speculatively.
+
+    `current_user_id` (optional) is the person doing THIS upload. It's used
+    only to set `owned_by_current_user` in the result, so the frontend banner
+    can tell "you already uploaded this" (it's in YOUR list → "select it and
+    Start") apart from "someone else already uploaded this" (per-user gating
+    means it is NOT in your list → purely informational).
 
     PATCH: now includes `existing_file_archived` — the original version
     never checked this, so re-uploading the exact same bytes as a file
@@ -38,13 +44,25 @@ def check_duplicate_file(db: Session, file_hash: str) -> dict | None:
     if existing is None:
         return None
 
-    uploader = db.query(User).get(existing.uploaded_by) if existing.uploaded_by else None
+    source = db.query(SourceFile).get(existing.source_file_id)
+
+    # Whose Account Statements list is this file actually in RIGHT NOW? That's
+    # SourceFile.uploaded_by_user_id (what GET /files filters on) — the current
+    # owner, which can differ from StatementFileHash.uploaded_by (the ORIGINAL
+    # uploader of these bytes) after a restore/retry transfers ownership. Use
+    # the current owner for both the displayed name and the ownership flag so
+    # the banner matches what the user can actually see.
+    owner_id = (
+        source.uploaded_by_user_id
+        if source is not None and source.uploaded_by_user_id is not None
+        else existing.uploaded_by
+    )
+    uploader = db.query(User).get(owner_id) if owner_id else None
 
     # Best-effort: find a run that included this source file, for the "view
     # existing run" link. selected_files stores filenames (JSON list), so we
     # match on the SourceFile's filename rather than a direct FK — matches
     # the existing AnalysisRun.selected_files shape (see db/models.py).
-    source = db.query(SourceFile).get(existing.source_file_id)
     prior_run = None
     if source:
         candidates = (
@@ -60,6 +78,7 @@ def check_duplicate_file(db: Session, file_hash: str) -> dict | None:
     return {
         "duplicate": True,
         "uploaded_by": uploader.display_name or uploader.email if uploader else "unknown",
+        "owned_by_current_user": bool(current_user_id is not None and owner_id == current_user_id),
         "uploaded_at": existing.uploaded_at.isoformat() if existing.uploaded_at else None,
         "existing_source_file_id": existing.source_file_id,
         "existing_file_archived": bool(source.archived) if source else False,
@@ -74,8 +93,12 @@ def check_duplicate_file(db: Session, file_hash: str) -> dict | None:
         "existing_ingest_status": source.ingest_status if source else None,
         "existing_ingest_error": source.ingest_error if source else None,
         "existing_run_id": prior_run.run_id if prior_run else None,
+        # Open the RUN detail view. The history page restores a run from the
+        # ?run_id= query param (see analysis-history/page.tsx); the /row/<id>
+        # route expects a LINE-ITEM id, not a run id, so the old link sent the
+        # user to the wrong row (run_id reinterpreted as record id).
         "history_link": (
-            f"/analysis-history/row/{prior_run.run_id}" if prior_run else "/analysis-history"
+            f"/analysis-history?run_id={prior_run.run_id}" if prior_run else "/analysis-history"
         ),
     }
 

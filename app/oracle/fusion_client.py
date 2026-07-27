@@ -1,5 +1,5 @@
 """
-app.oracle.fusion_client  (PATCHED v2)
+app.oracle.fusion_client  (PATCHED v3)
 =======================================
 POST /standardReceipts client. Supports Basic Auth and OAuth.
 
@@ -11,45 +11,61 @@ Three-currency model to match Oracle AR's own posting logic:
   invoice_currency   : what the invoice was raised in (e.g. USD)
   functional_currency: OU ledger currency (e.g. INR)
 
+PATCH (v3): "Currency" is NOT a standalone field that's always sent. A
+confirmed real Oracle sample payload shows Currency only ever appears
+TOGETHER WITH ConversionRateType/ConversionRate/ConversionDate, as one
+all-or-nothing group -- present only when invoice_currency differs from
+functional_currency (Oracle needs telling what foreign currency this
+receipt is in and how to convert it). When invoice_currency ==
+functional_currency, NONE of these four fields are sent at all -- Oracle
+defaults to the ledger's own functional currency on its own. Sending
+Currency alone, with no conversion fields, on a same-functional-currency
+receipt (the old v2 behavior) was simply wrong, not just redundant.
+
 Oracle payload shapes:
 
   Case A — All three currencies are the same (fully same-currency)
   ─────────────────────────────────────────────────────────────────
-  No ConversionRate/ConversionDate needed.
-  Currency = invoice_currency (= credited = functional)
-  Amount   = credit_amount (already in invoice currency)
+  No Currency, no ConversionRate/ConversionDate/ConversionRateType.
+  Amount   = credit_amount (already in invoice = functional currency)
 
   Case B — credited != invoice  (Leg 1 conversion needed by us)
   ─────────────────────────────────────────────────────────────────
   We converted credit_amount → invoice_currency at analysis time
-  (fx_credit_to_invoice). Oracle receives amounts in invoice_currency.
-  Currency     = invoice_currency
-  Amount       = credit_amount * fx_credit_to_invoice  (in invoice ccy)
+  (fx_credit_to_invoice). Amount is in invoice_currency either way.
+  Amount = credit_amount * fx_credit_to_invoice
 
-  If ALSO invoice != functional  (is_cross_ledger=True, Leg 2):
-    ConversionRateType = "User"
-    ConversionRate     = fx_invoice_to_functional
-    ConversionDate     = statement_date
-    Oracle uses ConversionRate internally to book in functional currency.
-    We do NOT compute functional amounts — Oracle owns that.
+    If invoice == functional (no Leg 2 needed):
+      No Currency, no ConversionRate* fields — same as Case A from here.
+
+    If ALSO invoice != functional  (is_cross_ledger=True, Leg 2):
+      Currency            = invoice_currency
+      ConversionRateType  = "User"
+      ConversionRate      = fx_invoice_to_functional
+      ConversionDate      = statement_date
+      Oracle uses ConversionRate internally to book in functional currency.
+      We do NOT compute functional amounts — Oracle owns that.
 
   Case C — credited == invoice but invoice != functional
   ─────────────────────────────────────────────────────────────────
   No Leg 1 needed (same currency received as invoice denomination).
-  Currency     = invoice_currency
-  Amount       = credit_amount
-  ConversionRateType = "User"
-  ConversionRate     = fx_invoice_to_functional
-  ConversionDate     = statement_date
+  Amount              = credit_amount
+  Currency            = invoice_currency
+  ConversionRateType  = "User"
+  ConversionRate      = fx_invoice_to_functional
+  ConversionDate      = statement_date
 
 Example (from spec):
   credit: 100 GBP, invoice: 100 USD, functional: INR
-  → Currency="USD", Amount=100*fx(GBP→USD),
+  → Amount=100*fx(GBP→USD), Currency="USD",
     ConversionRate=fx(USD→INR), ConversionDate=statement_date
 
   credit: 100 USD, invoice: 100 USD, functional: INR
-  → Currency="USD", Amount=100,
+  → Amount=100, Currency="USD",
     ConversionRate=fx(USD→INR), ConversionDate=statement_date
+
+  credit: 100 USD, invoice: 100 USD, functional: USD (all match)
+  → Amount=100. No Currency, no ConversionRate* fields at all.
 
 ReferenceAmount:
   Always in invoice_currency (same as Amount).
@@ -322,9 +338,11 @@ def build_receipt_creation_payload(line_item: LineItem) -> dict:
         unidentified/needs_remittance/conflict_exception).
 
     Payload shapes for Amount/Currency/ConversionRate — see this module's
-    docstring for the full three-currency-model examples; unchanged from
-    before, only the remittanceReferences array and CustomerAccountNumber
-    handling have changed.
+    docstring for the full three-currency-model examples. PATCHED (v3):
+    Currency/ConversionRateType/ConversionRate/ConversionDate are now one
+    all-or-nothing group, sent only when invoice_currency != functional_currency
+    — confirmed against a real Oracle sample payload; previously Currency was
+    sent unconditionally on every payload, which was wrong.
     """
     # ── Resolve currency fields from LineItem ─────────────────────────────────
     credited_currency   = (line_item.statement_currency  or "").upper().strip()
@@ -403,13 +421,22 @@ def build_receipt_creation_payload(line_item: LineItem) -> dict:
     customer_account_number = customer_account_number or ""
 
     # ── Base payload — NO remittanceReferences here, see docstring ───────────
+    # PATCH: "Currency" used to be unconditionally set to invoice_currency
+    # here, on every payload. A real confirmed Oracle sample payload shows
+    # Currency is NOT a standalone field -- it only appears TOGETHER WITH
+    # ConversionRateType/ConversionRate/ConversionDate, as one all-or-
+    # nothing group, for a receipt being raised in a currency OTHER than
+    # the OU's functional (ledger) currency. When invoice_currency ==
+    # functional_currency, Oracle defaults Currency to the ledger currency
+    # on its own -- sending it (with no conversion fields alongside it) was
+    # simply wrong, not just redundant. See the block below the audit-flag
+    # checks for where this whole group now gets added together.
     payload: dict = {
         "ReceiptNumber":               _build_receipt_number(line_item),
         "ReceiptMethod":               receipt_method_name,
         "BusinessUnit":                business_unit,
         "CustomerAccountNumber":       customer_account_number,
         "RemittanceBankAccountNumber": line_item.account_number,
-        "Currency":                    invoice_currency,     # always post in invoice ccy
         "Amount":                      amount_in_invoice_ccy,
         "AccountingDate":              accounting_date_iso,
         "ReceiptDate":                 statement_date_iso,
@@ -441,16 +468,30 @@ def build_receipt_creation_payload(line_item: LineItem) -> dict:
             f"receipt_method_map.json."
         )
 
-    # ── Add Leg 2 conversion fields when invoice != functional ────────────────
+    # ── Currency + Conversion* fields — ONE ALL-OR-NOTHING GROUP ─────────────
+    # Only added when invoice_currency != functional_currency (a foreign-
+    # currency receipt from the ledger's point of view). When they match,
+    # NONE of these four fields are sent — Oracle uses the ledger's own
+    # functional currency automatically, and amount_in_invoice_ccy is
+    # already the correct functional-currency amount at that point (Leg 1
+    # already converted credited_currency -> invoice_currency upstream;
+    # since invoice_currency == functional_currency here, no further
+    # conversion is needed or wanted).
     if is_cross_ledger and fx_invoice_to_functional:
+        payload["Currency"]           = invoice_currency
         payload["ConversionRateType"] = "User"
         payload["ConversionRate"]     = fx_invoice_to_functional
         payload["ConversionDate"]     = statement_date_iso
     elif is_cross_ledger and not fx_invoice_to_functional:
+        # Cross-ledger but the rate isn't resolved -- do NOT send a partial
+        # group (Currency with no rate is worse than sending neither).
+        # Flagged for a human, not silently posted in the functional
+        # currency it doesn't actually belong in.
         payload["_fx_leg2_missing"] = (
             f"fx_invoice_to_functional ({invoice_currency}→{functional_currency}) "
             f"not resolved. DO NOT POST — re-evaluate after providing rate."
         )
+
 
     # ── Audit trail (not sent to Oracle — strip before posting if needed) ─────
     payload["_fx_sources"] = {
