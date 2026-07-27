@@ -161,6 +161,18 @@ class Settings(BaseSettings):
     AGING_WATCH_FOLDER: str = "./aging_watch"       # folder scanned for new aging files
     AGING_POLL_INTERVAL_SECONDS: int = 30           # how often to re-scan
 
+    # ── GL Daily Rates auto-detection (file-based — NO Oracle REST API) ─────
+    # Same "drop a file in a watched folder" pattern as the aging report
+    # above (see gl_rates/watcher.py, the sibling of aging/watcher.py) —
+    # EXCEPT unlike the aging report (in-memory only), GL rate rows are
+    # UPSERTED into the gl_daily_rates table (db/models.py's GlDailyRate),
+    # since rate history needs to accumulate across files, not be replaced
+    # wholesale by the latest one. rule_engine/fx_service.py reads FROM
+    # THIS TABLE for FX resolution — there is no live Oracle GL REST call.
+    GL_RATES_SOURCE: str = "local_folder"           # "local_folder" | "sftp" (future)
+    GL_RATES_WATCH_FOLDER: str = "./gl_rates_watch"  # folder scanned for new GL rate files
+    GL_RATES_POLL_INTERVAL_SECONDS: int = 30        # how often to re-scan
+
     # ── Rule engine tolerances (overridable; mirrors Config screen) ────────
     SHORT_PAYMENT_TOLERANCE_PCT: float = 12.0
     BANK_CHARGE_SPOC_AUTHORITY: float = 50.0
@@ -201,6 +213,15 @@ class Settings(BaseSettings):
     # standardReceipts POSTs are ever in flight at once for a single run.
     # Keep this at/under Oracle Fusion's per-client rate limit.
     ORACLE_RECEIPT_MAX_WORKERS: int = 8
+
+    # ── Rule-engine evaluation concurrency (Step 4) ──────────────────────────
+    # ThreadPoolExecutor size for the per-row rule-evaluation fan-out in
+    # rule_engine/orchestrator.py (Pass 1 -> persist -> Pass 2 -> evaluate ->
+    # transition -> mark-consumed). Each worker thread opens its OWN DB
+    # session and its own gl_daily_rates / remittance lookups, so this is
+    # also the ceiling on how many rows are mid-evaluation at once for a
+    # single run. Keep this at/under your DB connection pool's capacity.
+    RULE_ENGINE_MAX_WORKERS: int = 8
 
 
 @lru_cache

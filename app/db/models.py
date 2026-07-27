@@ -19,12 +19,12 @@ This was wrong. The correct model has THREE currencies and TWO legs:
   Leg 1  credited → invoice    (for comparison + Oracle Amount)
     is_cross_currency              : statement_currency != invoice_currency
     fx_credit_to_invoice           : FX rate for Leg 1
-    fx_credit_to_invoice_source    : "oracle_gl" | "static_map" | "spoc_manual"
+    fx_credit_to_invoice_source    : "gl_rates_table" | "static_map" | "spoc_manual"
 
   Leg 2  invoice → functional  (for Oracle ConversionRate only — we don't apply it)
     is_cross_ledger                : invoice_currency != functional_currency
     fx_invoice_to_functional       : FX rate for Leg 2  (= Oracle ConversionRate)
-    fx_invoice_to_functional_source: "oracle_gl" | "static_map" | "spoc_manual"
+    fx_invoice_to_functional_source: "gl_rates_table" | "static_map" | "spoc_manual"
 
   is_cross_ou_currency:
     Set True on ready_to_post / acceptable_short_payment rows where the
@@ -56,7 +56,7 @@ import datetime as dt
 import enum
 
 from sqlalchemy import (
-    BigInteger, Boolean, Column, DateTime, Enum, Float, ForeignKey,
+    BigInteger, Boolean, Column, Date, DateTime, Enum, Float, ForeignKey,
     Integer, JSON, Numeric, String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import declarative_base, relationship
@@ -183,7 +183,7 @@ class LineItem(Base):
     # Leg 1: credited → invoice
     #   is_cross_currency   True when statement_currency != invoice_currency
     #   fx_credit_to_invoice        FX rate for Leg 1 conversion
-    #   fx_credit_to_invoice_source "oracle_gl" | "static_map" | "spoc_manual"
+    #   fx_credit_to_invoice_source "gl_rates_table" | "static_map" | "spoc_manual"
     #
     # Leg 2: invoice → functional  (Oracle's own conversion — we only store the rate)
     #   is_cross_ledger                True when invoice_currency != functional_currency
@@ -587,6 +587,51 @@ class BankAccount(Base):
     @property
     def all_ou_numbers(self) -> list[str]:
         return [ou.ou_number for ou in self.all_organization_units]
+
+
+class GlDailyRate(Base):
+    """
+    Oracle GL Daily Rates — loaded from a file, NOT a REST call.
+
+    There is no live Oracle GL Daily Rates REST API in this environment.
+    Finance drops a GL Daily Rates extract (.xlsx/.xls/.csv — same shape as
+    the Zensar_GL_Daily_Rates_Extract used to build
+    rule_engine/configs/fx_conversion_type_map.json) into a watched folder,
+    exactly the way aging reports arrive — see gl_rates/watcher.py, the
+    sibling of aging/watcher.py. That file is parsed and its rows UPSERTED
+    into this table (unlike the aging report, which stays in-memory only —
+    rate history needs to persist and accumulate across files, not be
+    replaced wholesale by the latest one).
+
+    rule_engine/fx_service.py.FxService._fetch_from_gl_rates_table() reads
+    FROM THIS TABLE (not a REST endpoint) for a given
+    (from_currency, to_currency, conversion_date, conversion_rate_type) —
+    see that method's docstring for the exact-date-then-nearest-prior-date
+    lookup order.
+
+    One row = one (pair, date, rate type) — the natural key mirrors what
+    Oracle's own GL_DAILY_RATES table looks like, so multiple files
+    (e.g. a new day's rates each morning) ADD rows rather than replace the
+    whole table; re-loading the same file re-upserts the same rows
+    (idempotent on the unique constraint below).
+    """
+    __tablename__ = "gl_daily_rates"
+
+    id                    = Column(Integer, primary_key=True, autoincrement=True)
+    from_currency         = Column(String(10), nullable=False, index=True)
+    to_currency           = Column(String(10), nullable=False, index=True)
+    conversion_date       = Column(Date, nullable=False, index=True)
+    conversion_rate_type  = Column(String(50), nullable=False)          # e.g. "MRC Daily", "Spot"
+    conversion_rate       = Column(Numeric(24, 10), nullable=False)     # 1 from_currency = ? to_currency
+    source_filename       = Column(String(300), nullable=True)          # which uploaded file this row came from
+    loaded_at             = Column(DateTime, default=dt.datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "from_currency", "to_currency", "conversion_date", "conversion_rate_type",
+            name="uq_gl_daily_rate_pair_date_type",
+        ),
+    )
 
 
 class BankAccountOU(Base):

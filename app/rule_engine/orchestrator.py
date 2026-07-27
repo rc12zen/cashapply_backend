@@ -266,8 +266,8 @@ def _build_rule_input(
                                 None if credited == invoice or not yet resolved
       fx_invoice_to_functional: rate Oracle uses to post invoice amt → functional
                                 None if invoice == functional or not yet resolved
-      fx_credit_to_invoice_source   : "oracle_gl" | "static_map" | None
-      fx_invoice_to_functional_source: "oracle_gl" | "static_map" | None
+      fx_credit_to_invoice_source   : "gl_rates_table" | "static_map" | None
+      fx_invoice_to_functional_source: "gl_rates_table" | "static_map" | None
 
       is_cross_currency: True when credited_currency != invoice_currency
                          (this drives conversion in evaluator & Oracle payload)
@@ -314,19 +314,18 @@ def _build_rule_input(
     fx_credit_to_invoice_source = None
 
     if is_cross_currency:
-        fx_credit_to_invoice = fx_service.get_rate(
+        # PATCH: this used to call fx_service.get_rate() and then a SECOND
+        # time call the private _fetch_from_oracle()/_fetch_from_gl_rates_table()
+        # just to figure out which source the rate came from -- doubling
+        # the DB lookup (or, previously, the REST call) for every
+        # cross-currency row. get_rate_with_source() already caches
+        # (rate, source) together from the single lookup get_rate() itself
+        # makes internally, so this now costs exactly one lookup.
+        fx_credit_to_invoice, fx_credit_to_invoice_source = fx_service.get_rate_with_source(
             from_ccy=credited_currency,
             to_ccy=invoice_currency,
             rate_date=rate_date,
         )
-        if fx_credit_to_invoice is not None:
-            oracle_rate = fx_service._fetch_from_oracle(
-                credited_currency, invoice_currency,
-                rate_date.strftime("%Y-%m-%d") if rate_date else "",
-            )
-            fx_credit_to_invoice_source = (
-                "oracle_gl" if oracle_rate is not None else "static_map"
-            )
 
     # ── Leg 2: invoice → functional ──────────────────────────────────────────
     # Rate that Oracle uses internally to post the receipt into the ledger.
@@ -341,19 +340,11 @@ def _build_rule_input(
     fx_invoice_to_functional_source = None
 
     if is_cross_ledger and invoice_currency:
-        fx_invoice_to_functional = fx_service.get_rate(
+        fx_invoice_to_functional, fx_invoice_to_functional_source = fx_service.get_rate_with_source(
             from_ccy=invoice_currency,
             to_ccy=functional_currency,
             rate_date=rate_date,
         )
-        if fx_invoice_to_functional is not None:
-            oracle_rate = fx_service._fetch_from_oracle(
-                invoice_currency, functional_currency,
-                rate_date.strftime("%Y-%m-%d") if rate_date else "",
-            )
-            fx_invoice_to_functional_source = (
-                "oracle_gl" if oracle_rate is not None else "static_map"
-            )
 
     # ── Cross-OU status ───────────────────────────────────────────────────────
     ou_status = resolve_ou_status(
@@ -508,9 +499,15 @@ def _mark_row_consumed(db: Session, orig: CreditRowSchema, run_id: int) -> None:
     """
     Stamps consumed_by_run_id on the StatementTransactionRow this
     CreditRowSchema was sourced from (design doc §0) — in the SAME
-    transaction as the LineItem it produced (both flushed together, both
-    committed together at the end of the chunk loop below), so a failed run
-    never "consumes" a row it didn't actually produce a LineItem for.
+    transaction/session as the LineItem it produced (see
+    _process_identified_payment()/_process_unknown_payment() below, each of
+    which does its whole pipeline inside one session_scope() block), so a
+    failed row never "consumes" a StatementTransactionRow it didn't actually
+    produce a LineItem for. PATCH: this used to be true at chunk
+    granularity (commit once per ~15-row chunk); now that Step 4 is
+    parallelized per-row (see _process_identified_payment), the same
+    atomicity guarantee holds per INDIVIDUAL ROW instead — a smaller blast
+    radius if one row's session has to roll back.
     No-op for rows from the legacy direct-parse fallback (statement_row_id
     is None in that path).
     """
@@ -519,6 +516,114 @@ def _mark_row_consumed(db: Session, orig: CreditRowSchema, run_id: int) -> None:
     db.query(StatementTransactionRow).filter(
         StatementTransactionRow.id == orig.statement_row_id
     ).update({"consumed_by_run_id": run_id})
+
+
+def _process_identified_payment(
+    run_id: int,
+    payment,
+    aging_map: AgingMap,
+    fx_service: FxService,
+    settings,
+) -> dict:
+    """
+    Full per-row Step 4 pipeline for ONE identified payment — Pass 1 build,
+    persist, Pass 2 build (remittance lookup + FX resolution), evaluate,
+    transition, mark-consumed. Runs in a WORKER THREAD with its OWN DB
+    session (session_scope()) — never shares the caller's `db` session,
+    since SQLAlchemy sessions aren't thread-safe. Commits (or rolls back)
+    when the `with` block exits.
+
+    Returns {"success": bool, "bank_reference": str, "error": str | None}
+    for the caller to log/count -- never raises, so one bad row can't take
+    the whole ThreadPoolExecutor batch down with it (mirrors Step 4.5's
+    per-row try/except-and-continue pattern).
+    """
+    from ..db.session import session_scope
+
+    orig = payment.original
+    try:
+        with session_scope() as db:
+            # Pass 1 — resolve credited/functional currencies only.
+            # invoice_currency is None (aging not resolved yet). We persist
+            # the LineItem now so it has a DB id for the remittance lookup
+            # in Pass 2.
+            pass1_input = _build_rule_input(
+                payment, aging_map, db=None, line_item=None, fx_service=fx_service
+            )
+            cc1 = pass1_input["cross_currency"]
+
+            line_item = _persist_line_item(
+                db, run_id, orig,
+                extraction_method=payment.extraction_method,
+                customer_name=payment.customer_name,
+                invoice_numbers=payment.confirmed_invoice_numbers,
+                customer_match_pct=payment.customer_match_pct,
+                confidence_score=payment.confidence_score,
+                credited_currency=cc1["credited_currency"],
+                functional_currency=cc1["functional_currency"],
+                invoice_currency=None,          # filled after Pass 2
+                is_cross_currency=False,        # filled after Pass 2
+                is_cross_ledger=False,          # filled after Pass 2
+            )
+
+            # Pass 2 — remittance lookup + invoice_currency resolution +
+            # both FX legs resolved (this thread's own session, so the
+            # remittance query and gl_daily_rates lookup are both scoped
+            # to it -- never touches another row's session).
+            pass2_input = _build_rule_input(
+                payment, aging_map, db, line_item, fx_service
+            )
+
+            # Back-fill FX fields onto the LineItem now that we know them.
+            _update_line_item_fx(db, line_item, pass2_input)
+
+            rule_result = evaluate_row(
+                pass2_input,
+                short_payment_tolerance_pct=settings.SHORT_PAYMENT_TOLERANCE_PCT,
+                customer_fuzzy_min_pct=settings.CUSTOMER_FUZZY_MATCH_MIN_PCT,
+            )
+            apply_transition(db, line_item, rule_result, trigger="rule_engine")
+            _mark_row_consumed(db, orig, run_id)
+
+        return {"success": True, "bank_reference": orig.bank_reference, "error": None}
+
+    except Exception as exc:
+        return {"success": False, "bank_reference": orig.bank_reference, "error": str(exc)}
+
+
+def _process_unknown_payment(run_id: int, unknown) -> dict:
+    """
+    Same idea as _process_identified_payment(), for a row that never
+    matched anything (straight to unidentified/R8) -- its own DB session,
+    never raises out of the thread.
+    """
+    from ..db.session import session_scope
+    from .evaluator import RuleResult
+
+    orig = unknown.original
+    try:
+        with session_scope() as db:
+            line_item = _persist_line_item(
+                db, run_id, orig,
+                extraction_method="none",
+                customer_name=None,
+                invoice_numbers=[],
+                customer_match_pct=0.0,
+                confidence_score=None,
+                credited_currency=(orig.currency or "").upper().strip(),
+                functional_currency=get_functional_currency(orig.ou_number),
+            )
+            apply_transition(
+                db, line_item,
+                RuleResult("R8", "NO_SIGNAL", "unidentified"),
+                trigger="rule_engine",
+            )
+            _mark_row_consumed(db, orig, run_id)
+
+        return {"success": True, "bank_reference": orig.bank_reference, "error": None}
+
+    except Exception as exc:
+        return {"success": False, "bank_reference": orig.bank_reference, "error": str(exc)}
 
 
 # ── Main analysis runner ───────────────────────────────────────────────────────
@@ -541,14 +646,15 @@ def _run_analysis(run_id: int, selected_files: list[str]) -> None:
             _log_aging_map_summary(run_id, aging_map)
 
             # ── Step 1b: Build FxService once per run ─────────────────────────
-            fx_service = FxService(
-                oracle_base_url=settings.ORACLE_FUSION_BASE_URL,
-                oracle_auth=(
-                    (settings.ORACLE_BASIC_USERNAME, settings.ORACLE_BASIC_PASSWORD)
-                    if settings.ORACLE_AUTH_MODE == "basic"
-                    else None
-                ),
-            )
+            # PATCH: FxService no longer talks to Oracle over REST for FX
+            # rates -- it reads the gl_daily_rates DB table (loaded from a
+            # finance-provided file, see gl_rates/watcher.py). The
+            # oracle_base_url/oracle_auth constructor args are now unused
+            # no-ops kept only for signature compatibility; ORACLE_FUSION_
+            # BASE_URL / ORACLE_AUTH_MODE below are still real settings --
+            # they're just used for actual receipt POSTING in
+            # oracle/fusion_client.py, not for FX rate lookups anymore.
+            fx_service = FxService()
 
             all_credit_rows: list[CreditRowSchema] = []
             seen_row_ids: set[int] = set()  # avoid double-adding a row if two
@@ -693,72 +799,81 @@ def _run_analysis(run_id: int, selected_files: list[str]) -> None:
             )
 
             # ── Step 4: Rule evaluation + DB persistence ──────────────────────
+            # PARALLELIZED via ThreadPoolExecutor -- same pattern as Step 4.5
+            # (receipt creation, see below) and extraction/chunk_processor.py's
+            # dispatch_chunks(). Every identified/unknown payment across every
+            # chunk is flattened into one flat work list and fanned out across
+            # Settings.RULE_ENGINE_MAX_WORKERS threads; each worker thread
+            # (_process_identified_payment / _process_unknown_payment) opens
+            # its OWN DB session via session_scope() and runs that row's
+            # entire Pass 1 -> persist -> Pass 2 -> evaluate -> transition ->
+            # mark-consumed pipeline inside it, committing when done.
+            #
+            # WHY THIS IS SAFE TO PARALLELIZE:
+            #   - aging_map is read-only and already shared across threads
+            #     elsewhere in this file (Step 3's dispatch_chunks) -- see
+            #     that module's docstring.
+            #   - fx_service's internal rate cache is now lock-protected (see
+            #     FxService.__init__) since multiple rows can now query
+            #     gl_daily_rates concurrently through the same instance.
+            #   - Each row gets its own LineItem (new autoincrement id) and
+            #     touches its own StatementTransactionRow (matched by
+            #     statement_row_id) -- rows never write to each other's data.
+            #   - duplicate_invoice_across_customers / already_processed_match
+            #     are both hardcoded False in _build_rule_input as of this
+            #     revision (no live cross-row duplicate check runs today), so
+            #     there is no cross-row ordering dependency to preserve.
+            #
+            # WHAT CHANGED IN BEHAVIOR: commits used to happen once per
+            # ~15-row CHUNK (a single failing row could, in principle, still
+            # let earlier successful rows in that chunk commit together, or
+            # blow up the whole chunk depending on where the exception hit).
+            # Now every row commits (or rolls back) independently in its own
+            # session -- strictly smaller blast radius per failure, and a
+            # bad row is caught, logged, and skipped rather than raising out
+            # of the loop (mirrors Step 4.5's existing try/except-and-continue
+            # design).
+            work_items: list[tuple[str, object]] = []
             for chunk_result in chunk_results:
-
                 for payment in chunk_result.identified_payments:
-                    orig = payment.original
-
-                    # Pass 1 — resolve credited/functional currencies only.
-                    # invoice_currency is None (aging not resolved yet).
-                    # We persist the LineItem now so it has a DB id for the
-                    # remittance lookup in Pass 2.
-                    pass1_input = _build_rule_input(
-                        payment, aging_map, db=None, line_item=None, fx_service=fx_service
-                    )
-                    cc1 = pass1_input["cross_currency"]
-
-                    line_item = _persist_line_item(
-                        db, run_id, orig,
-                        extraction_method=payment.extraction_method,
-                        customer_name=payment.customer_name,
-                        invoice_numbers=payment.confirmed_invoice_numbers,
-                        customer_match_pct=payment.customer_match_pct,
-                        confidence_score=payment.confidence_score,
-                        credited_currency=cc1["credited_currency"],
-                        functional_currency=cc1["functional_currency"],
-                        invoice_currency=None,          # filled after Pass 2
-                        is_cross_currency=False,        # filled after Pass 2
-                        is_cross_ledger=False,          # filled after Pass 2
-                    )
-
-                    # Pass 2 — remittance lookup + invoice_currency resolution +
-                    # both FX legs resolved.
-                    pass2_input = _build_rule_input(
-                        payment, aging_map, db, line_item, fx_service
-                    )
-
-                    # Back-fill FX fields onto the LineItem now that we know them.
-                    _update_line_item_fx(db, line_item, pass2_input)
-
-                    rule_result = evaluate_row(
-                        pass2_input,
-                        short_payment_tolerance_pct=settings.SHORT_PAYMENT_TOLERANCE_PCT,
-                        customer_fuzzy_min_pct=settings.CUSTOMER_FUZZY_MATCH_MIN_PCT,
-                    )
-                    apply_transition(db, line_item, rule_result, trigger="rule_engine")
-                    _mark_row_consumed(db, orig, run_id)
-
+                    work_items.append(("identified", payment))
                 for unknown in chunk_result.unknown_payments:
-                    orig = unknown.original
-                    line_item = _persist_line_item(
-                        db, run_id, orig,
-                        extraction_method="none",
-                        customer_name=None,
-                        invoice_numbers=[],
-                        customer_match_pct=0.0,
-                        confidence_score=None,
-                        credited_currency=(orig.currency or "").upper().strip(),
-                        functional_currency=get_functional_currency(orig.ou_number),
-                    )
-                    from .evaluator import RuleResult
-                    apply_transition(
-                        db, line_item,
-                        RuleResult("R8", "NO_SIGNAL", "unidentified"),
-                        trigger="rule_engine",
-                    )
-                    _mark_row_consumed(db, orig, run_id)
+                    work_items.append(("unknown", unknown))
 
-                db.commit()
+            total_rows_to_evaluate = len(work_items)
+            rule_engine_max_workers = max(1, get_settings().RULE_ENGINE_MAX_WORKERS)
+            dbg(run_id, "RULE_ENGINE", "batch",
+                f"Step 4: evaluating {total_rows_to_evaluate} row(s) "
+                f"across up to {rule_engine_max_workers} worker thread(s)...")
+
+            rule_engine_success_count = 0
+            rule_engine_failed_count = 0
+            with ThreadPoolExecutor(max_workers=rule_engine_max_workers) as pool:
+                futures = {}
+                for kind, item in work_items:
+                    if kind == "identified":
+                        futures[pool.submit(_process_identified_payment, run_id, item, aging_map, fx_service, settings)] = item
+                    else:
+                        futures[pool.submit(_process_unknown_payment, run_id, item)] = item
+
+                for future in as_completed(futures):
+                    result = future.result()  # never raises -- both workers catch internally
+                    if result["success"]:
+                        rule_engine_success_count += 1
+                    else:
+                        rule_engine_failed_count += 1
+                        dbg(run_id, "RULE_ENGINE", f"ref={result['bank_reference']}",
+                            f"Row evaluation FAILED — {result['error']}")
+
+            dbg(run_id, "RULE_ENGINE", "batch",
+                f"Step 4 complete: {rule_engine_success_count} succeeded, "
+                f"{rule_engine_failed_count} failed out of {total_rows_to_evaluate} row(s).")
+
+            # The outer `db` session hasn't seen any of the per-thread
+            # commits above -- refresh its identity map before Step 4.5
+            # queries LineItem rows by run_id (same reasoning as Step 4.5's
+            # own db.expire_all() further down).
+            db.expire_all()
 
             # ── Step 4.5: Create a bare Oracle receipt for EVERY credit row ────
             # in this run — regardless of category (unidentified,
