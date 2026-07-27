@@ -126,7 +126,7 @@ def handle_statement_upload_v2(db: Session, filename: str, data: bytes, uploaded
     """
     file_hash = compute_file_hash(data)
 
-    dup = check_duplicate_file(db, file_hash)
+    dup = check_duplicate_file(db, file_hash, uploaded_by.id if uploaded_by else None)
     if dup is not None:
         if dup["existing_file_archived"]:
             # PATCH: was an unconditional block. If the matched file had
@@ -138,6 +138,12 @@ def handle_statement_upload_v2(db: Session, filename: str, data: bytes, uploaded
             # restore, not a rejection.
             source = db.query(SourceFile).get(dup["existing_source_file_id"])
             source.archived = False
+            # Per-user gating: the file re-enters the Account Statements list
+            # for whoever just uploaded it, so ownership follows the current
+            # uploader — otherwise GET /files (scoped by uploaded_by_user_id)
+            # would restore it but keep it invisible to the person who acted.
+            if uploaded_by is not None:
+                source.uploaded_by_user_id = uploaded_by.id
             log_activity(db, uploaded_by, action="statement.restore",
                          entity_type="SourceFile", entity_id=source.id,
                          metadata={"file_hash": file_hash, "filename": filename})
@@ -177,6 +183,11 @@ def handle_statement_upload_v2(db: Session, filename: str, data: bytes, uploaded
             )
             source.ingest_status = "processing"
             source.ingest_error = None
+            # Per-user gating: ownership follows the current uploader so the
+            # retried file shows up for the person who re-uploaded it (see the
+            # restore branch above for the same rationale).
+            if uploaded_by is not None:
+                source.uploaded_by_user_id = uploaded_by.id
             log_activity(db, uploaded_by, action="statement.upload_retry_after_error",
                          entity_type="SourceFile", entity_id=source.id,
                          metadata={"file_hash": file_hash, "filename": filename,
@@ -246,7 +257,7 @@ def handle_statement_upload_v2(db: Session, filename: str, data: bytes, uploaded
         # guard (see design doc §4a) — fold this into the same duplicate
         # response instead of a 500.
         db.rollback()
-        dup = check_duplicate_file(db, file_hash)
+        dup = check_duplicate_file(db, file_hash, uploaded_by.id if uploaded_by else None)
         return dup or {"duplicate": True, "history_link": "/analysis-history"}
 
     log_activity(db, uploaded_by, action="statement.upload",
