@@ -248,6 +248,11 @@ class ErrorCode:
         "A primary Business Unit is required",
         "Choose a primary Business Unit for this account — it can't be left unset.",
     )
+    ORGANIZATION_UNIT_NOT_FOUND = ErrorDef(
+        3013, "ORGANIZATION_UNIT_NOT_FOUND", 404,
+        "Organization Unit not found",
+        "That Organization Unit doesn't exist.",
+    )
 
     # ── 4000-4999  Run / Analysis ────────────────────────────────────────────
     RUN_ALREADY_IN_PROGRESS = ErrorDef(

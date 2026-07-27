@@ -45,7 +45,8 @@ from ..common.error_codes import ErrorCode
 from ..audit.service import log_activity
 from ..hitl import (
     approve_row, reject_row, build_breakup_analysis,
-    get_hitl_history, retry_oracle_post, serialize_line_item,
+    get_hitl_history, retry_oracle_post, retry_receipt_creation_bulk_for_run,
+    check_receipt_retry_eligibility_for_run, serialize_line_item,
     get_mapping_options, get_invoices_for_customer,
     preview_manual_mapping, confirm_manual_mapping,
 )
@@ -167,6 +168,44 @@ def retry_oracle(id: int, request: Request, db: Session = Depends(get_db),
                  ip_address=_client_ip(request),
                  status="success" if result.get("success") else "failure",
                  metadata={"post_status": result.get("post_status")})
+    db.commit()
+    return result
+
+
+@router.get("/retry-oracle-bulk-for-run/{run_id}/eligibility")
+def retry_oracle_bulk_eligibility(run_id: int, db: Session = Depends(get_db),
+                                    user: User = Depends(require_permission("oracle:post"))):
+    """
+    Read-only — never mutates anything. Lets the frontend decide whether to
+    even SHOW the "Retry All Failed Receipts" button on a run's detail view,
+    rather than showing it on every run and refusing most clicks after the
+    fact. Same eligibility rule the actual retry endpoint enforces (single
+    source of truth — see hitl/service.py's
+    check_receipt_retry_eligibility_for_run()).
+    """
+    return check_receipt_retry_eligibility_for_run(db, run_id)
+
+
+@router.post("/retry-oracle-bulk-for-run/{run_id}")
+def retry_oracle_bulk_for_run(run_id: int, request: Request, db: Session = Depends(get_db),
+                                user: User = Depends(require_permission("oracle:post"))):
+    """
+    Bulk-retries RECEIPT CREATION (not invoice mapping — see
+    retry_receipt_creation_bulk_for_run()'s docstring) for every row in a
+    run. Deliberately refuses to run unless every attempted receipt in the
+    run is currently failed — see that function for the exact safety gate.
+    Surfacing this button on the frontend should itself be conditional on
+    the same "every receipt in this run failed" state (e.g. driven off
+    GET /run/pending-by-account or a per-run summary), so the button
+    doesn't even appear for a run with a normal mix of outcomes.
+    """
+    result = retry_receipt_creation_bulk_for_run(db, run_id, triggered_by=user.email)
+    log_activity(
+        db, user, action="oracle.retry_bulk_for_run", entity_type="AnalysisRun", entity_id=run_id,
+        ip_address=_client_ip(request),
+        status="failure" if "error" in result else "success",
+        metadata=result,
+    )
     db.commit()
     return result
 
