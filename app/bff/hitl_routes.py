@@ -51,6 +51,7 @@ from ..hitl import (
     preview_manual_mapping, confirm_manual_mapping,
 )
 from ..rule_engine.remittance_recheck import recheck_needs_remittance_rows
+from ..rule_engine.customer_name_correction import correct_customer_name
 
 router = APIRouter()
 
@@ -281,3 +282,37 @@ def recheck_remittance(id: int, request: Request, db: Session = Depends(get_db),
                            "to_rule_id": row_result.get("to_rule_id") if row_result else None})
     db.commit()
     return row_result or {"id": id, "changed": False, "reason": "No result produced."}
+
+
+@router.post("/{id}/correct-customer-name")
+def correct_customer_name_route(id: int, payload: dict, request: Request, db: Session = Depends(get_db),
+                                  user: User = Depends(require_permission("hitl:map"))):
+    """
+    Lets a SPOC correct a wrongly AI-identified customer name on a row —
+    applies to unidentified, needs_remittance, and conflict_exception rows
+    (anywhere the AI's own customer guess could plausibly be the actual
+    problem). Re-runs the same matching + rule-evaluation pipeline the
+    original analysis run used, so the row falls into whatever category
+    is now actually correct — see
+    rule_engine/customer_name_correction.py for the full mechanics and the
+    guard against correcting an already-finalized (approved/rejected/
+    manually-mapped) row.
+    """
+    corrected_name = (payload.get("customer_name") or "").strip()
+    result = correct_customer_name(db, id, corrected_name, corrected_by=user.email)
+    if result.get("error"):
+        raise AppError(ErrorCode.CUSTOMER_NAME_CORRECTION_FAILED, detail=result.get("message") or result["error"])
+
+    log_activity(
+        db, user, action="hitl.correct_customer_name", entity_type="LineItem", entity_id=id,
+        ip_address=_client_ip(request),
+        metadata={
+            "from_customer_name": result.get("from_customer_name"),
+            "to_customer_name": result.get("to_customer_name"),
+            "from_rule_id": result.get("from_rule_id"),
+            "to_rule_id": result.get("to_rule_id"),
+            "to_category": result.get("to_category"),
+        },
+    )
+    db.commit()
+    return result
