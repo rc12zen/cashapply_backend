@@ -18,6 +18,7 @@ configure_logging()  # must run before any other app import that grabs a logger 
 from .db.session import init_db
 from .db.settings import get_settings
 from .aging.watcher import start_watcher
+from .gl_rates.watcher import start_gl_rates_watcher
 from .common.errors import register_exception_handlers
 from .common.request_context import RequestIdMiddleware
 from .bff import (
@@ -73,6 +74,7 @@ def on_startup():
     settings = get_settings()
     init_db()   # create_all() — includes every new auth/RBAC/audit/dedup table.
     start_watcher()   # Auto-detect aging reports from AGING_WATCH_FOLDER
+    start_gl_rates_watcher()   # Auto-detect GL Daily Rates files from GL_RATES_WATCH_FOLDER -- see gl_rates/watcher.py
 
     # Procrastinate's sync connector does NOT lazily auto-open its pool —
     # every task.defer() call (run_routes.py's /start and /upload) would

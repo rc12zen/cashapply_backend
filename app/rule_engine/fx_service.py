@@ -4,32 +4,49 @@ app.rule_engine.fx_service
 FX rate resolution for cross-currency payment evaluation.
 
 Priority order:
-  1. Oracle Fusion GL Daily Rates API  (live, date-specific)
-  2. Static fallback rate map          (hardcoded approximates — NEVER use for posting,
-                                        only for rule-band evaluation when Oracle is down)
+  1. gl_daily_rates DB table   (loaded from a finance-provided file --
+                                see gl_rates/watcher.py -- NOT a live REST
+                                call. There is no Oracle GL Daily Rates
+                                REST API available in this environment;
+                                finance drops an extract file into a
+                                watched folder, the same way the aging
+                                report arrives, and it gets parsed and
+                                upserted into this table.)
+  2. Static fallback rate map  (hardcoded approximates -- NEVER use for
+                                posting, only for rule-band evaluation
+                                when a rate isn't in the table for that
+                                date/pair yet)
 
 Usage:
-    fx = FxService(db=db, oracle_base_url=settings.ORACLE_FUSION_BASE_URL)
+    fx = FxService(db=db)
     rate = fx.get_rate(from_ccy="USD", to_ccy="INR", rate_date=statement_date)
     if rate is None:
-        # R13 fires — SPOC must provide rate manually
+        # R13 fires -- SPOC must provide rate manually
 
 Currency direction convention (matches Oracle GL):
-    get_rate("USD", "INR", date) → how many INR per 1 USD
+    get_rate("USD", "INR", date) -> how many INR per 1 USD
     i.e. from_amount * rate = to_amount
 
 OU functional currency:
-    Loaded from ou_functional_currency.json (one entry per OU).
-    get_functional_currency(ou_number) → "INR" / "GBP" / "USD" etc.
+    Loaded from the organization_units DB table (OrganizationUnit) --
+    see _load_organization_unit() below.
+    get_functional_currency(ou_number) -> "INR" / "GBP" / "USD" etc.
+
+DATE LOOKUP (for the given day):
+    Looks for an exact (from_ccy, to_ccy, conversion_date, rate_type) match
+    in gl_daily_rates first. If the file for that exact date hasn't landed
+    yet (weekend, holiday, same-day lag before the morning drop), falls
+    back to the MOST RECENT PRIOR date on record for that pair/type --
+    see _fetch_from_gl_rates_table()'s docstring for exactly how far back
+    it will look.
 """
 from __future__ import annotations
 
 import datetime as dt
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
-
-import httpx
 
 from ..common.json_cache import load_json_cached
 
@@ -37,12 +54,19 @@ logger = logging.getLogger(__name__)
 
 _HERE = Path(__file__).parent
 
+# How many calendar days back to search for the most recent prior rate if
+# the exact conversion_date isn't in gl_daily_rates yet (e.g. weekend/
+# holiday gap, or the file for today simply hasn't been dropped/loaded
+# yet). Keeps a single missed day from silently falling all the way
+# through to the static approximate map.
+_NEAREST_PRIOR_DATE_LOOKBACK_DAYS = 7
+
 # ── Static fallback rate map ──────────────────────────────────────────────────
 # These are APPROXIMATE rates for rule-band evaluation only.
-# NEVER use these for Oracle posting — always use Oracle GL rate for posting.
+# NEVER use these for Oracle posting -- always use a real gl_daily_rates row.
 # Update periodically; keyed as "FROM_TO" e.g. "USD_INR".
 #
-# ⚠️  TO FINANCE TEAM: please review and correct these rates quarterly.
+# WARNING TO FINANCE TEAM: please review and correct these rates quarterly.
 
 _STATIC_RATE_MAP: dict[str, float] = {
     # USD pairs
@@ -160,8 +184,8 @@ def _load_fx_conversion_type_map() -> dict:
 
 def get_conversion_rate_type(from_ccy: str, to_ccy: str) -> tuple[str, str]:
     """
-    Returns (human_type_name, oracle_type_code) to use for the Oracle GL
-    Daily Rates query for this currency pair.
+    Returns (human_type_name, oracle_type_code) to use for the
+    gl_daily_rates lookup for this currency pair.
 
     Built from Zensar_GL_Daily_Rates_Extract__3_.txt (234,260 historical
     rate rows). "Corporate" -- the value this module used to hardcode --
@@ -189,7 +213,8 @@ def get_conversion_rate_type(from_ccy: str, to_ccy: str) -> tuple[str, str]:
 
 class FxService:
     """
-    Resolves FX rates with Oracle GL as primary source, static map as fallback.
+    Resolves FX rates with the gl_daily_rates DB table as primary source,
+    static map as fallback.
 
     Instantiate once per analysis run (in orchestrator) and pass into
     _build_rule_input so the same instance is reused across all rows.
@@ -198,15 +223,35 @@ class FxService:
 
     def __init__(
         self,
-        oracle_base_url: str | None = None,
-        oracle_auth: tuple[str, str] | None = None,   # (username, password) for basic auth
-        oracle_token: str | None = None,               # Bearer token for OAuth
+        oracle_base_url: str | None = None,   # kept for call-site backward compatibility; unused (no REST call)
+        oracle_auth: tuple[str, str] | None = None,   # unused, see above
+        oracle_token: str | None = None,              # unused, see above
     ):
+        # PATCH: this class used to call Oracle's GL Daily Rates REST API
+        # directly (self._oracle_base_url / self._oracle_auth /
+        # self._oracle_token were used to build the HTTP request). There is
+        # no such REST API available in this environment -- GL rates arrive
+        # as a file (see gl_rates/watcher.py) and are looked up from the
+        # gl_daily_rates DB table instead (see _fetch_from_gl_rates_table()
+        # below). The constructor keeps accepting these three arguments,
+        # unused, so existing call sites that still pass
+        # oracle_base_url=settings.ORACLE_FUSION_BASE_URL etc. don't need to
+        # change -- they're just no-ops now.
         self._oracle_base_url = oracle_base_url
         self._oracle_auth     = oracle_auth
         self._oracle_token    = oracle_token
-        # "FROM_TO_YYYY-MM-DD" -> (rate, source). source is "oracle_gl" | "static_map" | None.
+        # "FROM_TO_YYYY-MM-DD" -> (rate, source). source is "gl_rates_table" | "static_map" | None.
+        # PATCH: one FxService instance is now shared across MULTIPLE WORKER
+        # THREADS (rule_engine/orchestrator.py's Step 4 fans out row
+        # evaluation via ThreadPoolExecutor, all rows sharing this same
+        # instance so the cache is actually useful across the whole run).
+        # A plain dict here would risk two threads racing on the same
+        # cache_key (best case: a harmless duplicate DB lookup; there's no
+        # corruption risk since each entry is only ever written once with
+        # the same value, but the lock makes that explicit rather than
+        # relying on CPython dict-op atomicity as an implementation detail).
         self._cache: dict[str, tuple[Optional[float], Optional[str]]] = {}
+        self._cache_lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -221,8 +266,8 @@ class FxService:
         Returns None if rate cannot be resolved from any source.
 
         Priority:
-          1. Same currency → 1.0 (no conversion needed)
-          2. Oracle Fusion GL Daily Rates API
+          1. Same currency -> 1.0 (no conversion needed)
+          2. gl_daily_rates DB table (exact date, then nearest prior date)
           3. Static fallback map (approximate)
         """
         rate, _source = self.get_rate_with_source(from_ccy, to_ccy, rate_date)
@@ -236,13 +281,13 @@ class FxService:
     ) -> tuple[Optional[float], Optional[str]]:
         """
         Same as get_rate(), but also returns where the rate came from:
-        "oracle_gl" | "static_map" | None.
+        "gl_rates_table" | "static_map" | None.
 
-        This is the ONLY place that talks to Oracle GL for a given
-        (from_ccy, to_ccy, date) — both the rate and its source are cached
-        together, so callers that need to know the source (e.g. for the
-        Oracle payload's audit trail) don't need a second, uncached call
-        to _fetch_from_oracle().
+        This is the ONLY place that queries gl_daily_rates for a given
+        (from_ccy, to_ccy, date) -- both the rate and its source are
+        cached together, so callers that need to know the source (e.g.
+        for the Oracle payload's audit trail) don't need a second,
+        uncached call to _fetch_from_gl_rates_table().
         """
         from_ccy = (from_ccy or "").upper().strip()
         to_ccy   = (to_ccy   or "").upper().strip()
@@ -250,22 +295,26 @@ class FxService:
         if not from_ccy or not to_ccy:
             return None, None
 
-        # Same currency — always 1.0, no API call needed
+        # Same currency -- always 1.0, no lookup needed
         if from_ccy == to_ccy:
             return 1.0, None
 
-        date_str = (
-            rate_date.strftime("%Y-%m-%d")
-            if rate_date else dt.date.today().strftime("%Y-%m-%d")
+        rate_date_obj = (
+            rate_date.date() if isinstance(rate_date, dt.datetime)
+            else rate_date if isinstance(rate_date, dt.date)
+            else dt.date.today()
         )
+        date_str = rate_date_obj.strftime("%Y-%m-%d")
         cache_key = f"{from_ccy}_{to_ccy}_{date_str}"
 
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        with self._cache_lock:
+            cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
 
-        # 1. Try Oracle GL
-        rate = self._fetch_from_oracle(from_ccy, to_ccy, date_str)
-        source = "oracle_gl" if rate is not None else None
+        # 1. Try the gl_daily_rates DB table (file-loaded)
+        rate = self._fetch_from_gl_rates_table(from_ccy, to_ccy, rate_date_obj)
+        source = "gl_rates_table" if rate is not None else None
 
         # 2. Fallback to static map
         if rate is None:
@@ -273,15 +322,14 @@ class FxService:
             if rate is not None:
                 source = "static_map"
                 logger.warning(
-                    "FX rate for %s→%s on %s not found in Oracle GL — "
-                    "using static fallback %.4f. DO NOT use for posting.",
-                    from_ccy, to_ccy, date_str, rate,
+                    "FX rate for %s->%s on %s not found in gl_daily_rates (checked exact date "
+                    "and up to %d prior day(s)) -- using static fallback %.4f. DO NOT use for posting.",
+                    from_ccy, to_ccy, date_str, _NEAREST_PRIOR_DATE_LOOKBACK_DAYS, rate,
                 )
 
-        self._cache[cache_key] = (rate, source)
+        with self._cache_lock:
+            self._cache[cache_key] = (rate, source)
         return rate, source
-
-
 
     def convert(
         self,
@@ -300,83 +348,94 @@ class FxService:
             return None, None
         return round(amount * rate, 2), rate
 
-    # ── Oracle GL API ─────────────────────────────────────────────────────────
+    # ── gl_daily_rates DB table (file-loaded, NOT a REST call) ──────────────
 
-    def _fetch_from_oracle(
+    def _fetch_from_gl_rates_table(
         self,
         from_ccy: str,
         to_ccy: str,
-        date_str: str,
+        rate_date: dt.date,
     ) -> Optional[float]:
         """
-        Calls Oracle Fusion GL Daily Rates REST API.
-
-        Endpoint (placeholder — confirm exact path with Oracle admin):
-          GET /fscmRestApi/resources/11.13.18.05/glDailyRates
-              ?q=FromCurrency=<from>;ToCurrency=<to>;ConversionDate=<date>;ConversionRateType=<resolved>
-              &fields=ConversionRate
+        Looks up gl_daily_rates for this (from_ccy, to_ccy, rate_date) --
+        NO REST call. Rows in that table come from finance dropping a GL
+        Daily Rates extract file into a watched folder (see
+        gl_rates/watcher.py + gl_rates/parser.py), exactly the way the
+        aging report is ingested -- the difference is these rows are
+        persisted to the DB (aging stays in-memory only), since rate
+        history needs to accumulate across files rather than be replaced
+        wholesale by the latest one.
 
         ConversionRateType is resolved per currency pair via
         get_conversion_rate_type() (see fx_conversion_type_map.json, built
-        from 234,260 historical rate rows). This USED to hardcode
-        "Corporate" — that type was retired 2023-06-05 (only 24 rows in
-        the whole extract). "MRC Daily" is the active daily rate type
-        (94.6% of the extract, still current as of the most recent date on
-        record) and is now the default.
+        from 234,260 historical rate rows) -- "MRC Daily" is the active
+        daily rate type for the large majority of pairs; "Corporate" was
+        retired 2023-06-05 and should not be queried by default.
 
-        TODO: Confirm with Oracle admin:
-          - Exact endpoint path for your Oracle Fusion instance
-          - Auth method (basic vs OAuth — matches ORACLE_AUTH_MODE in settings)
-          - Whether to use ConversionDate or EffectiveDate in the filter
+        LOOKUP ORDER for the given day:
+          1. Exact match on (from_ccy, to_ccy, rate_date, resolved type).
+          2. If no exact-date row exists (e.g. a weekend/holiday, or
+             today's file simply hasn't been dropped/loaded yet), falls
+             back to the MOST RECENT row on or before rate_date, within
+             _NEAREST_PRIOR_DATE_LOOKBACK_DAYS calendar days. This mirrors
+             how Oracle GL itself carries forward the last daily rate over
+             non-business days -- it does NOT search forward to a future
+             date, and it gives up (returns None -> falls through to the
+             static map) if nothing is on record within the lookback
+             window, rather than silently reaching arbitrarily far back.
         """
-        if not self._oracle_base_url:
-            return None
+        from ..db.session import session_scope
+        from ..db.models import GlDailyRate
 
         conversion_rate_type, _type_code = get_conversion_rate_type(from_ccy, to_ccy)
 
         try:
-            url = f"{self._oracle_base_url}/glDailyRates"
-            params = {
-                "q": (
-                    f"FromCurrency={from_ccy};"
-                    f"ToCurrency={to_ccy};"
-                    f"ConversionDate={date_str};"
-                    f"ConversionRateType={conversion_rate_type}"
-                ),
-                "fields": "ConversionRate,FromCurrency,ToCurrency,ConversionDate",
-                "limit": 1,
-            }
-            headers = {}
-            auth = None
-
-            if self._oracle_token:
-                headers["Authorization"] = f"Bearer {self._oracle_token}"
-            elif self._oracle_auth:
-                auth = self._oracle_auth
-
-            resp = httpx.get(url, params=params, headers=headers, auth=auth, timeout=15)
-
-            if resp.status_code != 200:
-                logger.warning(
-                    "Oracle GL rates API returned %s for %s→%s (type=%s) on %s",
-                    resp.status_code, from_ccy, to_ccy, conversion_rate_type, date_str,
+            with session_scope() as db:
+                # 1. Exact date match.
+                row = (
+                    db.query(GlDailyRate)
+                    .filter(
+                        GlDailyRate.from_currency == from_ccy,
+                        GlDailyRate.to_currency == to_ccy,
+                        GlDailyRate.conversion_date == rate_date,
+                        GlDailyRate.conversion_rate_type == conversion_rate_type,
+                    )
+                    .first()
                 )
-                return None
+                if row is not None:
+                    return float(row.conversion_rate)
 
-            data = resp.json()
-            items = data.get("items") or []
-            if not items:
+                # 2. Nearest prior date within the lookback window.
+                earliest = rate_date - dt.timedelta(days=_NEAREST_PRIOR_DATE_LOOKBACK_DAYS)
+                row = (
+                    db.query(GlDailyRate)
+                    .filter(
+                        GlDailyRate.from_currency == from_ccy,
+                        GlDailyRate.to_currency == to_ccy,
+                        GlDailyRate.conversion_rate_type == conversion_rate_type,
+                        GlDailyRate.conversion_date < rate_date,
+                        GlDailyRate.conversion_date >= earliest,
+                    )
+                    .order_by(GlDailyRate.conversion_date.desc())
+                    .first()
+                )
+                if row is not None:
+                    logger.info(
+                        "gl_daily_rates: no exact-date row for %s->%s on %s (type=%s) -- "
+                        "using nearest prior date %s instead.",
+                        from_ccy, to_ccy, rate_date, conversion_rate_type, row.conversion_date,
+                    )
+                    return float(row.conversion_rate)
+
                 logger.info(
-                    "Oracle GL rates API: no rate found for %s→%s on %s",
-                    from_ccy, to_ccy, date_str,
+                    "gl_daily_rates: no rate found for %s->%s on or before %s (type=%s, "
+                    "lookback=%d days).",
+                    from_ccy, to_ccy, rate_date, conversion_rate_type, _NEAREST_PRIOR_DATE_LOOKBACK_DAYS,
                 )
                 return None
-
-            rate = items[0].get("ConversionRate")
-            return float(rate) if rate is not None else None
 
         except Exception as exc:
-            logger.warning("Oracle GL rates API error for %s→%s: %s", from_ccy, to_ccy, exc)
+            logger.warning("gl_daily_rates lookup error for %s->%s: %s", from_ccy, to_ccy, exc)
             return None
 
     # ── Static map ────────────────────────────────────────────────────────────
@@ -397,7 +456,7 @@ class FxService:
             return round(1.0 / inv_rate, 6)
 
         # Try via USD as bridge currency
-        # from_ccy → USD → to_ccy
+        # from_ccy -> USD -> to_ccy
         from_to_usd = _STATIC_RATE_MAP.get(f"{from_ccy}_USD")
         usd_to_target = _STATIC_RATE_MAP.get(f"USD_{to_ccy}")
         if from_to_usd and usd_to_target:

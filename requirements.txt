@@ -24,6 +24,15 @@ psycopg[binary]==3.2.3
 # New — Auth (Azure Entra ID token validation)
 python-jose[cryptography]==3.3.0
 
+# New — AI providers (extraction/ai_providers.py). Anthropic and direct
+# OpenAI both use their own SDK; Azure OpenAI ALSO uses this same `openai`
+# package (just a different base_url — see ai_providers.py's Azure
+# branch), so this one line covers both AI_PROVIDER=openai and
+# AI_PROVIDER=azure_openai. Missing from this file was the actual root
+# cause of "No module named 'openai'" / AI EXTRACTION UNAVAILABLE in UAT.
+anthropic==0.34.2
+openai>=1.99.0
+
 # New — Background task queue (Postgres-backed; no Redis/RabbitMQ/Celery)
 # PsycopgConnector (psycopg3) ships as a core part of procrastinate — no extra needed.
 procrastinate==2.14.0
