@@ -303,6 +303,11 @@ class ErrorCode:
         "Recheck failed",
         "We couldn't recheck this row against remittances right now.",
     )
+    CUSTOMER_NAME_CORRECTION_FAILED = ErrorDef(
+        5005, "CUSTOMER_NAME_CORRECTION_FAILED", 400,
+        "Customer name correction failed",
+        "We couldn't correct the customer name on this row right now.",
+    )
 
     # ── 6000-6999  Oracle / Fusion ───────────────────────────────────────────
     ORACLE_POST_FAILED = ErrorDef(

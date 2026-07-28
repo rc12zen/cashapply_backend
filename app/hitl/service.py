@@ -379,3 +379,136 @@ def retry_oracle_post(db: Session, line_item_id: int) -> dict:
         "post_status": r.reference_status,
         "message":     r.post_message,
     }
+
+
+def check_receipt_retry_eligibility_for_run(db: Session, run_id: int) -> dict:
+    """
+    Read-only check: would retry_receipt_creation_bulk_for_run() actually be
+    allowed to run for this run_id right now? Used by the frontend to decide
+    whether to even SHOW the "Retry All Failed Receipts" button on a run's
+    detail view, so it only ever appears where clicking it would genuinely
+    do something -- not on every run, refusing most of them after the fact.
+
+    Returns exactly the same shape retry_receipt_creation_bulk_for_run()
+    would return on a refusal, PLUS an explicit "eligible" boolean:
+      {"eligible": False, "error": "no_receipt_attempts", ...}
+      {"eligible": False, "error": "not_all_failed", "succeeded_count":...,
+       "failed_count":..., "total_count":...}
+      {"eligible": True, "failed_count":..., "total_count":...}
+    Never mutates anything -- no receipt is touched, no commit happens.
+    """
+    rows = (
+        db.query(LineItem)
+        .filter(LineItem.run_id == run_id, LineItem.oracle_post_status.isnot(None))
+        .all()
+    )
+    if not rows:
+        return {
+            "eligible": False,
+            "error": "no_receipt_attempts",
+            "message": f"No receipt-creation attempts found for run {run_id} -- nothing to retry.",
+        }
+
+    succeeded_count = sum(1 for r in rows if r.oracle_post_status == "success")
+    failed_count = sum(1 for r in rows if r.oracle_post_status == "failed")
+    if succeeded_count > 0 or failed_count != len(rows):
+        return {
+            "eligible": False,
+            "error": "not_all_failed",
+            "message": (
+                f"Run {run_id} has {succeeded_count} successful and {failed_count} failed "
+                f"receipt(s) out of {len(rows)} total -- bulk retry is only offered when "
+                f"EVERY receipt in the run failed. Retry the failed row(s) individually instead."
+            ),
+            "succeeded_count": succeeded_count,
+            "failed_count": failed_count,
+            "total_count": len(rows),
+        }
+
+    return {"eligible": True, "failed_count": failed_count, "total_count": len(rows)}
+
+
+def retry_receipt_creation_bulk_for_run(db: Session, run_id: int, triggered_by: str | None = None) -> dict:
+    """
+    Bulk-retries Oracle RECEIPT CREATION (Step 4.5 -- create_receipt_for_
+    line_item, NOT invoice mapping/retry_oracle_post above, which is a
+    separate later stage) for every row in a given run.
+
+    Deliberately different from retry_oracle_post(): that one only ever
+    applies to rows that already passed approval and then failed at the
+    invoice-mapping step (reference_status == "failed"). This one targets
+    the EARLIER failure mode -- oracle_post_status == "failed" -- which is
+    what happens when the bare receipt itself never got created in the
+    first place (e.g. a wrong OrganizationUnit name/currency causing every
+    single receipt in the run to 404 against Oracle, before any SPOC ever
+    got the chance to approve anything).
+
+    SAFETY GATE (by design, not a technical limitation): only proceeds when
+    EVERY row in this run that attempted receipt creation currently shows
+    oracle_post_status == "failed" -- i.e. a genuine whole-run failure
+    (systemic cause: bad OU/BU config, Oracle outage, etc). If the run has
+    a MIX of successes and failures, this refuses to run at all -- a mixed
+    result means the failures are row-specific, not run-wide, and mass-
+    retrying could re-POST receipts for rows that have nothing wrong with
+    them just because they happen to share a run_id. Row-specific failures
+    should go through the individual per-row retry/reconfigure path instead.
+
+    Shares its eligibility rule with check_receipt_retry_eligibility_for_run()
+    above (single source of truth) -- see that function's docstring for the
+    exact shape of a refusal.
+
+    Returns:
+      {"error": "no_receipt_attempts", ...}          -- no rows to retry
+      {"error": "not_all_failed", "failed_count":..., -- mixed run, refused
+       "succeeded_count": ..., "total_count": ...}
+      {"run_id":..., "attempted":..., "succeeded":...,
+       "failed":..., "results": [...]}                -- ran, per-row results
+    """
+    eligibility = check_receipt_retry_eligibility_for_run(db, run_id)
+    if not eligibility["eligible"]:
+        return {k: v for k, v in eligibility.items() if k != "eligible"}
+
+    rows = (
+        db.query(LineItem)
+        .filter(LineItem.run_id == run_id, LineItem.oracle_post_status.isnot(None))
+        .all()
+    )
+
+    results = []
+    for r in rows:
+        res = create_receipt_for_line_item(db, r)
+        results.append({
+            "id": r.id,
+            "bank_reference": r.bank_reference,
+            "success": bool(res.get("success")),
+            "message": r.post_message,
+        })
+
+    for r, res in zip(rows, results):
+        prior_state = r.current_state
+        if res["success"]:
+            # Receipt now exists -- state itself doesn't change here (this
+            # function only recreates the bare receipt, same as Step 4.5;
+            # it does NOT re-run rule evaluation or invoice mapping), but
+            # record the transition for the audit trail.
+            db.add(RowStatusHistory(
+                line_item_id=r.id, from_state=prior_state, to_state=prior_state,
+                trigger="retry_bulk_for_run", rule_id=r.rule_id, triggered_by=triggered_by or "spoc_ui",
+                comment="Receipt creation retried successfully (bulk, whole-run retry).",
+            ))
+        else:
+            db.add(RowStatusHistory(
+                line_item_id=r.id, from_state=prior_state, to_state=prior_state,
+                trigger="retry_bulk_for_run", rule_id=r.rule_id, triggered_by=triggered_by or "spoc_ui",
+                comment=f"Receipt creation retried (bulk) and FAILED AGAIN — {r.post_message}",
+            ))
+    db.commit()
+
+    succeeded_after = sum(1 for res in results if res["success"])
+    return {
+        "run_id": run_id,
+        "attempted": len(results),
+        "succeeded": succeeded_after,
+        "failed": len(results) - succeeded_after,
+        "results": results,
+    }

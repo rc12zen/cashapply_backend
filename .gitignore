@@ -77,3 +77,4 @@ docs/_build/
 
 # Tests
 coverage/
+.DS_Store

@@ -265,6 +265,20 @@ class LineItem(Base):
     manually_mapped_at = Column(DateTime, nullable=True)
     manually_mapped_by = Column(String, nullable=True)  # SPOC email
 
+    # ── Customer-name correction tracking ─────────────────────────────────────
+    # Set by rule_engine/customer_name_correction.py's correct_customer_name()
+    # — the only persistent record of "a human overrode the AI's own
+    # extracted_customer_name because it was wrong", distinct from
+    # manually_mapped above (that one is about hand-picking an INVOICE;
+    # this one is about correcting the CUSTOMER the AI thought it saw).
+    # ai_extracted_customer_name preserves what the AI originally said,
+    # exactly once (never overwritten by a second correction), so the
+    # original AI guess is never lost even after a human fixes it.
+    customer_name_corrected    = Column(Boolean, default=False)
+    customer_name_corrected_at = Column(DateTime, nullable=True)
+    customer_name_corrected_by = Column(String, nullable=True)  # SPOC email
+    ai_extracted_customer_name = Column(String, nullable=True)
+
     # ── Legacy flags (kept for lib/api.ts backward-compatibility) ─────────────
     # DO NOT rename — frontend depends on these exact column names.
     is_matched        = Column(Boolean, default=False)

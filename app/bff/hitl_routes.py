@@ -45,11 +45,13 @@ from ..common.error_codes import ErrorCode
 from ..audit.service import log_activity
 from ..hitl import (
     approve_row, reject_row, build_breakup_analysis,
-    get_hitl_history, retry_oracle_post, serialize_line_item,
+    get_hitl_history, retry_oracle_post, retry_receipt_creation_bulk_for_run,
+    check_receipt_retry_eligibility_for_run, serialize_line_item,
     get_mapping_options, get_invoices_for_customer,
     preview_manual_mapping, confirm_manual_mapping,
 )
 from ..rule_engine.remittance_recheck import recheck_needs_remittance_rows
+from ..rule_engine.customer_name_correction import correct_customer_name
 
 router = APIRouter()
 
@@ -171,6 +173,44 @@ def retry_oracle(id: int, request: Request, db: Session = Depends(get_db),
     return result
 
 
+@router.get("/retry-oracle-bulk-for-run/{run_id}/eligibility")
+def retry_oracle_bulk_eligibility(run_id: int, db: Session = Depends(get_db),
+                                    user: User = Depends(require_permission("oracle:post"))):
+    """
+    Read-only — never mutates anything. Lets the frontend decide whether to
+    even SHOW the "Retry All Failed Receipts" button on a run's detail view,
+    rather than showing it on every run and refusing most clicks after the
+    fact. Same eligibility rule the actual retry endpoint enforces (single
+    source of truth — see hitl/service.py's
+    check_receipt_retry_eligibility_for_run()).
+    """
+    return check_receipt_retry_eligibility_for_run(db, run_id)
+
+
+@router.post("/retry-oracle-bulk-for-run/{run_id}")
+def retry_oracle_bulk_for_run(run_id: int, request: Request, db: Session = Depends(get_db),
+                                user: User = Depends(require_permission("oracle:post"))):
+    """
+    Bulk-retries RECEIPT CREATION (not invoice mapping — see
+    retry_receipt_creation_bulk_for_run()'s docstring) for every row in a
+    run. Deliberately refuses to run unless every attempted receipt in the
+    run is currently failed — see that function for the exact safety gate.
+    Surfacing this button on the frontend should itself be conditional on
+    the same "every receipt in this run failed" state (e.g. driven off
+    GET /run/pending-by-account or a per-run summary), so the button
+    doesn't even appear for a run with a normal mix of outcomes.
+    """
+    result = retry_receipt_creation_bulk_for_run(db, run_id, triggered_by=user.email)
+    log_activity(
+        db, user, action="oracle.retry_bulk_for_run", entity_type="AnalysisRun", entity_id=run_id,
+        ip_address=_client_ip(request),
+        status="failure" if "error" in result else "success",
+        metadata=result,
+    )
+    db.commit()
+    return result
+
+
 # ── Manual invoice mapping ────────────────────────────────────────────────────
 # For rows that didn't land in ready_for_oracle automatically. Confirming a
 # mapping only RE-CLASSIFIES the row into ready_for_oracle — it does NOT post
@@ -242,3 +282,37 @@ def recheck_remittance(id: int, request: Request, db: Session = Depends(get_db),
                            "to_rule_id": row_result.get("to_rule_id") if row_result else None})
     db.commit()
     return row_result or {"id": id, "changed": False, "reason": "No result produced."}
+
+
+@router.post("/{id}/correct-customer-name")
+def correct_customer_name_route(id: int, payload: dict, request: Request, db: Session = Depends(get_db),
+                                  user: User = Depends(require_permission("hitl:map"))):
+    """
+    Lets a SPOC correct a wrongly AI-identified customer name on a row —
+    applies to unidentified, needs_remittance, and conflict_exception rows
+    (anywhere the AI's own customer guess could plausibly be the actual
+    problem). Re-runs the same matching + rule-evaluation pipeline the
+    original analysis run used, so the row falls into whatever category
+    is now actually correct — see
+    rule_engine/customer_name_correction.py for the full mechanics and the
+    guard against correcting an already-finalized (approved/rejected/
+    manually-mapped) row.
+    """
+    corrected_name = (payload.get("customer_name") or "").strip()
+    result = correct_customer_name(db, id, corrected_name, corrected_by=user.email)
+    if result.get("error"):
+        raise AppError(ErrorCode.CUSTOMER_NAME_CORRECTION_FAILED, detail=result.get("message") or result["error"])
+
+    log_activity(
+        db, user, action="hitl.correct_customer_name", entity_type="LineItem", entity_id=id,
+        ip_address=_client_ip(request),
+        metadata={
+            "from_customer_name": result.get("from_customer_name"),
+            "to_customer_name": result.get("to_customer_name"),
+            "from_rule_id": result.get("from_rule_id"),
+            "to_rule_id": result.get("to_rule_id"),
+            "to_category": result.get("to_category"),
+        },
+    )
+    db.commit()
+    return result

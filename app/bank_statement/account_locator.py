@@ -25,9 +25,12 @@ extract_accounts(filepath, locator, source) -> set[str]  (normalized full accoun
 """
 from __future__ import annotations
 
+import logging
 import re
 
 from .snapshot import FileSnapshot
+
+logger = logging.getLogger("cashapply.ingestion.locator")
 
 
 def normalize_account(value) -> str:
@@ -126,6 +129,7 @@ def extract_accounts(filepath: str, locator: dict, source: dict | None = None) -
     One value for a single-account file; many for a multi-account (column) file.
     Never raises — returns an empty set on any failure."""
     if not locator:
+        logger.debug("[locator] no account_locator configured -- returning empty set. file=%r", filepath)
         return set()
     source = source or {}
     t = locator.get("type")
@@ -134,22 +138,46 @@ def extract_accounts(filepath: str, locator: dict, source: dict | None = None) -
     try:
         if t == "cell":
             snap = FileSnapshot.from_path(filepath)
-            val = snap.cell(locator.get("row", 0), locator.get("col", 0), locator.get("sheet"))
-            # A header cell may list several accounts (main & sub) — split them.
-            out.update(split_accounts(val))
+            row, col, sheet = locator.get("row", 0), locator.get("col", 0), locator.get("sheet")
+            val = snap.cell(row, col, sheet)
+            split = split_accounts(val)
+            out.update(split)
+            # LOGGING: this is the exact spot that explains "how did the
+            # system decide this was/wasn't the account number" -- shows
+            # the RAW cell text before any cleanup, and what it became
+            # after split_accounts()/normalize_account(). If `val` is
+            # blank here, the locator's row/col/sheet is pointing at the
+            # wrong spot in this file (see the BofA/account-8 case).
+            logger.info(
+                "[locator] type=cell file=%r sheet=%r row=%s col=%s -> raw=%r normalized=%s",
+                filepath, sheet, row, col, val, sorted(split),
+            )
 
         elif t == "column":
             from .extractor import ExtractorFactory
             df = ExtractorFactory.extract(filepath, source)
             name = locator.get("name")
+            raw_values: list = []
             if name and name in df.columns:
                 for v in df[name].tolist():
+                    raw_values.append(v)
                     out.update(split_accounts(v))
+            # LOGGING: for column locators, log how many raw values were
+            # scanned and the distinct normalized set produced -- if
+            # `name` isn't in df.columns at all (e.g. header row
+            # misconfigured, so the real column names never got read),
+            # raw_values stays empty and this makes that obvious.
+            logger.info(
+                "[locator] type=column file=%r column_name=%r column_found=%s "
+                "raw_value_count=%d -> normalized=%s",
+                filepath, name, bool(name and name in df.columns), len(raw_values), sorted(out),
+            )
 
         elif t == "regex":
             pattern = re.compile(locator.get("pattern", ""))
             snap = FileSnapshot.from_path(filepath)
-            for text in _regex_texts(locator, filepath, source, snap):
+            texts = _regex_texts(locator, filepath, source, snap)
+            for text in texts:
                 if not text:
                     continue
                 # finditer (not search) so a cell holding several account-like
@@ -159,7 +187,15 @@ def extract_accounts(filepath: str, locator: dict, source: dict | None = None) -
                     n = normalize_account(captured)
                     if n:
                         out.add(n)
-    except Exception:
+            logger.info(
+                "[locator] type=regex file=%r pattern=%r texts_scanned=%d -> normalized=%s",
+                filepath, locator.get("pattern", ""), len(texts), sorted(out),
+            )
+    except Exception as exc:
+        logger.warning(
+            "[locator] extraction RAISED for file=%r locator=%r -- returning empty set. error=%s",
+            filepath, locator, exc,
+        )
         return out
 
     return out

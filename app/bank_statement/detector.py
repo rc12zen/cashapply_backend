@@ -26,6 +26,7 @@ unchanged.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -35,6 +36,8 @@ from .configs.account_loader import (  # noqa: F401
 )
 from .account_locator import extract_accounts, normalize_account, match_key
 from .ou_resolver import resolve_ou
+
+logger = logging.getLogger("cashapply.ingestion.detector")
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +136,10 @@ def _collect_matches(filepath: str, fmt: str):
         for acct, entry in configs.items()
         if isinstance((entry.get("recipes") or {}).get(fmt), list) and entry["recipes"][fmt]
     ]
+    logger.info(
+        "[detect] file=%r format=%r -- %d candidate account(s) have an active '%s' recipe: %s",
+        filepath, fmt, len(candidates), fmt, [c[0] for c in candidates],
+    )
     if not candidates:
         return [], set()
 
@@ -150,9 +157,31 @@ def _collect_matches(filepath: str, fmt: str):
     matches = []
     for acct, entry, recipe in candidates:
         extracted_keys = {match_key(x) for x in extract_cache[_extract_sig(recipe)]}
-        ckey = match_key(entry.get("account_number", acct))
-        if ckey and ckey in extracted_keys:   # full-account match (leading-zero-safe)
+        registered_value = entry.get("account_number", acct)
+        ckey = match_key(registered_value)
+        is_match = bool(ckey and ckey in extracted_keys)
+        # LOGGING: this is THE line that answers "why did/didn't this
+        # account match" -- for every candidate, shows exactly what its
+        # OWN locator extracted from THIS file, what that candidate's
+        # OWN registered account_number normalizes to, and whether they
+        # lined up. This is what would have shown, in plain sight, that
+        # the "HSBC" entry's locator target cell literally contained the
+        # text "HSBC" in the PLN file too -- a false-positive match on a
+        # non-numeric placeholder "account number", not a real account
+        # number collision.
+        logger.info(
+            "[detect]   candidate acct=%r registered_account_number=%r -> match_key=%r | "
+            "this_recipe's_locator_extracted=%s (match_keys=%s) | MATCHED=%s",
+            acct, registered_value, ckey, sorted(extract_cache[_extract_sig(recipe)]),
+            sorted(extracted_keys), is_match,
+        )
+        if is_match:
             matches.append((acct, entry, recipe))
+
+    logger.info(
+        "[detect] file=%r format=%r -- RESULT: %d match(es) out of %d candidate(s): %s",
+        filepath, fmt, len(matches), len(candidates), [m[0] for m in matches],
+    )
     return matches, all_extracted
 
 
@@ -168,6 +197,7 @@ def detect_config(filepath: str) -> DetectionResult:
     try:
         matches, extracted = _collect_matches(filepath, fmt)
     except Exception as e:
+        logger.exception("[detect] detect_config RAISED for file=%r", filepath)
         result.errors.append(str(e))
         result.method_detail = f"Detection error: {e}"
         return result
@@ -182,10 +212,23 @@ def detect_config(filepath: str) -> DetectionResult:
                 f"Extracted account(s) {sorted(extracted)[:3]} but none are registered "
                 f"for format '{fmt}'. Add a config."
             )
+            logger.warning(
+                "[detect] file=%r -> UNKNOWN: extracted account(s) %s but none are "
+                "registered for format=%r. If you believe this account IS registered, "
+                "check whether its recipe's account_locator is pointing at the wrong "
+                "cell/column for this specific file.",
+                filepath, sorted(extracted), fmt,
+            )
         else:
             result.method_detail = (
                 f"No account could be extracted (or no '{fmt}' recipe exists). "
                 f"Add a config or select manually."
+            )
+            logger.warning(
+                "[detect] file=%r -> UNKNOWN: NO account number could be extracted at all "
+                "by ANY candidate's locator for format=%r. Either no recipe exists for this "
+                "format yet, or every candidate's locator failed against this file's layout.",
+                filepath, fmt,
             )
         return result
 
@@ -204,10 +247,17 @@ def detect_config(filepath: str) -> DetectionResult:
         result.candidates    = [_candidate(a, e, fmt) for a, e, _ in matches]
         if len(matches) == 1:
             result.method_detail = f"Account {result.account_number} → '{acct}' ({fmt})"
+            logger.info("[detect] file=%r -> MATCHED account=%r config_key=%r (single match)",
+                        filepath, result.account_number, acct)
         else:
             result.method_detail = (
                 f"{len(matches)} registered accounts in file share one layout → "
                 f"first fit '{acct}' ({fmt})"
+            )
+            logger.info(
+                "[detect] file=%r -> MATCHED %d accounts sharing one layout, first-fit "
+                "config_key=%r chosen out of: %s",
+                filepath, len(matches), acct, [m[0] for m in matches],
             )
         return result
 
@@ -218,6 +268,10 @@ def detect_config(filepath: str) -> DetectionResult:
     result.candidates = [_candidate(a, e, fmt) for a, e, _ in matches]
     result.method_detail = (
         f"{len(matches)} configs matched with different layouts — choose one."
+    )
+    logger.warning(
+        "[detect] file=%r -> AMBIGUOUS: %d configs matched with DIFFERENT layouts: %s",
+        filepath, len(matches), [m[0] for m in matches],
     )
     return result
 

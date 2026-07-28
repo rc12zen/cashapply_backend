@@ -36,6 +36,7 @@ Analyst         — preparer + config author. Uploads statements
                   (statement:upload), starts & monitors runs (run:start,
                   run:monitor), maps invoices (hitl:map), authors config &
                   bank-format recipes (config:view, config:author),
+                  manages Business Unit / OU details (ou:manage),
                   downloads files (file:download), and views the activity
                   log (activity_log:view). CANNOT approve/reject/post
                   (no oracle:post / hitl:reject), manage the aging report,
@@ -43,7 +44,15 @@ Analyst         — preparer + config author. Uploads statements
                   manage users.
 Oracle Operator — approver/poster. Views data everywhere (run:view), maps
                   invoices (hitl:map), rejects (hitl:reject), and
-                  approves/posts to Oracle (oracle:post); downloads files
+                  approves/posts to Oracle (oracle:post); ALSO manages
+                  Business Unit / OU details (ou:manage) — the same
+                  Oracle-facing accuracy problem an incorrect OU/BU name
+                  or currency causes (a receipt 404ing on the wrong
+                  BusinessUnit string) is squarely this role's territory,
+                  so it gets this narrow permission without also getting
+                  full config:author (which would additionally unlock
+                  authoring bank-statement parsing recipes — out of scope
+                  for an approver/poster); downloads files
                   (file:download); views the activity log. CANNOT run or
                   monitor analysis, nor see/author config (no run:start,
                   run:monitor, config:view, config:author).
@@ -72,14 +81,23 @@ config:view        — view config data (abbreviations, AI status, format
                      recipe list / account detail (read-only). Analyst,
                      Auditor.
 config:author      — config WRITES: edit abbreviations, test config, Config
-                     Builder upload/raw-preview/locate/test/save, edit
-                     account→business-unit mapping; plus the Config Builder
-                     OU list (available-ous) used while authoring. Analyst
-                     only.
+                     Builder upload/raw-preview/locate/test/save; plus the
+                     Config Builder OU list (available-ous) used while
+                     authoring. Analyst only.
+ou:manage          — Accounts & OU's page WRITES: edit a bank account's
+                     Business Unit mapping (primary/additional OUs), and
+                     edit an OrganizationUnit's own name/functional
+                     currency directly. Deliberately split out from
+                     config:author so Oracle Operator can hold it (fixing
+                     an OU/BU name or currency is squarely an Oracle-
+                     posting-accuracy concern) WITHOUT also getting Config
+                     Builder recipe-authoring access. Analyst, Oracle
+                     Operator.
 hitl:map           — confirm a manual invoice mapping / recheck remittance
                      (does NOT post to Oracle by itself).
 hitl:reject        — reject a HITL row.
-oracle:post        — approve a row / post to Oracle Fusion / retry a post.
+oracle:post        — approve a row / post to Oracle Fusion / retry a post
+                     (single row or bulk-for-run).
 file:download      — download a stored file (Analyst, Oracle Operator).
 activity_log:view  — view the Activity Log (Analyst, Oracle Operator,
                      Auditor, Administrator).
@@ -105,17 +123,20 @@ ROLE_PERMISSIONS: dict[str, tuple[str, list[str]]] = {
     ),
     "Analyst": (
         "Preparer + config author: uploads statements, runs & monitors analysis, "
-        "maps invoices, authors config/recipes, downloads files, views the activity "
-        "log. Cannot approve/reject/post, manage aging, delete recipes, or manage users.",
+        "maps invoices, authors config/recipes, manages Business Unit/OU details, "
+        "downloads files, views the activity log. Cannot approve/reject/post, "
+        "manage aging, delete recipes, or manage users.",
         ["run:view", "run:start", "statement:upload", "run:monitor",
-         "config:view", "config:author", "hitl:map", "file:download",
+         "config:view", "config:author", "ou:manage", "hitl:map", "file:download",
          "activity_log:view"],
     ),
     "Oracle Operator": (
         "Approver/poster: reviews, maps, rejects, and approves/posts to Oracle; "
-        "downloads files; views the activity log. Cannot run analysis, monitor runs, "
-        "or see/author config.",
-        ["run:view", "hitl:map", "hitl:reject", "oracle:post",
+        "manages Business Unit/OU details (an OU/BU naming or currency error is an "
+        "Oracle-posting-accuracy problem, squarely this role's territory); downloads "
+        "files; views the activity log. Cannot run analysis, monitor runs, or see/"
+        "author config.",
+        ["run:view", "hitl:map", "hitl:reject", "oracle:post", "ou:manage",
          "file:download", "activity_log:view"],
     ),
     "Auditor": (

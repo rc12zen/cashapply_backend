@@ -4,6 +4,8 @@ from .service import (
     build_breakup_analysis,
     get_hitl_history,
     retry_oracle_post,
+    retry_receipt_creation_bulk_for_run,
+    check_receipt_retry_eligibility_for_run,
     serialize_line_item,
 )
 from .manual_mapping import (
@@ -19,6 +21,8 @@ __all__ = [
     "build_breakup_analysis",
     "get_hitl_history",
     "retry_oracle_post",
+    "retry_receipt_creation_bulk_for_run",
+    "check_receipt_retry_eligibility_for_run",
     "serialize_line_item",
     "get_mapping_options",
     "get_invoices_for_customer",

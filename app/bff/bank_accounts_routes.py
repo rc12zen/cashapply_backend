@@ -1,10 +1,21 @@
 """
 app.bff.bank_accounts_routes
 ==============================
-/api/bank-accounts/* — a simple, read-mostly "reference" page: which Bank
-Accounts exist and which Business Unit(s) they belong to. Requested as a
-nav-bar info page anyone with view access can check, plus an
-Administrator-only action to change an account's Business Unit(s).
+/api/bank-accounts/* — the "Accounts & OU's" reference + management page:
+which Bank Accounts exist, which Business Unit(s) they belong to, and the
+full roster of every Organization Unit (name + functional currency).
+Requested as a nav-bar page anyone with view access can check, plus
+writes gated behind the narrower `ou:manage` permission (Administrator,
+Analyst, Oracle Operator — see scripts/seed_rbac.py).
+
+PATCH: writes here used to require `config:author` (the same permission
+that also unlocks Config Builder recipe-authoring). Split out into its own
+`ou:manage` permission so Oracle Operator can hold it too — an OU/Business
+Unit name or currency being wrong is squarely an Oracle-posting-accuracy
+problem (a receipt 404s if the BusinessUnit string sent to Oracle doesn't
+EXACTLY match what Oracle has registered, e.g. "PUNE(111)" vs "Pune(111)"),
+so the role that approves/posts to Oracle should be able to fix it directly,
+without also getting bank-statement-recipe-authoring access it doesn't need.
 
 MULTI-BU: an account normally belongs to exactly one Business Unit (its
 `ou_id` FK on BankAccount) — but some accounts legitimately receive
@@ -14,11 +25,16 @@ db/models.py). `all_organization_units` / `all_ou_numbers` on the model
 gives primary + additional together.
 
 IMPORTANT — WHEN A CHANGE TAKES EFFECT: changing an account's Business
-Unit(s) here only affects analysis runs started AFTER the change.
-Already-completed runs are never touched — LineItem.business_unit is a
-permanent snapshot taken at the time that run actually happened, not a
-live join to this table (see rule_engine/orchestrator.py, which re-
-resolves the CURRENT Business Unit(s) fresh each time a new run starts).
+Unit(s), or an OU's own name/currency, here only affects analysis runs
+started AFTER the change. Already-completed runs are never touched —
+LineItem.business_unit is a permanent snapshot taken at the time that run
+actually happened, not a live join to this table (see
+rule_engine/orchestrator.py, which re-resolves the CURRENT Business
+Unit(s) fresh each time a new run starts). Similarly,
+rule_engine/fx_service.py's get_functional_currency() /
+get_ou_display_name() read the organization_units table LIVE, with no
+caching, so a fix made here is picked up by the very next Oracle retry —
+see oracle/fusion_client.py's payload-building — with no extra step needed.
 """
 from __future__ import annotations
 
@@ -67,10 +83,19 @@ def _account_dict(a: BankAccount) -> dict:
     }
 
 
+def _ou_dict(ou: OrganizationUnit) -> dict:
+    return {
+        "ou_number": ou.ou_number,
+        "ou_name": ou.ou_name,
+        "functional_currency": ou.functional_currency,
+        "active": ou.active,
+    }
+
+
 @router.get("")
 def list_bank_accounts(db: Session = Depends(get_db),
                         user: User = Depends(require_permission("run:view"))):
-    """The nav-bar 'Bank Accounts' info page — every onboarded account and
+    """The nav-bar 'Accounts & OU's' info page — every onboarded account and
     the Business Unit(s) it belongs to. View-only for every role except
     Viewer (same tier as Config/Overview/etc)."""
     accounts = db.query(BankAccount).order_by(BankAccount.bank_name, BankAccount.account_number).all()
@@ -80,15 +105,17 @@ def list_bank_accounts(db: Session = Depends(get_db),
 @router.get("/business-units")
 def list_business_units(db: Session = Depends(get_db),
                          user: User = Depends(require_permission("run:view"))):
-    """Every known Business Unit (OrganizationUnit row) — powers the
-    primary/additional Business Unit pickers on this page."""
+    """
+    Every known Business Unit (OrganizationUnit row) — powers the
+    primary/additional Business Unit pickers on this page AND the "Accounts
+    & OU's" page's own OU roster table. Deliberately includes OUs with NO
+    bank account attached yet (e.g. an OU number seen in the aging report
+    but not yet onboarded via Config Builder) -- listing accounts alone
+    would never surface those, since an account-shaped query can only ever
+    show OUs reachable THROUGH an account.
+    """
     ous = db.query(OrganizationUnit).filter(OrganizationUnit.active.is_(True)).order_by(OrganizationUnit.ou_name).all()
-    return {
-        "business_units": [
-            {"ou_number": ou.ou_number, "ou_name": ou.ou_name, "functional_currency": ou.functional_currency}
-            for ou in ous
-        ]
-    }
+    return {"business_units": [_ou_dict(ou) for ou in ous]}
 
 
 class UpdateBusinessUnitsRequest(BaseModel):
@@ -99,10 +126,10 @@ class UpdateBusinessUnitsRequest(BaseModel):
 @router.put("/{account_id}/business-units")
 def update_business_units(account_id: int, body: UpdateBusinessUnitsRequest, request: Request,
                            db: Session = Depends(get_db),
-                           user: User = Depends(require_permission("config:author"))):
-    """Administrator-only: change which Business Unit(s) a bank account
-    belongs to. ONLY affects analysis runs started from now on — see
-    module docstring. Nothing here touches any past run/LineItem."""
+                           user: User = Depends(require_permission("ou:manage"))):
+    """Change which Business Unit(s) a bank account belongs to. ONLY affects
+    analysis runs started from now on — see module docstring. Nothing here
+    touches any past run/LineItem."""
     account = db.query(BankAccount).get(account_id)
     if not account:
         raise AppError(ErrorCode.BANK_ACCOUNT_NOT_FOUND)
@@ -143,3 +170,67 @@ def update_business_units(account_id: int, body: UpdateBusinessUnitsRequest, req
     db.commit()
     db.refresh(account)
     return _account_dict(account)
+
+
+class UpdateOrganizationUnitRequest(BaseModel):
+    ou_name: str
+    functional_currency: str
+
+
+@router.put("/business-units/{ou_number}")
+def update_organization_unit(ou_number: str, body: UpdateOrganizationUnitRequest, request: Request,
+                              db: Session = Depends(get_db),
+                              user: User = Depends(require_permission("ou:manage"))):
+    """
+    Edit an OrganizationUnit's own name and/or functional currency directly
+    -- this is new: previously, once an OU was created (see
+    bff/config_builder_routes.py's _get_or_create_organization_unit()), its
+    ou_name could be silently overwritten by the NEXT account onboarded
+    against it, and functional_currency could never be corrected at all
+    short of a manual DB UPDATE. This is that missing correction path,
+    exposed as a real, audited, permission-gated action instead.
+
+    Get the exact Business Unit string right here BEFORE relying on it —
+    oracle/fusion_client.py's get_ou_display_name() builds Oracle's
+    "BusinessUnit" field as EXACTLY f"{ou_name}({ou_number})", e.g.
+    "PUNE(111)". Oracle Fusion matches this as an exact string — "Pune(111)"
+    (wrong case) or any other variation gets a 404 on every single receipt
+    for that OU, not a validation warning. There is no case-insensitive or
+    fuzzy fallback anywhere in the posting path.
+
+    Every call here is audited (bank_account.ou_details_changed) with the
+    before/after values, since a wrong edit here is exactly as consequential
+    as a wrong value at onboarding time.
+    """
+    ou = db.query(OrganizationUnit).filter(OrganizationUnit.ou_number == ou_number).first()
+    if not ou:
+        raise AppError(ErrorCode.ORGANIZATION_UNIT_NOT_FOUND, detail=ou_number)
+
+    new_name = (body.ou_name or "").strip()
+    new_currency = (body.functional_currency or "").strip().upper()
+    if not new_name:
+        raise AppError(ErrorCode.BUSINESS_UNIT_REQUIRED, detail="Business Unit name cannot be blank")
+    if not new_currency:
+        raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED, detail="Functional Currency cannot be blank")
+
+    old_name = ou.ou_name
+    old_currency = ou.functional_currency
+
+    ou.ou_name = new_name
+    ou.functional_currency = new_currency
+    db.flush()
+
+    log_activity(
+        db, user, action="bank_account.ou_details_changed", entity_type="OrganizationUnit",
+        entity_id=ou.ou_number, ip_address=_client_ip(request),
+        metadata={
+            "ou_number": ou.ou_number,
+            "ou_name": {"from": old_name, "to": new_name},
+            "functional_currency": {"from": old_currency, "to": new_currency},
+            "effective_from": "next analysis run / next Oracle retry only -- completed runs and "
+                               "already-posted receipts are unaffected",
+        },
+    )
+    db.commit()
+    db.refresh(ou)
+    return _ou_dict(ou)

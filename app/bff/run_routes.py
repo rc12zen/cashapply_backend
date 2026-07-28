@@ -37,6 +37,7 @@ from ..ingestion.ingest_service import handle_statement_upload_v2
 from ..tasks.analysis_tasks import run_analysis_task
 from ..bank_statement.preview import preview_bank_file
 from .metrics import compute_run_summary_row
+from .date_range import parse_date_from, parse_date_to
 
 router = APIRouter()
 
@@ -395,9 +396,12 @@ def get_run_history(
 ):
     q = db.query(AnalysisRun)
     if date_from:
+        # Parse to a real datetime (Postgres rejects timestamp >= varchar) and,
+        # for date_to, push to end-of-day so a bare "<= YYYY-MM-DD" doesn't drop
+        # every run after midnight — same helper every other bff route uses.
         q = q.filter(AnalysisRun.started_at >= parse_date_from(date_from))
     if date_to:
-        q = q.filter(AnalysisRun.started_at <= parse_date_from(date_to))
+        q = q.filter(AnalysisRun.started_at <= parse_date_to(date_to))
     if status:
         # Validate against the real enum rather than filtering on a raw
         # string -- a typo'd/stale status value (e.g. "complete" instead
