@@ -1,86 +1,68 @@
 """
-app.oracle.fusion_client  (PATCHED v3)
-=======================================
+app.oracle.fusion_client  (PATCHED v5 -- simplified)
+=======================================================
 POST /standardReceipts client. Supports Basic Auth and OAuth.
 
-ORACLE PAYLOAD MODEL (this revision)
---------------------------------------
-Three-currency model to match Oracle AR's own posting logic:
+RECEIPT-CREATION PAYLOAD MODEL -- exactly two cases, nothing else
+--------------------------------------------------------------------
+Every receipt-creation payload is built from ONE decision:
 
-  credited_currency  : what arrived in the bank (e.g. GBP)
-  invoice_currency   : what the invoice was raised in (e.g. USD)
-  functional_currency: OU ledger currency (e.g. INR)
+    is_cross_ledger = (invoice_currency != functional_currency)
 
-PATCH (v3): "Currency" is NOT a standalone field that's always sent. A
-confirmed real Oracle sample payload shows Currency only ever appears
-TOGETHER WITH ConversionRateType/ConversionRate/ConversionDate, as one
-all-or-nothing group -- present only when invoice_currency differs from
-functional_currency (Oracle needs telling what foreign currency this
-receipt is in and how to convert it). When invoice_currency ==
-functional_currency, NONE of these four fields are sent at all -- Oracle
-defaults to the ledger's own functional currency on its own. Sending
-Currency alone, with no conversion fields, on a same-functional-currency
-receipt (the old v2 behavior) was simply wrong, not just redundant.
+CASE 1 -- NOT cross-ledger (invoice_currency == functional_currency)
+    Send exactly these 9 fields, nothing more:
+        ReceiptNumber, ReceiptMethod, BusinessUnit, CustomerAccountNumber,
+        RemittanceBankAccountNumber, Currency, Amount, AccountingDate,
+        ReceiptDate
 
-Oracle payload shapes:
+CASE 2 -- cross-ledger (invoice_currency != functional_currency)
+    Send the SAME 9 fields, PLUS exactly these 3:
+        ConversionRateType ("User"), ConversionRate, ConversionDate
+    -- 12 fields total.
 
-  Case A — All three currencies are the same (fully same-currency)
-  ─────────────────────────────────────────────────────────────────
-  No Currency, no ConversionRate/ConversionDate/ConversionRateType.
-  Amount   = credit_amount (already in invoice = functional currency)
+That's it. `Currency` is ALWAYS present in both cases (confirmed via a
+live Oracle test: a same-currency payload sent WITHOUT Currency was
+rejected with "You must provide a value for the Currency attribute").
+Only the 3 Conversion* fields are conditional on cross-ledger.
 
-  Case B — credited != invoice  (Leg 1 conversion needed by us)
-  ─────────────────────────────────────────────────────────────────
-  We converted credit_amount → invoice_currency at analysis time
-  (fx_credit_to_invoice). Amount is in invoice_currency either way.
-  Amount = credit_amount * fx_credit_to_invoice
+WHAT WAS REMOVED IN v5 (previously "audit" fields tacked onto the
+payload dict itself -- _fx_sources, _is_cross_ou_currency,
+_receipt_method_unresolved, _receipt_method_ambiguous,
+_customer_account_number_unresolved, _customer_account_number_fallback_
+lookup): these added no value to the actual payload, were a repeated
+source of confusion about what was really being sent, and (confirmed via
+a live captured request) were ACTUALLY GOING OUT to Oracle over the wire
+despite comments claiming otherwise. Removed entirely -- nothing builds
+them, nothing sends them. Anything worth knowing about how a field got
+resolved (customer lookup fallback, unresolved receipt method, ambiguous
+receipt method) is now a plain server-side log line instead of payload
+clutter -- see the logger.info/warning calls below.
 
-    If invoice == functional (no Leg 2 needed):
-      No Currency, no ConversionRate* fields — same as Case A from here.
+WHAT CHANGED FOR THE "cross-ledger but rate not resolved" EDGE CASE:
+previously this silently returned a payload with a "_fx_leg2_missing"
+"DO NOT POST" flag that nothing downstream actually checked before
+posting anyway -- meaning an incomplete payload could genuinely reach
+Oracle. Now raises ValueError instead, so a caller can never accidentally
+post a cross-ledger receipt with no conversion rate; the row fails
+cleanly and visibly instead of going out half-built.
 
-    If ALSO invoice != functional  (is_cross_ledger=True, Leg 2):
-      Currency            = invoice_currency
-      ConversionRateType  = "User"
-      ConversionRate      = fx_invoice_to_functional
-      ConversionDate      = statement_date
-      Oracle uses ConversionRate internally to book in functional currency.
-      We do NOT compute functional amounts — Oracle owns that.
+Amount:
+  Leg 1 (credited_currency -> invoice_currency) is resolved BEFORE this
+  function runs (by the rule engine / orchestrator, stored on the
+  LineItem) -- Amount here is always already in invoice_currency.
+  Oracle itself handles converting Amount into functional_currency using
+  ConversionRate when Case 2 applies -- this app never computes or sends
+  a functional-currency amount.
 
-  Case C — credited == invoice but invoice != functional
-  ─────────────────────────────────────────────────────────────────
-  No Leg 1 needed (same currency received as invoice denomination).
-  Amount              = credit_amount
-  Currency            = invoice_currency
-  ConversionRateType  = "User"
-  ConversionRate      = fx_invoice_to_functional
-  ConversionDate      = statement_date
-
-Example (from spec):
-  credit: 100 GBP, invoice: 100 USD, functional: INR
-  → Amount=100*fx(GBP→USD), Currency="USD",
-    ConversionRate=fx(USD→INR), ConversionDate=statement_date
-
-  credit: 100 USD, invoice: 100 USD, functional: INR
-  → Amount=100, Currency="USD",
-    ConversionRate=fx(USD→INR), ConversionDate=statement_date
-
-  credit: 100 USD, invoice: 100 USD, functional: USD (all match)
-  → Amount=100. No Currency, no ConversionRate* fields at all.
-
-ReferenceAmount:
-  Always in invoice_currency (same as Amount).
-  stated_amount on each MatchedInvoice is already in invoice_currency
-  (set by _resolve_matched_invoices in the evaluator using Leg 1).
-
-PROBLEM 2 — is_cross_ou_currency in response
----------------------------------------------
-build_receipt_creation_payload now includes is_cross_ou_currency from the
-LineItem so the caller (state_machine / API response) can surface the flag
-to the front-end without a separate DB query.
+ReceiptNumber: CASHAPPLY-<ou_number>-<YYYYMMDD>-<line_item_id> -- no
+extra suffix (a previous version had an unexplained "-226" appended,
+confirmed via a live Oracle test to push real values over Oracle's
+30-character ReceiptNumber limit -- removed).
 """
 from __future__ import annotations
 
 import datetime as dt
+import logging
 
 import httpx
 
@@ -90,6 +72,8 @@ from ..rule_engine.fx_service import get_ou_display_name
 from .receipt_method_resolver import resolve_receipt_method
 from ..common.http_debug_log import log_oracle_request, log_oracle_response, log_oracle_error
 from ..aging import aging_store
+
+logger = logging.getLogger("cashapply.oracle")
 
 
 class OracleFusionClient:
@@ -134,6 +118,10 @@ class OracleFusionClient:
         Returns normalised result dict:
           { success, oracle_ref_no, standard_receipt_id, status_code, message, raw }
 
+        As of v5, `payload` never contains anything but real Oracle
+        fields (see build_receipt_creation_payload's module docstring) --
+        no stripping needed here anymore. Sent exactly as built.
+
         Every call logs the exact outbound request as a copy-pasteable curl
         command (credentials redacted — see http_debug_log.py) and the full
         response status/headers/body, so a failed post can be diagnosed or
@@ -150,25 +138,14 @@ class OracleFusionClient:
         )
         headers = self._auth_headers()
 
-        # PATCH: these underscore-prefixed audit fields (_fx_sources,
-        # _receipt_method_unresolved, _is_cross_ou_currency, etc.) used to
-        # be sent to Oracle AS-IS, on the theory that "Oracle ignores
-        # unrecognized fields" — that was never actually verified, and a
-        # real captured outbound request confirmed they WERE going out
-        # over the wire in the JSON body. Log the FULL payload (audit
-        # fields included) so the log always shows everything that was
-        # computed for this row — but build a SEPARATE, stripped dict for
-        # the actual POST, so Oracle only ever receives real receipt
-        # fields, never our own internal audit metadata.
         log_oracle_request(
             "POST", url, headers=headers, auth=auth, json_body=payload,
             tag="oracle.standardReceipts",
         )
-        outbound_payload = {k: v for k, v in payload.items() if not k.startswith("_")}
 
         try:
             resp = httpx.post(
-                url, json=outbound_payload,
+                url, json=payload,
                 headers=headers, auth=auth, timeout=60,
             )
             log_oracle_response(resp, tag="oracle.standardReceipts")
@@ -178,15 +155,6 @@ class OracleFusionClient:
                 return {
                     "success":             True,
                     "oracle_ref_no":       data.get("ReceiptNumber"),
-                    # BUGFIX: was `data.get("ReceiptId") or data.get("id")` —
-                    # a real Oracle response (confirmed against an actual
-                    # /standardReceipts POST result) returns the numeric
-                    # receipt ID under "StandardReceiptId", never "ReceiptId"
-                    # or "id". As written before, standard_receipt_id would
-                    # silently come back None on every real Oracle call —
-                    # which would have broken invoice-mapping entirely,
-                    # since that step needs this ID to address
-                    # /standardReceipts/{id}/child/remittanceReferences.
                     "standard_receipt_id": data.get("StandardReceiptId"),
                     "status_code":         str(resp.status_code),
                     "message":             "Posted successfully",
@@ -276,40 +244,71 @@ class OracleFusionClient:
 
 def _build_receipt_number(line_item: LineItem) -> str:
     """
-    Generates the Oracle `ReceiptNumber` -- confirmed by the business to be
-    supplied by us, not Oracle. Must be RECOGNIZABLE (a human scanning
-    Oracle AR receipts can tell it came from CashApply, and roughly when/
-    where from) and UNIQUE (never collides, including across retries of
-    the same row).
-
+    Generates the Oracle `ReceiptNumber` -- supplied by us, not Oracle.
     Format: CASHAPPLY-<ou_number>-<YYYYMMDD>-<line_item_id>
       e.g.  CASHAPPLY-111-20260604-1583
 
-    Recognizable:
-      - "CASHAPPLY" prefix identifies the source system at a glance.
-      - <ou_number> shows which business unit/plant the receipt is for.
-      - <YYYYMMDD> shows roughly when the underlying payment was received
-        (statement_date; falls back to the row's created_at date if the
-        statement date wasn't parsed, so this segment is never blank).
+    Unique: <line_item_id> is LineItem.id, a DB auto-increment primary
+    key -- globally unique for the table's lifetime, never reused.
+    Idempotent across retries: same LineItem -> same ReceiptNumber, every
+    time this is called.
 
-    Unique -- guaranteed, not just likely:
-      - <line_item_id> is LineItem.id, a DB auto-increment primary key.
-        It is globally unique for the lifetime of the table and is NEVER
-        reused, even after a row is deleted. That alone is sufficient for
-        uniqueness; the ou_number/date segments are for recognizability
-        only and add no uniqueness risk.
-
-    Idempotent across retries:
-      - hitl.service.py's retry_oracle_post() rebuilds the payload from
-        scratch on every attempt, but always against the SAME LineItem, so
-        this function returns the exact same value every time for a given
-        row -- a retry after a network timeout reuses the same
-        ReceiptNumber rather than minting a new one.
+    Defensive length guard: Oracle's ReceiptNumber field caps at 30
+    characters. A larger OU number or line_item_id could in principle
+    still exceed that -- truncates the recognizability prefix (never the
+    trailing line_item_id, which is what guarantees uniqueness) and logs
+    loudly if this ever fires.
     """
     ou = line_item.ou_number or "UNK"
     date_source = line_item.statement_date or line_item.created_at
     date_str = date_source.strftime("%Y%m%d") if date_source else "00000000"
-    return f"CASHAPPLY-{ou}-{date_str}-{line_item.id}-226"
+    receipt_number = f"CASHAPPLY-{ou}-{date_str}-{line_item.id}"
+    if len(receipt_number) > 30:
+        logger.warning(
+            "ReceiptNumber '%s' (%d chars) exceeds Oracle's 30-char limit -- "
+            "truncating the OU/date prefix. This format needs revisiting.",
+            receipt_number, len(receipt_number),
+        )
+        suffix = f"-{line_item.id}"
+        receipt_number = receipt_number[: 30 - len(suffix)] + suffix
+    return receipt_number
+
+
+def _resolve_customer_account_number(line_item: LineItem) -> str:
+    """
+    Returns the CustomerAccountNumber to send -- "" if genuinely
+    unresolved (never null/omitted). Tries, in order:
+      1. customer_number on any matched invoice.
+      2. A fuzzy customer-name lookup against the currently-loaded aging
+         report, if no invoice matched but a customer name was extracted.
+    Logs which path was used / whether it's unresolved -- this used to
+    be embedded in the payload as "_customer_account_number_unresolved"/
+    "_fallback_lookup" audit keys; now it's just a log line, since
+    nothing downstream ever parsed those keys programmatically.
+    """
+    matched_invoices_raw = line_item.matched_invoices or []
+    customer_account_number = next(
+        (m.get("customer_number") for m in matched_invoices_raw if m.get("customer_number")),
+        None,
+    )
+    if not customer_account_number and line_item.extracted_customer_name:
+        aging_map = aging_store.get_aging_map()
+        if aging_map is not None:
+            match, score = aging_map.fuzzy_customer(line_item.extracted_customer_name)
+            if match:
+                customer_account_number = match.customer_number
+                logger.info(
+                    "[receipt_payload] row=%s CustomerAccountNumber resolved via customer-name "
+                    "fallback lookup -- matched '%s' at %.0f%% confidence for extracted name '%s'.",
+                    line_item.id, match.customer_name, score, line_item.extracted_customer_name,
+                )
+    if not customer_account_number:
+        logger.warning(
+            "[receipt_payload] row=%s CustomerAccountNumber unresolved -- no matched-invoice "
+            "customer_number and no confident aging-report name match. Posting with \"\" per spec.",
+            line_item.id,
+        )
+    return customer_account_number or ""
 
 
 def build_receipt_creation_payload(line_item: LineItem) -> dict:
@@ -317,205 +316,102 @@ def build_receipt_creation_payload(line_item: LineItem) -> dict:
     Builds the Oracle AR standardReceipts CREATION payload — step 1 (Bank
     Reconciliation stage). Called for EVERY credit row, regardless of
     category, right after the analysis run finishes categorizing it — NOT
-    gated on ready_for_oracle / SPOC approval.
+    gated on ready_for_oracle / SPOC approval. Never includes
+    remittanceReferences — that's a separate, later POST (see
+    build_remittance_reference_payloads), once a row reaches
+    ready_for_oracle and a SPOC approves it.
 
-    Deliberately excludes `remittanceReferences` entirely — invoice
-    mapping happens later, as a separate POST to
-    /standardReceipts/{standard_receipt_id}/child/remittanceReferences
-    (see build_remittance_reference_payloads + OracleFusionClient.
-    post_remittance_reference), once the row reaches ready_for_oracle and
-    a SPOC approves it. At this stage we may not even have SPOC
-    confirmation yet, and rows that never reach ready_for_oracle should
-    still get a bare receipt per the current spec.
-
-    CustomerAccountNumber is "" (empty string, not null/omitted) when no
-    customer was identified for this row — confirmed against the
-    business's own sample payload. Rows that are genuinely unidentified
-    never reach ready_for_oracle anyway (matching requires an identified
-    customer), so this only ever applies to rows that will never get
-    invoice-mapped, not to a temporary/fixable gap.
-
-    Parameters
-    ----------
-    line_item:
-        Persisted LineItem with all three currency fields and both FX legs
-        already resolved by the orchestrator (this happens for every row
-        in the same pass, before categorization — see orchestrator.py's
-        Pass 2 — so this data is available even for rows that end up
-        unidentified/needs_remittance/conflict_exception).
-
-    Payload shapes for Amount/Currency/ConversionRate — see this module's
-    docstring for the full three-currency-model examples. PATCHED (v3):
-    Currency/ConversionRateType/ConversionRate/ConversionDate are now one
-    all-or-nothing group, sent only when invoice_currency != functional_currency
-    — confirmed against a real Oracle sample payload; previously Currency was
-    sent unconditionally on every payload, which was wrong.
+    See this module's docstring for the exact two-case field model.
+    Raises ValueError if this row is cross-ledger but its conversion rate
+    hasn't been resolved -- see that docstring's note on why this is now
+    a hard failure instead of a silently half-built payload.
     """
     # ── Resolve currency fields from LineItem ─────────────────────────────────
-    credited_currency   = (line_item.statement_currency  or "").upper().strip()
     invoice_currency    = (line_item.invoice_currency    or "").upper().strip()
     functional_currency = (line_item.functional_currency or "").upper().strip()
+    credited_currency   = (line_item.statement_currency  or "").upper().strip()
 
     # Fall back gracefully when invoice_currency was not resolved (e.g. a
     # genuinely unidentified row with no matched invoice at all — this
-    # payload is built for EVERY row now, not just ones that matched).
+    # payload is built for EVERY row, not just ones that matched).
     if not invoice_currency:
         invoice_currency = credited_currency or functional_currency
 
-    credit_amount    = float(line_item.credit_amount or 0)
+    credit_amount = float(line_item.credit_amount or 0)
     statement_date_iso = (
         line_item.statement_date.strftime("%Y-%m-%d")
         if line_item.statement_date else None
     )
     accounting_date_iso = dt.date.today().strftime("%Y-%m-%d")
 
-    # ── Leg 1: convert credit amount → invoice currency ───────────────────────
-    is_cross_currency    = bool(line_item.is_cross_currency)   # credited != invoice
+    # ── Leg 1: convert credit amount → invoice currency (already resolved
+    # upstream by the rule engine before this function ever runs) ───────────
+    is_cross_currency    = bool(line_item.is_cross_currency)
     fx_credit_to_invoice = float(line_item.fx_credit_to_invoice) if line_item.fx_credit_to_invoice else None
-
     if is_cross_currency and fx_credit_to_invoice:
         amount_in_invoice_ccy = round(credit_amount * fx_credit_to_invoice, 2)
     else:
         amount_in_invoice_ccy = credit_amount
 
-    # ── Leg 2: invoice → functional (Oracle ConversionRate) ──────────────────
-    is_cross_ledger          = bool(line_item.is_cross_ledger)   # invoice != functional
-    fx_invoice_to_functional = float(line_item.fx_invoice_to_functional) if line_item.fx_invoice_to_functional else None
+    # ── The ONE decision that drives everything else ─────────────────────────
+    is_cross_ledger = invoice_currency != functional_currency
 
-    # ── Resolve the real ReceiptMethod (was hardcoded "Standard" — a value
-    #    that appears nowhere in the actual Oracle AR Receipt Methods
-    #    extract). Falls back to "Standard" ONLY if the account genuinely
-    #    isn't in receipt_method_map.json, and flags that clearly so it
-    #    doesn't silently post under a guessed method — see
-    #    `_receipt_method_unresolved` below.
+    fx_invoice_to_functional = float(line_item.fx_invoice_to_functional) if line_item.fx_invoice_to_functional else None
+    if is_cross_ledger and not fx_invoice_to_functional:
+        # Was previously a silent "_fx_leg2_missing" payload flag that
+        # nothing downstream checked before posting anyway. Now a hard
+        # failure -- a caller can never accidentally send a cross-ledger
+        # receipt with no conversion rate.
+        raise ValueError(
+            f"Cannot build receipt payload for LineItem {line_item.id}: cross-ledger "
+            f"conversion rate ({invoice_currency}->{functional_currency}) is not resolved. "
+            f"Do not post until a rate is available."
+        )
+
+    # ── ReceiptMethod ──────────────────────────────────────────────────────────
     receipt_method_result = resolve_receipt_method(
         account_number=line_item.account_number,
         ou_number=line_item.ou_number,
     )
     receipt_method_name = receipt_method_result.receipt_method_name or "Standard"
+    if not receipt_method_result.matched:
+        logger.warning(
+            "[receipt_payload] row=%s account='%s' not found in receipt_method_map.json -- "
+            "posting with fallback ReceiptMethod='Standard'. Add this account to the extract "
+            "before relying on it.",
+            line_item.id, line_item.account_number,
+        )
+    elif receipt_method_result.ambiguous:
+        logger.info(
+            "[receipt_payload] row=%s account='%s' has multiple candidate receipt methods "
+            "(class='%s' chosen by default priority order) -- confirm this is correct.",
+            line_item.id, line_item.account_number, receipt_method_result.receipt_class,
+        )
 
-    # ── BusinessUnit: Oracle expects "NAME(ou)" (e.g. "PUNE(111)").
+    # ── BusinessUnit: Oracle expects "NAME(ou)" (e.g. "PUNE(111)") ───────────
     business_unit = get_ou_display_name(line_item.ou_number) or line_item.business_unit
 
-    # ── CustomerAccountNumber: "" when unresolved, never null/omitted ─────────
-    # PATCH: this used to ONLY look at matched_invoices — which requires an
-    # INVOICE to have been matched. A needs_remittance row (customer
-    # identified in the narrative, but no invoice number found) has
-    # matched_invoices = [] by definition, so CustomerAccountNumber always
-    # came back blank even when the aging report genuinely has that
-    # customer on file — "customer identified" (Card 2's extracted_customer)
-    # and "customer resolved to an aging account number" were being
-    # silently conflated. Now falls back to a customer-name lookup against
-    # the currently-loaded aging report when no invoice was matched, so
-    # this field can be populated correctly even before an invoice is known.
-    matched_invoices_raw = line_item.matched_invoices or []
-    customer_account_number = next(
-        (m.get("customer_number") for m in matched_invoices_raw if m.get("customer_number")),
-        None,
-    )
-    customer_lookup_note = None
-    if not customer_account_number and line_item.extracted_customer_name:
-        aging_map = aging_store.get_aging_map()
-        if aging_map is not None:
-            match, score = aging_map.fuzzy_customer(line_item.extracted_customer_name)
-            if match:
-                customer_account_number = match.customer_number
-                customer_lookup_note = (
-                    f"CustomerAccountNumber resolved via customer-name lookup against the aging "
-                    f"report (no invoice was matched) — matched '{match.customer_name}' at {score:.0f}% "
-                    f"confidence for extracted name '{line_item.extracted_customer_name}'."
-                )
-    customer_account_number = customer_account_number or ""
+    # ── CustomerAccountNumber ──────────────────────────────────────────────────
+    customer_account_number = _resolve_customer_account_number(line_item)
 
-    # ── Base payload — NO remittanceReferences here, see docstring ───────────
-    # PATCH: "Currency" used to be unconditionally set to invoice_currency
-    # here, on every payload. A real confirmed Oracle sample payload shows
-    # Currency is NOT a standalone field -- it only appears TOGETHER WITH
-    # ConversionRateType/ConversionRate/ConversionDate, as one all-or-
-    # nothing group, for a receipt being raised in a currency OTHER than
-    # the OU's functional (ledger) currency. When invoice_currency ==
-    # functional_currency, Oracle defaults Currency to the ledger currency
-    # on its own -- sending it (with no conversion fields alongside it) was
-    # simply wrong, not just redundant. See the block below the audit-flag
-    # checks for where this whole group now gets added together.
+    # ── CASE 1: base 9 fields, always present ────────────────────────────────
     payload: dict = {
         "ReceiptNumber":               _build_receipt_number(line_item),
         "ReceiptMethod":               receipt_method_name,
         "BusinessUnit":                business_unit,
         "CustomerAccountNumber":       customer_account_number,
         "RemittanceBankAccountNumber": line_item.account_number,
+        "Currency":                    invoice_currency,
         "Amount":                      amount_in_invoice_ccy,
         "AccountingDate":              accounting_date_iso,
         "ReceiptDate":                 statement_date_iso,
     }
 
-    if customer_lookup_note:
-        payload["_customer_account_number_fallback_lookup"] = customer_lookup_note
-
-    if not customer_account_number:
-        payload["_customer_account_number_unresolved"] = (
-            "No customer_number found on any matched invoice, and no confident "
-            "customer-name match was found in the currently-loaded aging report "
-            "either — posted with CustomerAccountNumber=\"\" per spec. This row will "
-            "never reach ready_for_oracle / invoice mapping unless a customer is "
-            "later identified."
-        )
-
-    if not receipt_method_result.matched:
-        payload["_receipt_method_unresolved"] = (
-            f"Account '{line_item.account_number}' not found in receipt_method_map.json — "
-            f"posted with fallback ReceiptMethod='Standard'. DO NOT trust this for posting; "
-            f"add this account to the extract / config before relying on it."
-        )
-    elif receipt_method_result.ambiguous:
-        payload["_receipt_method_ambiguous"] = (
-            f"Account '{line_item.account_number}' has multiple candidate receipt methods "
-            f"(class='{receipt_method_result.receipt_class}' chosen by default priority order); "
-            f"confirm this is the correct one — see _accounts_with_unresolved_ambiguity in "
-            f"receipt_method_map.json."
-        )
-
-    # ── Currency + Conversion* fields — ONE ALL-OR-NOTHING GROUP ─────────────
-    # Only added when invoice_currency != functional_currency (a foreign-
-    # currency receipt from the ledger's point of view). When they match,
-    # NONE of these four fields are sent — Oracle uses the ledger's own
-    # functional currency automatically, and amount_in_invoice_ccy is
-    # already the correct functional-currency amount at that point (Leg 1
-    # already converted credited_currency -> invoice_currency upstream;
-    # since invoice_currency == functional_currency here, no further
-    # conversion is needed or wanted).
-    if is_cross_ledger and fx_invoice_to_functional:
-        payload["Currency"]           = invoice_currency
+    # ── CASE 2: + exactly 3 more, only when cross-ledger ─────────────────────
+    if is_cross_ledger:
         payload["ConversionRateType"] = "User"
         payload["ConversionRate"]     = fx_invoice_to_functional
         payload["ConversionDate"]     = statement_date_iso
-    elif is_cross_ledger and not fx_invoice_to_functional:
-        # Cross-ledger but the rate isn't resolved -- do NOT send a partial
-        # group (Currency with no rate is worse than sending neither).
-        # Flagged for a human, not silently posted in the functional
-        # currency it doesn't actually belong in.
-        payload["_fx_leg2_missing"] = (
-            f"fx_invoice_to_functional ({invoice_currency}→{functional_currency}) "
-            f"not resolved. DO NOT POST — re-evaluate after providing rate."
-        )
-
-
-    # ── Audit trail (stripped before the actual POST -- see
-    # OracleFusionClient.post_standard_receipt(), which builds a separate,
-    # cleaned dict for the real outbound request and only uses this full
-    # version for logging) ─────────────────────────────────────────────────
-    payload["_fx_sources"] = {
-        "credited_currency":              credited_currency,
-        "invoice_currency":               invoice_currency,
-        "functional_currency":            functional_currency,
-        "fx_credit_to_invoice":           fx_credit_to_invoice,
-        "fx_credit_to_invoice_source":    line_item.fx_credit_to_invoice_source,
-        "fx_invoice_to_functional":       fx_invoice_to_functional,
-        "fx_invoice_to_functional_source": line_item.fx_invoice_to_functional_source,
-    }
-    payload["_is_cross_ou_currency"] = bool(
-        getattr(line_item, "is_cross_ou_currency", False)
-    )
 
     return payload
 
