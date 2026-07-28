@@ -48,6 +48,7 @@ from ..common.upload_validation import validate_statement_upload, validate_state
 from ..bank_statement.account_locator import extract_accounts, normalize_account, last4, match_key
 from ..bank_statement.account_validation import account_reject_reason
 from ..bank_statement.field_sanity import check_field_values
+from ..bank_statement.currency import normalize_currency
 from ..bank_statement.configs.account_loader import (
     load_account_configs, load_account_ou_map, reload_account_configs,
     active_recipe, format_summaries,
@@ -487,6 +488,24 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
         raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED, detail="Organization Unit")
     if not body.business_unit.strip():
         raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED, detail="Business Unit")
+
+    # Standardize the account/statement currency to an ISO-4217 code (Fusion
+    # requires it — see bank_statement/currency.py). Store the ISO on the
+    # BankAccount and stamp it into the recipe so the parser has a per-config
+    # fallback when a row's own currency value can't be mapped at ingest time.
+    if body.currency and body.currency.strip():
+        iso = normalize_currency(body.currency)
+        if iso is None:
+            raise AppError(
+                ErrorCode.CONFIG_RECIPE_INVALID,
+                detail=f"Currency '{body.currency}' isn't a recognised currency — pick a standard ISO code (e.g. EUR, GBP, USD).",
+            )
+        body.currency = iso
+        body.recipe["currency"] = iso
+    # Functional currency (OU ledger) — normalize when it maps cleanly; the OU
+    # helper still uppercases/validates presence for a genuinely new OU.
+    if body.functional_currency and body.functional_currency.strip():
+        body.functional_currency = normalize_currency(body.functional_currency) or body.functional_currency
 
     try:
         ou = _get_or_create_organization_unit(db, body.ou_number, body.business_unit, body.functional_currency)

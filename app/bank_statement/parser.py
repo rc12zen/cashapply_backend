@@ -34,6 +34,7 @@ from .extractor import ExtractorFactory
 from .credit_rules import eval_credit_rule
 from .transforms import apply_transforms
 from .ou_resolver import resolve_ou
+from .currency import normalize_currency
 
 logger = logging.getLogger("cashapply.parser")
 
@@ -420,9 +421,13 @@ def parse_credit_rows(
     transforms   = cfg.get("transforms", {})
     # Fall back to the human-readable display name (never the internal config key)
     default_bank = cfg.get("display_name") or ""
+    # ISO fallback stamped into the recipe at save (config_builder_routes.builder_save)
+    # — used when a row's own currency value can't be standardized to ISO.
+    config_currency = normalize_currency(cfg.get("currency")) if cfg.get("currency") else None
 
     out: list[NormalizedCreditRow] = []
     invalid_amount_count = 0
+    unmapped_currency_count = 0
 
     for _, row in df.iterrows():
         # 5a. Credit rule
@@ -473,10 +478,24 @@ def parse_credit_rows(
         ou_number     = ou_info.get("ou_number")
         business_unit = ou_info.get("business_unit")
 
+        # 5g. Standardize currency to ISO-4217 (Fusion requires it). Map known
+        # spellings ("EURO"->"EUR" etc.); if a row's value can't be mapped, fall
+        # back to the config's currency and flag it (never blocks ingestion).
+        raw_currency = record.get("currency", "")
+        currency = normalize_currency(raw_currency)
+        if currency is None:
+            currency = config_currency or str(raw_currency or "").upper().strip()
+            if raw_currency:
+                unmapped_currency_count += 1
+                logger.warning(
+                    "Currency %r not a known ISO code (file=%s, ref=%s) — fell back to %r",
+                    raw_currency, filename, record.get("bank_reference"), currency,
+                )
+
         out.append(NormalizedCreditRow(
             bank_name      = record.get("bank_name") or default_bank,
             account_number = account_number,
-            currency       = record.get("currency", ""),
+            currency       = currency,
             narrative      = record.get("narrative", ""),
             credit_amount  = credit_amount,
             statement_date = statement_date,
@@ -489,6 +508,11 @@ def parse_credit_rows(
         logger.warning(
             "%s: dropped %d row(s) with invalid (non-numeric, zero, or negative) credit amounts",
             filename, invalid_amount_count,
+        )
+    if unmapped_currency_count:
+        logger.warning(
+            "%s: %d row(s) had a currency that couldn't be mapped to an ISO code — fell back to the config currency (%s)",
+            filename, unmapped_currency_count, config_currency or "raw value",
         )
 
     return out
