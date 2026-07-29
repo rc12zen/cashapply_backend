@@ -130,12 +130,20 @@ def get_pending_by_account(db: Session = Depends(get_db), user: User = Depends(r
         key = f.bank_account_id
         if key not in groups:
             account = db.query(BankAccount).get(key) if key is not None else None
+            # Prefer the account's CURRENT OU mapping (BankAccount.ou_id ->
+            # OrganizationUnit) — the authoritative source the run itself
+            # resolves against. f.business_unit / f.ou_number are only a snapshot
+            # taken at UPLOAD time (ingest_service), so a file ingested before
+            # its account's OU was set up (or before it was fixed on the
+            # Accounts & OU's page) would otherwise show a stale "No Business
+            # Unit" here even though the account is now mapped correctly.
+            ou = account.organization_unit if account else None
             groups[key] = {
                 "bank_account_id": key,
                 "account_number": account.account_number if account else None,
                 "bank_name": (account.bank_name if account else None) or f.bank_config_key or "Unknown",
-                "business_unit": f.business_unit or "",
-                "ou_number": f.ou_number or "",
+                "business_unit": (ou.ou_name if ou else None) or f.business_unit or "",
+                "ou_number": (ou.ou_number if ou else None) or f.ou_number or "",
                 "files": [],
                 "pending_row_count": 0,
             }

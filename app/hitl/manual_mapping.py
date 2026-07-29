@@ -4,8 +4,22 @@ app.hitl.manual_mapping
 Manual invoice-mapping — lets a SPOC hand-pick invoice(s) from the
 currently-loaded aging report for a row that didn't land in
 ready_for_oracle automatically (unidentified, needs_remittance,
-conflict_exception, post_failed, rejected — anything except
-ready_for_oracle and processed).
+conflict_exception — anything except ready_for_oracle and processed).
+
+PATCH: post_failed and rejected are NO LONGER eligible here, despite an
+earlier version of this docstring listing them. Both categories are only
+ever reachable AFTER a SPOC decision has already been recorded
+(hitl_status == "approved" for post_failed — see bff/metrics.py's
+_category_for_row(), which defines post_failed as reference_status ==
+"failed", itself only settable post-approval; hitl_status == "rejected"
+for rejected rows). Every function below now refuses outright if
+hitl_status is already set, since re-mapping underneath an already-made
+human decision could silently "unwind" a row Oracle already has a
+receipt for back into a pending-approval state, with no real audit trail
+beyond a RowStatusHistory entry. If rejected rows specifically should
+remain re-mappable on reconsideration, narrow the guard to
+hitl_status == "approved" only — see confirm_manual_mapping()'s
+docstring.
 
 DESIGN (confirmed with the business):
   - Confirming a mapping only RE-CLASSIFIES the row into ready_for_oracle
@@ -72,6 +86,17 @@ def get_mapping_options(db: Session, line_item_id: int) -> dict:
     r = db.query(LineItem).get(line_item_id)
     if not r:
         return {"error": "Row not found"}
+    if r.hitl_status is not None:
+        # Defense-in-depth — the frontend already hides the Manual Mapping
+        # card once a decision is recorded (see canManuallyMap in the
+        # row-detail page), but this endpoint refuses independently too,
+        # in case of a stale page or a direct API call.
+        return {
+            "error": (
+                f"This row already has a recorded SPOC decision (hitl_status="
+                f"'{r.hitl_status}') and can no longer be manually mapped."
+            ),
+        }
 
     aging_map = aging_store.get_aging_map()
     if aging_map is None:
@@ -156,6 +181,13 @@ def preview_manual_mapping(db: Session, line_item_id: int, invoice_numbers: list
     r = db.query(LineItem).get(line_item_id)
     if not r:
         return {"error": "Row not found"}
+    if r.hitl_status is not None:
+        return {
+            "error": (
+                f"This row already has a recorded SPOC decision (hitl_status="
+                f"'{r.hitl_status}') and can no longer be manually mapped."
+            ),
+        }
     if not invoice_numbers:
         return {"error": "Select at least one invoice."}
 
@@ -191,14 +223,41 @@ def confirm_manual_mapping(
     only if it still qualifies, RE-CLASSIFIES the row into ready_for_oracle.
     Does NOT call Oracle — see module docstring for why that's a deliberate,
     separate step via the existing Approve action.
+
+    PATCH: refuses outright if this row already has a SPOC decision
+    recorded (hitl_status == "approved" or "rejected"). There was
+    previously NO check here at all — this endpoint would happily
+    overwrite matched_invoices and reset current_state back to
+    "review_approve" on a row that had ALREADY been approved (including
+    one sitting in post_failed, which — per bff/metrics.py's
+    _category_for_row() — can only ever be reached AFTER approval,
+    meaning every post_failed row already has hitl_status="approved" set)
+    or rejected. That's a real data-integrity gap, not just a frontend
+    display issue: it could silently "unwind" a row Oracle already has a
+    receipt for back into a pending-approval state in this system, with
+    no trace beyond a RowStatusHistory entry. Blocking on hitl_status
+    covers both approved AND rejected rows under one rule (a decision was
+    already made, of any kind) — narrow this to hitl_status == "approved"
+    only if rejected rows should remain re-mappable on reconsideration.
     """
+    r = db.query(LineItem).get(line_item_id)
+    if not r:
+        return {"error": "Row not found"}
+    if r.hitl_status is not None:
+        return {
+            "error": (
+                f"This row already has a recorded SPOC decision (hitl_status="
+                f"'{r.hitl_status}') and can no longer be manually mapped."
+            ),
+            "qualifies": False,
+        }
+
     preview = preview_manual_mapping(db, line_item_id, invoice_numbers)
     if preview.get("error"):
         return preview
     if not preview["qualifies"]:
         return {"error": preview["message"], "qualifies": False}
 
-    r = db.query(LineItem).get(line_item_id)
     selected = preview["matched_invoices_preview"]
     from_state = r.current_state
 

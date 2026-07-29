@@ -130,7 +130,20 @@ class Settings(BaseSettings):
     # ── Oracle Fusion (App1) ─────────────────────────────────────────────────
     # SECURITY: no hardcoded default — must come from .env / real environment.
     # A previous revision shipped live UAT credentials as class defaults; removed.
-    ORACLE_FUSION_BASE_URL: str = "https://fa-etvl-test-saasfaprod1.fa.ocs.oraclecloud.com/fscmRestApi/resources/latest/standardReceipts"
+    # PATCH: this used to be
+    # "...resources/latest/standardReceipts" -- with the trailing
+    # "/standardReceipts" already baked in. But oracle/fusion_client.py's
+    # post_standard_receipt() ALSO appends "/standardReceipts" itself
+    # (url = f"{s.ORACLE_FUSION_BASE_URL}/standardReceipts"), and
+    # post_remittance_reference() appends
+    # "/standardReceipts/{id}/child/remittanceReferences" -- so having it
+    # in BOTH places doubled the path. Confirmed as a real, live bug: a
+    # genuine POST with the old value hit
+    # ".../standardReceipts/standardReceipts" and got a real 404 Not
+    # Found back from Oracle. This setting is the resource-collection
+    # ROOT -- fusion_client.py's own URL-building code is what appends
+    # the specific resource path, for both endpoints it calls.
+    ORACLE_FUSION_BASE_URL: str = "https://fa-etvl-test-saasfaprod1.fa.ocs.oraclecloud.com/fscmRestApi/resources/latest"
     ORACLE_AUTH_MODE: Literal["basic", "oauth"] = "basic"
     ORACLE_BASIC_USERNAME: str | None = None
     ORACLE_BASIC_PASSWORD: str | None = None
@@ -172,6 +185,49 @@ class Settings(BaseSettings):
     GL_RATES_SOURCE: str = "local_folder"           # "local_folder" | "sftp" (future)
     GL_RATES_WATCH_FOLDER: str = "./gl_rates_watch"  # folder scanned for new GL rate files
     GL_RATES_POLL_INTERVAL_SECONDS: int = 30        # how often to re-scan
+
+    # ── Oracle Cloud file-transfer VM puller (SSH jump chain) ────────────────
+    # Confirmed, tested connectivity (see context doc this was built from):
+    #   App VM -> ssh {ORACLE_FILE_JUMP_USER}@{ORACLE_FILE_JUMP_HOST}   (hop 1, DMZ)
+    #          -> ssh {ORACLE_FILE_REMOTE_USER}@{ORACLE_FILE_REMOTE_HOST} (hop 2)
+    # Both hops are key-based/passwordless already -- see
+    # oracle_file_pull/puller.py, which opens this exact two-hop chain
+    # natively in paramiko (no shelling out to `ssh -J`).
+    #
+    # This does NOT change how the aging/GL-rates watchers themselves work
+    # (AGING_SOURCE/GL_RATES_SOURCE above stay "local_folder") -- the
+    # puller's whole job is to SFTP the remote file down and drop it into
+    # the SAME local watch folders those watchers already poll, so the
+    # ingestion side needs zero new code.
+    ORACLE_FILE_JUMP_HOST: str = "192.168.7.30"          # DMZ server (ze42-v-zffusion)
+    ORACLE_FILE_JUMP_USER: str = "cauatadmin"
+    ORACLE_FILE_REMOTE_HOST: str = "144.24.100.229"       # Oracle Cloud VM (zenappdev)
+    ORACLE_FILE_REMOTE_USER: str = "al123"
+    ORACLE_FILE_REMOTE_PATH: str = "/u01/xxzen/data/fin/outbound/ca"
+
+    # Exact remote filenames confirmed via `ls -ltr` on the Oracle Cloud VM.
+    # Receipt-methods file deliberately NOT pulled yet -- out of scope for
+    # now; add ORACLE_RECEIPT_METHODS_REMOTE_FILENAME + a third pull-spec
+    # entry in oracle_file_pull/puller.py's PULL_SPECS when that's ready,
+    # rather than reworking this puller.
+    ORACLE_AGING_REMOTE_FILENAME:    str = "xxzen_aging_report_excel.xlsx"
+    ORACLE_GL_RATES_REMOTE_FILENAME: str = "xxzen_gl_daily_rates_extract.txt"
+
+    # How often the puller checks the remote files' mtimes. Requirement
+    # says "4x/day" but exact clock times vs. even spacing was an open
+    # question -- defaults to evenly spaced (6 hours). Override in .env
+    # once that's confirmed, or run via cron instead with --once (see
+    # puller.py's __main__ block) if specific clock times are needed.
+    ORACLE_FILE_PULL_INTERVAL_SECONDS: int = 6 * 60 * 60
+
+    # Local JSON file tracking each remote filename's last-SEEN mtime, so
+    # a file is only re-downloaded when it's actually changed on the
+    # remote side -- same idea as the remittance agent's
+    # processed_message_ids dedupe, just keyed by filename+mtime instead
+    # of a Graph message ID. A local file (not a DB table) was chosen for
+    # simplicity; move this into a small Postgres table later if the
+    # puller ever runs from more than one place and needs shared state.
+    ORACLE_FILE_PULL_STATE_PATH: str = "./oracle_file_pull_state.json"
 
     # ── Rule engine tolerances (overridable; mirrors Config screen) ────────
     SHORT_PAYMENT_TOLERANCE_PCT: float = 12.0
