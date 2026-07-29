@@ -45,7 +45,10 @@ from ..storage.client import get_storage_client
 from ..common.errors import AppError
 from ..common.error_codes import ErrorCode
 from ..common.upload_validation import validate_statement_upload, validate_statement_size
-from ..bank_statement.account_locator import extract_accounts, normalize_account, last4, match_key
+from ..bank_statement.account_locator import (
+    extract_account_groups, collapse_tokens, mixed_groups, alias_key,
+    normalize_account, last4, match_key,
+)
 from ..bank_statement.account_validation import account_reject_reason
 from ..bank_statement.field_sanity import check_field_values
 from ..bank_statement.currency import normalize_currency
@@ -269,33 +272,82 @@ class LocateAccountRequest(BaseModel):
     storage_key: str
     locator: dict
     source: dict | None = None
+    # Draft `account_aliases` (mixed cell → chosen primary account). Sent so the
+    # preview reflects the picks the user has already made in the wizard.
+    aliases: dict | None = None
+
+
+# How many discovered accounts the wizard is asked to render/onboard at once.
+# A pathological column (or a locator pointed at the wrong column) can yield
+# hundreds; truncate EXPLICITLY and say so rather than silently showing a subset.
+_MAX_DISCOVERED_ACCOUNTS = 50
 
 
 @router.post("/builder/locate-account")
 def builder_locate_account(body: LocateAccountRequest, db: Session = Depends(get_db),
                            user: User = Depends(require_permission("config:manage"))):
-    """Run a locator draft against the file and return the account(s) it finds,
-    flagging any that are already registered."""
+    """Run a locator draft against the file and return the account(s) it finds.
+
+    For a COLUMN locator this is normally several accounts — the wizard onboards
+    every one of them against the same recipe (see builder_save's `accounts`), so
+    this response carries everything that table needs: which accounts are already
+    configured, which don't look like real accounts, which cells name more than
+    one account (and so need a primary chosen), and any OU already on record to
+    prefill with.
+    """
     _record, local_path = _local_path_by_key(db, body.storage_key)
-    found = sorted(extract_accounts(local_path, body.locator, body.source or {}))
+    aliases = body.aliases if isinstance(body.aliases, dict) else {}
+    source = body.source or {}
+
+    groups = extract_account_groups(local_path, body.locator, source)
+    found_all = sorted({a for g in groups for a in collapse_tokens(g, aliases)})
+    truncated = max(0, len(found_all) - _MAX_DISCOVERED_ACCOUNTS)
+    found = found_all[:_MAX_DISCOVERED_ACCOUNTS]
+
+    # Cells naming several accounts. Anything without an alias entry is still
+    # unresolved — the wizard must make the user pick a primary, because a row
+    # whose account cell names two accounts has no single receipt target.
+    mixed = [
+        {"key": alias_key(g), "accounts": g, "chosen": aliases.get(alias_key(g))}
+        for g in mixed_groups(groups)
+    ]
 
     configs = load_account_configs()
-    existing = {}
+    by_key = {match_key(entry.get("account_number", k)): (k, entry) for k, entry in configs.items()}
+
+    existing: dict[str, list[str]] = {}
+    known: dict[str, dict] = {}
     for acct in found:
-        mk = match_key(acct)
-        for k, entry in configs.items():
-            if match_key(entry.get("account_number", k)) == mk:
-                existing[acct] = sorted((entry.get("recipes") or {}).keys())
+        hit = by_key.get(match_key(acct))
+        if not hit:
+            continue
+        _k, entry = hit
+        existing[acct] = sorted((entry.get("recipes") or {}).keys())
+        # Prefill for the Save step's per-account OU table, so onboarding N
+        # accounts is mostly confirming rather than retyping.
+        known[acct] = {
+            "display_name":  entry.get("display_name"),
+            "bank":          entry.get("bank"),
+            "currency":      entry.get("currency"),
+            "ou_number":     entry.get("ou_number"),
+            "business_unit": entry.get("business_unit"),
+        }
+
     # Flag candidates that don't look like real account numbers (e.g. the locator
-    # landed on a label/heading cell) so the wizard can grey them out or warn
-    # BEFORE one is chosen as the account identity. {account: reason-or-None}.
+    # landed on a label/heading cell, or a "TOTAL" footer row got scanned) so the
+    # wizard can grey them out BEFORE one is chosen as an account identity.
+    # {account: reason-or-None}.
     account_issues = {a: account_reject_reason(a) for a in found}
     return {
         "accounts": found,
         "count": len(found),
+        "total_found": len(found_all),
+        "truncated": truncated,             # >0 ⇒ tell the user N were not shown
         "last4s": sorted({last4(a) for a in found}),
-        "existing": existing,   # {account: [formats already configured]}
+        "existing": existing,               # {account: [formats already configured]}
         "account_issues": account_issues,   # {account: reason string | null}
+        "mixed": mixed,                     # [{key, accounts, chosen}]
+        "known": known,                     # {account: {ou_number, business_unit, …}}
     }
 
 
@@ -355,6 +407,24 @@ def available_ous(db: Session = Depends(get_db),
 
 # ── save a recipe (create account or add a format recipe under an existing one) ──
 
+class AccountAssignment(BaseModel):
+    """One account to onboard against the recipe being saved.
+
+    A COLUMN account-locator normally finds several accounts in one file. Each
+    needs its own BankAccount + OU (they can differ per account) but shares the
+    SAME recipe body, so the wizard sends one of these per discovered account and
+    builder_save writes N identical AccountConfigRecipe rows.
+    """
+    account_number: str
+    display_name: str
+    ou_number: str
+    business_unit: str
+    functional_currency: str | None = None
+    bank: str | None = None
+    currency: str | None = None
+    override_account_validation: bool = False
+
+
 class SaveRecipeRequest(BaseModel):
     account_number: str
     display_name: str
@@ -384,6 +454,16 @@ class SaveRecipeRequest(BaseModel):
     # "I confirm this is the real account number" checkbox for a rare
     # legitimately-unusual account.
     override_account_validation: bool = False
+    # MULTI-ACCOUNT FAN-OUT. When the account locator is a COLUMN, one file
+    # legitimately contains several accounts; configuring only one leaves the
+    # rest unrecognised (and, before detect_config started refusing such files,
+    # got their rows attributed to whichever account won first-fit). The wizard
+    # sends every discovered account here — same recipe body, own account
+    # number / display name / OU each — and all of them are written in ONE
+    # transaction. When omitted, the top-level account_number/display_name/
+    # ou_number/business_unit fields are used as a single assignment exactly as
+    # before, so existing callers are unaffected.
+    accounts: list[AccountAssignment] | None = None
     storage_key: str | None = None    # (unused for keying; kept for symmetry)
     # Best-effort author of this version, read from the login_user_email_stub
     # cookie by the wizard (this module's axios has no dev-user interceptor).
@@ -430,35 +510,45 @@ def _get_or_create_organization_unit(db: Session, ou_number: str, business_unit:
     return ou
 
 
-def _get_or_create_bank_account(db: Session, acct: str, body: "SaveRecipeRequest",
-                                  ou: OrganizationUnit) -> tuple[BankAccount, bool]:
-    """Returns (bank_account, created)."""
+def _get_or_create_bank_account(db: Session, acct: str, display_name: str, bank: str | None,
+                                  currency: str | None,
+                                  ou: OrganizationUnit) -> tuple[BankAccount, bool, str | None]:
+    """Returns (bank_account, created, previous_ou_number_if_reassigned).
+
+    The third element exists so a fan-out over several accounts can REPORT which
+    already-configured accounts had their OU changed by this save. Reassigning an
+    existing account's OU is legitimate (it's how a mis-mapped account gets
+    corrected) but doing it silently across N accounts at once is not.
+    """
     existing = (
         db.query(BankAccount)
-        .filter(BankAccount.account_number == acct, BankAccount.bank_name == (body.bank or "UNKNOWN"))
+        .filter(BankAccount.account_number == acct, BankAccount.bank_name == (bank or "UNKNOWN"))
         .first()
     )
     if existing:
-        existing.display_name = body.display_name
+        existing.display_name = display_name
         existing.account_last4 = last4(acct)
-        if body.currency:
-            existing.currency = body.currency
+        if currency:
+            existing.currency = currency
+        previous = None
         if existing.ou_id != ou.id:
+            prior = existing.organization_unit
+            previous = prior.ou_number if prior else None
             existing.ou_id = ou.id
-        return existing, False
+        return existing, False, previous
 
     account = BankAccount(
         ou_id=ou.id,
         account_number=acct,
         account_last4=last4(acct),
-        display_name=body.display_name,
-        bank_name=body.bank or "UNKNOWN",
+        display_name=display_name,
+        bank_name=bank or "UNKNOWN",
         bank_config_key=acct,
-        currency=body.currency,
+        currency=currency,
     )
     db.add(account)
     db.flush()
-    return account, True
+    return account, True, None
 
 
 @router.post("/builder/save")
@@ -467,27 +557,62 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
     """Save/attach a recipe. If the account exists, a new recipe version is added
     for the format; otherwise a new account is created — always linked to a real
     OrganizationUnit (OU + Business Unit), never saved without one."""
-    acct = str(body.account_number).strip()
-    if not acct:
-        raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED, detail="account number")
-    # Structural gate on the account identity — the fix for the config-corruption
-    # class of bug. A value that doesn't look like an account (label cell, no
-    # digits, too short/long) is refused unless the SPOC explicitly overrode it.
-    if not body.override_account_validation:
-        reason = account_reject_reason(acct)
-        if reason:
-            raise AppError(ErrorCode.CONFIG_RECIPE_INVALID, detail=reason)
-    if not body.display_name.strip():
-        raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED, detail="display name")
     fmt = _FMT_ALIASES.get(body.format.lower(), body.format.lower())
     if fmt not in ("xlsx", "xls", "csv", "pdf"):
         raise AppError(ErrorCode.CONFIG_FILE_TYPE_UNSUPPORTED, detail=f"'{body.format}' -- use xlsx, xls, csv, or pdf")
     if not body.recipe.get("account_locator"):
         raise AppError(ErrorCode.CONFIG_RECIPE_INVALID, detail="no account locator -- go back to the Account step")
-    if not body.ou_number.strip():
-        raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED, detail="Organization Unit")
-    if not body.business_unit.strip():
-        raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED, detail="Business Unit")
+
+    # One assignment per account to onboard. `accounts` is the multi-account
+    # fan-out; without it the top-level fields are a single assignment (the
+    # original behaviour).
+    if body.accounts:
+        assignments = list(body.accounts)
+    else:
+        assignments = [AccountAssignment(
+            account_number=body.account_number,
+            display_name=body.display_name,
+            ou_number=body.ou_number,
+            business_unit=body.business_unit,
+            functional_currency=body.functional_currency,
+            bank=body.bank,
+            currency=body.currency,
+            override_account_validation=body.override_account_validation,
+        )]
+
+    # Validate EVERY assignment before writing anything, so a bad entry at
+    # position 5 of 7 can't leave a half-configured file behind.
+    seen_accounts: set[str] = set()
+    for a in assignments:
+        a.account_number = str(a.account_number).strip()
+        if not a.account_number:
+            raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED, detail="account number")
+        # Structural gate on the account identity — the fix for the config-
+        # corruption class of bug. A value that doesn't look like an account
+        # (label cell, no digits, too short/long) is refused unless the SPOC
+        # explicitly overrode it. Applied per account: with a column locator the
+        # discovered set can include a "TOTAL" footer row, and letting one
+        # through would register junk as a real account identity.
+        if not a.override_account_validation:
+            reason = account_reject_reason(a.account_number)
+            if reason:
+                raise AppError(ErrorCode.CONFIG_RECIPE_INVALID, detail=reason)
+        if not (a.display_name or "").strip():
+            raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED,
+                           detail=f"display name for account {a.account_number}")
+        if not (a.ou_number or "").strip():
+            raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED,
+                           detail=f"Organization Unit for account {a.account_number}")
+        if not (a.business_unit or "").strip():
+            raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED,
+                           detail=f"Business Unit for account {a.account_number}")
+        mk = match_key(a.account_number)
+        if mk in seen_accounts:
+            raise AppError(ErrorCode.CONFIG_RECIPE_INVALID,
+                           detail=f"account {a.account_number} is listed twice")
+        seen_accounts.add(mk)
+
+    acct = assignments[0].account_number   # back-compat: the primary account
 
     # Standardize the account/statement currency to an ISO-4217 code (Fusion
     # requires it — see bank_statement/currency.py). Store the ISO on the
@@ -507,32 +632,79 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
     if body.functional_currency and body.functional_currency.strip():
         body.functional_currency = normalize_currency(body.functional_currency) or body.functional_currency
 
+    # Per-assignment currencies: fall back to the shared statement currency, and
+    # reject an unmappable one here rather than letting it reach the DB.
+    for a in assignments:
+        if a.currency and a.currency.strip():
+            iso = normalize_currency(a.currency)
+            if iso is None:
+                raise AppError(
+                    ErrorCode.CONFIG_RECIPE_INVALID,
+                    detail=f"Currency '{a.currency}' for account {a.account_number} isn't a recognised currency.",
+                )
+            a.currency = iso
+        else:
+            a.currency = body.currency
+        if a.functional_currency and a.functional_currency.strip():
+            a.functional_currency = normalize_currency(a.functional_currency) or a.functional_currency
+        if a.bank is None:
+            a.bank = body.bank
+
+    saved: list[dict] = []
+    ou_changed: list[dict] = []
     try:
-        ou = _get_or_create_organization_unit(db, body.ou_number, body.business_unit, body.functional_currency)
-        account, created = _get_or_create_bank_account(db, acct, body, ou)
+        # ONE transaction for every account — a failure part-way leaves nothing
+        # behind, so a multi-account file is never half-configured.
+        for a in assignments:
+            ou = _get_or_create_organization_unit(db, a.ou_number, a.business_unit, a.functional_currency)
+            account, created, previous_ou = _get_or_create_bank_account(
+                db, a.account_number, a.display_name, a.bank, a.currency, ou
+            )
+            if previous_ou is not None:
+                ou_changed.append({
+                    "account_number": a.account_number,
+                    "from_ou_number": previous_ou,
+                    "to_ou_number": ou.ou_number,
+                })
 
-        existing_versions = (
-            db.query(AccountConfigRecipe)
-            .filter(AccountConfigRecipe.bank_account_id == account.id, AccountConfigRecipe.format == fmt)
-            .all()
-        )
-        format_created = not existing_versions
-        next_version = max((v.version for v in existing_versions), default=0) + 1
+            existing_versions = (
+                db.query(AccountConfigRecipe)
+                .filter(AccountConfigRecipe.bank_account_id == account.id,
+                        AccountConfigRecipe.format == fmt)
+                .all()
+            )
+            format_created = not existing_versions
+            next_version = max((v.version for v in existing_versions), default=0) + 1
 
-        recipe_row = AccountConfigRecipe(
-            bank_account_id=account.id,
-            format=fmt,
-            version=next_version,
-            recipe=body.recipe,
-            created_by=(body.created_by or "").strip() or None,
-        )
-        db.add(recipe_row)
+            db.add(AccountConfigRecipe(
+                bank_account_id=account.id,
+                format=fmt,
+                version=next_version,
+                recipe=body.recipe,          # same recipe body for every account
+                created_by=(body.created_by or "").strip() or None,
+            ))
+            # Flush per account so the next iteration's version query sees this
+            # row — matters when the same account somehow appears twice, and
+            # keeps the id available for the audit entry.
+            db.flush()
 
-        action = "config.create" if (created or format_created) else "config.version_added"
-        log_activity(db, user, action=action, entity_type="AccountConfig",
-                     entity_id=acct,
-                     metadata={"display_name": body.display_name, "format": fmt, "version": next_version,
-                               "ou_number": ou.ou_number, "business_unit": ou.ou_name})
+            action = "config.create" if (created or format_created) else "config.version_added"
+            log_activity(db, user, action=action, entity_type="AccountConfig",
+                         entity_id=a.account_number,
+                         metadata={"display_name": a.display_name, "format": fmt,
+                                   "version": next_version, "ou_number": ou.ou_number,
+                                   "business_unit": ou.ou_name,
+                                   "batch_size": len(assignments)})
+
+            saved.append({
+                "account_number": a.account_number,
+                "display_name": a.display_name,
+                "created": created,
+                "format_created": format_created,
+                "version": next_version,
+                "ou_number": ou.ou_number,
+                "business_unit": ou.ou_name,
+            })
 
         db.commit()
     except AppError:
@@ -540,26 +712,38 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
         raise
     except Exception as e:
         db.rollback()
-        logger.exception("builder_save failed for account %s", acct)
+        logger.exception("builder_save failed for account(s) %s", [a.account_number for a in assignments])
         raise AppError(ErrorCode.CONFIG_SAVE_FAILED, detail=f"{e.__class__.__name__} -- nothing was changed")
 
-    if created:
-        message = f"Created account {acct} with {fmt} recipe (v1)."
-    elif format_created:
-        message = f"Added {fmt} recipe to account {acct} (v1)."
+    primary = saved[0]
+    if len(saved) > 1:
+        created_count = sum(1 for s in saved if s["created"])
+        message = (
+            f"Configured {len(saved)} accounts with the same {fmt} recipe "
+            f"({created_count} new, {len(saved) - created_count} updated)."
+        )
+    elif primary["created"]:
+        message = f"Created account {primary['account_number']} with {fmt} recipe (v1)."
+    elif primary["format_created"]:
+        message = f"Added {fmt} recipe to account {primary['account_number']} (v1)."
     else:
-        message = f"Added version {next_version} to {fmt} recipe for account {acct}."
+        message = (f"Added version {primary['version']} to {fmt} recipe for account "
+                   f"{primary['account_number']}.")
 
     return {
         "success": True,
-        "account_number": acct,
+        # Back-compat scalars describe the PRIMARY (first) account, so existing
+        # callers that ignore `saved` behave exactly as before.
+        "account_number": primary["account_number"],
         "format": fmt,
-        "created": created,
-        "format_created": format_created,
-        "appended": not created and not format_created,
-        "version": next_version,
-        "ou_number": ou.ou_number,
-        "business_unit": ou.ou_name,
+        "created": primary["created"],
+        "format_created": primary["format_created"],
+        "appended": not primary["created"] and not primary["format_created"],
+        "version": primary["version"],
+        "ou_number": primary["ou_number"],
+        "business_unit": primary["business_unit"],
+        "saved": saved,                 # one entry per configured account
+        "ou_changed": ou_changed,       # existing accounts whose OU this save moved
         "message": message,
     }
 

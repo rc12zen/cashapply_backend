@@ -16,8 +16,17 @@ Algorithm
 5. Resolve:
      • exactly one match ....................... use its recipe
      • many matches, all the same layout ....... first fit (multi-account file)
+     • matched, but the file also holds an
+       account with no config ................. INCOMPLETE_ACCOUNTS (must configure)
      • many matches, different layouts ......... AMBIGUOUS (user must choose)
      • zero matches ............................ UNKNOWN (→ wizard)
+
+INCOMPLETE_ACCOUNTS exists because a multi-account file is only safe to ingest
+when EVERY account in it is configured. Ingesting a partially-configured file
+would silently attribute the unconfigured accounts' rows to whichever account
+won first-fit. Junk tokens (a "TOTAL" footer row scanned by a column locator)
+are filtered out by account_validation.account_reject_reason() before this
+check, so they can never block a file.
 
 `config_key` is the matched account number. `detection.config` is the matched
 *recipe* (source/fields/credit_rule/… + display_name), which the parser consumes
@@ -34,7 +43,11 @@ from typing import Optional
 from .configs.account_loader import (  # noqa: F401
     load_account_configs, load_bank_ou_mapping, last4_index, active_recipe,
 )
-from .account_locator import extract_accounts, normalize_account, match_key
+from .account_locator import (
+    extract_account_groups, collapse_tokens, mixed_groups, alias_key,
+    normalize_account, match_key,
+)
+from .account_validation import account_reject_reason
 from .ou_resolver import resolve_ou
 
 logger = logging.getLogger("cashapply.ingestion.detector")
@@ -56,8 +69,14 @@ class DetectionResult:
     success:              bool           = False
     errors:               list           = field(default_factory=list)
     confidence:           int            = 0
-    reason:               Optional[str]  = None    # "UNKNOWN" | "AMBIGUOUS"
+    reason:               Optional[str]  = None    # "UNKNOWN" | "AMBIGUOUS" | "INCOMPLETE_ACCOUNTS"
     ambiguous_candidates: list           = field(default_factory=list)
+    # Accounts present in the file that have NO config for this format (junk
+    # tokens already filtered). Non-empty ⇒ reason == "INCOMPLETE_ACCOUNTS".
+    unregistered_accounts: list          = field(default_factory=list)
+    # Cells naming several accounts with no `account_aliases` entry to say which
+    # one is the receipt target, as ["41678876|41678884", …].
+    unresolved_mixed_cells: list         = field(default_factory=list)
     candidates:           list           = field(default_factory=list)
     suggestions:          list           = field(default_factory=list)
     trace:                list           = field(default_factory=list)
@@ -124,9 +143,22 @@ def _candidate(account: str, entry: dict, fmt: str) -> dict:
     }
 
 
+def _aliases(recipe: dict) -> dict:
+    """The recipe's mixed-cell → primary-account map (see account_locator)."""
+    a = recipe.get("account_aliases")
+    return a if isinstance(a, dict) else {}
+
+
 def _collect_matches(filepath: str, fmt: str):
-    """Return (matches, extracted_accounts).
-    matches = list of (account_number, entry, recipe) whose FULL account is in the file."""
+    """Return (matches, extracted_accounts, views, registered_keys).
+
+    matches       = list of (account_number, entry, recipe) whose FULL account is in the file
+    views[sig]    = {"accounts": set[str], "mixed": list[str]} — what ONE recipe's
+                    locator+aliases sees in this file. Per-recipe because two
+                    recipes can resolve the same mixed cell to different primaries.
+    registered_keys = match_key of every account that HAS a config for this format
+                    (the denominator for "is this file fully configured?").
+    """
     configs = load_account_configs()
     # recipes[fmt] is an append-only list of version objects; detection always uses
     # the ACTIVE (latest) version. A format counts as present only when its version
@@ -141,22 +173,42 @@ def _collect_matches(filepath: str, fmt: str):
         filepath, fmt, len(candidates), fmt, [c[0] for c in candidates],
     )
     if not candidates:
-        return [], set()
+        return [], set(), {}, set()
 
     # Extract once per distinct (locator, source) — many configs share a layout.
-    extract_cache: dict[str, set] = {}
+    # Groups (per-cell tokens) are alias-independent, so they cache on that sig;
+    # the alias collapse is then applied per recipe below.
+    group_cache: dict[str, list[list[str]]] = {}
     for _acct, _entry, recipe in candidates:
         sig = _extract_sig(recipe)
-        if sig not in extract_cache:
-            extract_cache[sig] = extract_accounts(
+        if sig not in group_cache:
+            group_cache[sig] = extract_account_groups(
                 filepath, recipe.get("account_locator", {}), recipe.get("source", {})
             )
 
-    all_extracted: set = set().union(*extract_cache.values()) if extract_cache else set()
+    views: dict[str, dict] = {}
+    for _acct, _entry, recipe in candidates:
+        sig = _extract_sig(recipe)
+        if sig in views:
+            continue
+        aliases = _aliases(recipe)
+        groups = group_cache[sig]
+        accounts: set[str] = set()
+        for g in groups:
+            accounts.update(collapse_tokens(g, aliases))
+        # A mixed cell is "unresolved" only when the alias map doesn't say which
+        # of its accounts is the receipt target.
+        unresolved = [alias_key(g) for g in mixed_groups(groups)
+                      if not aliases.get(alias_key(g))]
+        views[sig] = {"accounts": accounts, "mixed": unresolved}
+
+    all_extracted: set = set().union(*(v["accounts"] for v in views.values())) if views else set()
+    registered_keys = {match_key(e.get("account_number", a)) for a, e, _ in candidates}
+    registered_keys.discard("")
 
     matches = []
     for acct, entry, recipe in candidates:
-        extracted_keys = {match_key(x) for x in extract_cache[_extract_sig(recipe)]}
+        extracted_keys = {match_key(x) for x in views[_extract_sig(recipe)]["accounts"]}
         registered_value = entry.get("account_number", acct)
         ckey = match_key(registered_value)
         is_match = bool(ckey and ckey in extracted_keys)
@@ -172,7 +224,7 @@ def _collect_matches(filepath: str, fmt: str):
         logger.info(
             "[detect]   candidate acct=%r registered_account_number=%r -> match_key=%r | "
             "this_recipe's_locator_extracted=%s (match_keys=%s) | MATCHED=%s",
-            acct, registered_value, ckey, sorted(extract_cache[_extract_sig(recipe)]),
+            acct, registered_value, ckey, sorted(views[_extract_sig(recipe)]["accounts"]),
             sorted(extracted_keys), is_match,
         )
         if is_match:
@@ -182,7 +234,7 @@ def _collect_matches(filepath: str, fmt: str):
         "[detect] file=%r format=%r -- RESULT: %d match(es) out of %d candidate(s): %s",
         filepath, fmt, len(matches), len(candidates), [m[0] for m in matches],
     )
-    return matches, all_extracted
+    return matches, all_extracted, views, registered_keys
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +247,7 @@ def detect_config(filepath: str) -> DetectionResult:
     result.file_format = fmt
 
     try:
-        matches, extracted = _collect_matches(filepath, fmt)
+        matches, extracted, views, registered_keys = _collect_matches(filepath, fmt)
     except Exception as e:
         logger.exception("[detect] detect_config RAISED for file=%r", filepath)
         result.errors.append(str(e))
@@ -237,6 +289,45 @@ def detect_config(filepath: str) -> DetectionResult:
     # ── Single match, or several accounts sharing one layout (multi-account) ──
     if len(matches) == 1 or len(layouts) == 1:
         acct, entry, recipe = matches[0]     # first fit
+        view = views.get(_extract_sig(recipe), {"accounts": set(), "mixed": []})
+
+        # A multi-account file is only safe to ingest when EVERY account in it is
+        # configured — otherwise the unconfigured accounts' rows get attributed to
+        # whichever account won first-fit. Junk tokens (a "TOTAL" footer row picked
+        # up by a column locator) are filtered here, so they can never block a
+        # file; without that filter this check would be a permanent dead end.
+        unregistered = sorted(
+            a for a in view["accounts"]
+            if match_key(a) not in registered_keys and not account_reject_reason(a)
+        )
+        unresolved_mixed = list(view["mixed"])
+        if unregistered or unresolved_mixed:
+            result.reason  = "INCOMPLETE_ACCOUNTS"
+            result.success = False
+            result.unregistered_accounts  = unregistered
+            result.unresolved_mixed_cells = unresolved_mixed
+            # Keep the matched recipe/account on the result: the UI needs it to
+            # offer "add these accounts to this existing config".
+            result.config_key     = acct
+            result.config         = _recipe_config(recipe, entry)
+            result.account_number = normalize_account(entry.get("account_number", acct))
+            result.candidates     = [_candidate(a, e, fmt) for a, e, _ in matches]
+            bits = []
+            if unregistered:
+                bits.append(f"{len(unregistered)} account(s) with no '{fmt}' config: "
+                            f"{', '.join(unregistered[:5])}")
+            if unresolved_mixed:
+                bits.append(f"{len(unresolved_mixed)} cell(s) naming several accounts with no "
+                            f"primary chosen: {', '.join(unresolved_mixed[:5])}")
+            result.method_detail = "; ".join(bits)
+            logger.warning(
+                "[detect] file=%r -> INCOMPLETE_ACCOUNTS: matched config_key=%r but "
+                "unregistered=%s unresolved_mixed=%s -- ingestion blocked until every "
+                "account in this file is configured.",
+                filepath, acct, unregistered, unresolved_mixed,
+            )
+            return result
+
         result.success       = True
         result.config_key    = acct
         result.config        = _recipe_config(recipe, entry)
@@ -280,7 +371,7 @@ def list_matching_configs(filepath: str) -> list[dict]:
     """Every account config whose full account appears in the file (for the picker)."""
     fmt = file_format(filepath)
     try:
-        matches, _ = _collect_matches(filepath, fmt)
+        matches, _extracted, _views, _registered = _collect_matches(filepath, fmt)
     except Exception:
         return []
     return [_candidate(a, e, fmt) for a, e, _ in matches]

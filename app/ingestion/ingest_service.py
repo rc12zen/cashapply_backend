@@ -56,6 +56,37 @@ class OUNotMappedError(Exception):
         )
 
 
+def _incomplete_accounts_message(detection) -> str:
+    """User-facing reason a fully-recognised file is still refused.
+
+    A multi-account statement is only safe to ingest when EVERY account in it is
+    configured — otherwise the unconfigured accounts' rows are attributed to
+    whichever account won first-fit in the detector. Names the exact accounts so
+    the fix is a Config Builder round-trip, not a guess.
+    """
+    parts = []
+    missing = list(getattr(detection, "unregistered_accounts", None) or [])
+    mixed = list(getattr(detection, "unresolved_mixed_cells", None) or [])
+    if missing:
+        shown = ", ".join(missing[:5])
+        more = f" (and {len(missing) - 5} more)" if len(missing) > 5 else ""
+        parts.append(
+            f"This statement contains {len(missing)} account(s) with no configuration yet: "
+            f"{shown}{more}. Add them on the Config tab — you can reuse this file's existing "
+            f"recipe and just set each account's Organization Unit."
+        )
+    if mixed:
+        shown = ", ".join(mixed[:5])
+        parts.append(
+            f"{len(mixed)} cell(s) name more than one account ({shown}) without a primary "
+            f"account chosen. Open the config's Account step and pick which account each of "
+            f"those should be applied to."
+        )
+    return " ".join(parts) or (
+        "This statement contains accounts that are not configured yet — add them on the Config tab."
+    )
+
+
 def _get_or_create_bank_account(db: Session, account_number: str | None, bank_name: str | None,
                                   ou_number: str | None, currency: str | None) -> BankAccount | None:
     if not account_number:
@@ -269,6 +300,10 @@ def handle_statement_upload_v2(db: Session, filename: str, data: bytes, uploaded
     warning = None
     if is_ambiguous:
         warning = "Multiple configs match this file — choose the correct one."
+    elif detection.reason == "INCOMPLETE_ACCOUNTS":
+        # Recognised, but not every account in it is configured — a distinct
+        # (and actionable) state from "we don't know this format at all".
+        warning = _incomplete_accounts_message(detection)
     elif not detection.success:
         warning = "Bank format not auto-detected — manual config required."
 
@@ -319,7 +354,13 @@ def ingest_and_parse(db: Session, source_file_id: int) -> dict:
                 source_file_id, record.filename,
             )
             record.ingest_status = "unrecognized"
-            record.ingest_error = "No matching account configuration found for this statement — configure this account to enable ingestion."
+            if detection.reason == "INCOMPLETE_ACCOUNTS":
+                # The format IS recognised — we're refusing because some account
+                # in the file has no config, which would otherwise get its rows
+                # silently attributed to the first-fit account.
+                record.ingest_error = _incomplete_accounts_message(detection)
+            else:
+                record.ingest_error = "No matching account configuration found for this statement — configure this account to enable ingestion."
             db.commit()
             return {"error": record.ingest_error}
 
@@ -333,7 +374,23 @@ def ingest_and_parse(db: Session, source_file_id: int) -> dict:
         # already re-resolves it fresh on every call but nothing was reading
         # that fresh value back out. Prefer it; fall back to the stored
         # value only if this call's own detection didn't produce one.
-        resolved_ou_number = (detection.ou_info or {}).get("ou_number") or record.ou_number
+        #
+        # PATCH 2 (F2 — cross-account OU contamination): detection.ou_info
+        # describes the FIRST-FIT account only (detector.py picks matches[0]
+        # when several accounts share one layout). Pairing it with row 0's
+        # account number below meant a multi-account file could hand account
+        # B's BankAccount row account A's OU — and _get_or_create_bank_account's
+        # self-heal branch then OVERWRITES a correct ou_id with the wrong one,
+        # a persistent DB mutation, not just a bad read. The parser already
+        # resolves each row's OU from that row's OWN account (parser.py's
+        # step 5f) and nothing was reading it back; prefer it. Reliable now
+        # that detect_config refuses files containing unconfigured accounts,
+        # so row 0's account is always registered and therefore resolvable.
+        resolved_ou_number = (
+            (raw_rows[0].ou_number if raw_rows else None)
+            or (detection.ou_info or {}).get("ou_number")
+            or record.ou_number
+        )
 
         bank_account = _get_or_create_bank_account(
             db,
