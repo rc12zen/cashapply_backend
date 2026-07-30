@@ -101,6 +101,21 @@ class AnalysisRun(Base):
     # ── Auth/RBAC integration (additive) ──────────────────────────────────────
     triggered_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
+    # PATCH: which aging report SourceFile was ACTIVE at the moment this run
+    # started — set once in run_routes.start_run() and never touched again.
+    # Lets Analysis History show "the aging report this run actually matched
+    # against" even after a newer aging report has since been loaded and
+    # become the active one (see bff/config_routes.py's aging-preview /
+    # aging-download, which now accept an optional source_file_id to read
+    # this historical snapshot instead of always reading "active").
+    # Nullable because existing rows predate this column and runs started
+    # before any aging report was ever uploaded have nothing to point at.
+    # NOTE: Base.metadata.create_all() only creates missing TABLES, not
+    # missing COLUMNS -- an already-deployed DB needs a one-off
+    # `ALTER TABLE analysis_runs ADD COLUMN aging_source_file_id INTEGER`
+    # (or equivalent) applied manually before this ships to that environment.
+    aging_source_file_id = Column(Integer, ForeignKey("source_files.id"), nullable=True)
+
     line_items = relationship("LineItem", back_populates="run")
 
 

@@ -39,7 +39,7 @@ import datetime as dt
 
 from sqlalchemy.orm import Session
 
-from ..db.models import AnalysisRun, LineItem, RowStatusHistory
+from ..db.models import AnalysisRun, LineItem, RowStatusHistory, SourceFile
 from ..aging import aging_store
 from ..rule_engine.fx_service import _STATIC_RATE_MAP
 from .date_range import parse_date_from, parse_date_to
@@ -374,6 +374,18 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
             total_ready_for_oracle += 1
     total_identified = len(rows) - total_unidentified
 
+    # PATCH: the aging report snapshot this run actually matched against —
+    # captured once at run-start (AnalysisRun.aging_source_file_id) since the
+    # active aging report can be replaced by a newer upload afterwards. None
+    # for runs that predate this column, or that ran before any aging report
+    # was ever uploaded. Filename resolved here (not stored on the run row
+    # itself) so a rename/re-upload history stays a single source of truth
+    # in source_files.
+    aging_source_filename = None
+    if run.aging_source_file_id is not None:
+        aging_source = db.query(SourceFile).filter(SourceFile.id == run.aging_source_file_id).first()
+        aging_source_filename = aging_source.filename if aging_source else None
+
     return {
         "run_id": run.run_id,
         "started_at": run.started_at.isoformat() if run.started_at else None,
@@ -383,6 +395,8 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
         "bank_names": sorted({r.bank_name for r in rows if r.bank_name}),
         "business_units": sorted({r.business_unit for r in rows if r.business_unit}),
         "total_credit_rows": len(rows),
+        "aging_source_file_id": run.aging_source_file_id,
+        "aging_source_filename": aging_source_filename,
         # ── New taxonomy — what the Analysis History table now shows ────────
         "total_identified": total_identified,
         "total_unidentified": total_unidentified,

@@ -380,12 +380,25 @@ def start_run(payload: dict, request: Request, db: Session = Depends(get_db),
     if existing_running:
         raise AppError(ErrorCode.RUN_ALREADY_IN_PROGRESS)
 
+    # PATCH: snapshot which aging report is active RIGHT NOW, so Analysis
+    # History can later show "the aging report this run actually matched
+    # against" even after a newer one has since replaced it as active (see
+    # AnalysisRun.aging_source_file_id's comment in db/models.py). Read-only
+    # lookup — does not touch aging_store or the in-memory AgingMap.
+    active_aging = (
+        db.query(SourceFile)
+        .filter(SourceFile.kind == "aging_report", SourceFile.archived.is_(False))
+        .order_by(SourceFile.uploaded_at.desc())
+        .first()
+    )
+
     run = AnalysisRun(
         status=RunStatus.RUNNING,
         started_at=dt.datetime.utcnow(),
         selected_files=selected_files,
         triggered_by=user.email,
         triggered_by_user_id=user.id,
+        aging_source_file_id=active_aging.id if active_aging else None,
     )
     db.add(run)
     db.commit()

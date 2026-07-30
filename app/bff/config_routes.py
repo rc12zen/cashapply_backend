@@ -19,9 +19,10 @@ frontend changes required for this swap.
 from __future__ import annotations
 
 import io
-import zipfile
+import mimetypes
 
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from ..db.models import AppConfig, SourceFile, User
@@ -204,30 +205,43 @@ def select_aging_source(source_file_id: int, db: Session = Depends(get_db),
 
 
 @router.get("/aging-preview")
-def aging_preview(max_rows: int = 200, db: Session = Depends(get_db),
+def aging_preview(max_rows: int = 200, source_file_id: int | None = None,
+                   db: Session = Depends(get_db),
                    user: User = Depends(require_permission("run:view"))):
-    # Unchanged — reads the Excel file directly from storage, never touched
-    # the AgingInvoice table.
-    return preview_aging_file(db, max_rows)
+    # Reads the Excel file directly from storage, never touches the
+    # AgingInvoice table. PATCH: source_file_id lets a caller preview a
+    # specific historical aging snapshot (e.g. "the one a past run matched
+    # against") instead of always the currently active one.
+    return preview_aging_file(db, max_rows, source_file_id=source_file_id)
 
 
 @router.get("/aging-download")
-def aging_download(db: Session = Depends(get_db),
+def aging_download(source_file_id: int | None = None, db: Session = Depends(get_db),
                     user: User = Depends(require_permission("run:view"))):
-    result = load_active_aging_file(db)
+    """
+    PATCH: used to wrap the aging file in an ad-hoc zip before sending it.
+    A .xlsx is already a zip container internally, so a zip-of-a-zip opened
+    directly (e.g. dropped straight into OneDrive/Excel Online without
+    extracting first) fails with Excel's "file format may not be matching
+    with the file extension" error -- Excel parses the OUTER zip fine, finds
+    none of the OOXML parts it expects inside, and bails. See
+    storage_routes.py's download_file() for the pattern this now matches:
+    stream the real file with its own name/content-type, no wrapper.
+
+    PATCH: also accepts source_file_id, same reasoning as aging_preview above.
+    """
+    result = load_active_aging_file(db, source_file_id=source_file_id)
     if not result:
         raise AppError(ErrorCode.STORAGE_FILE_NOT_FOUND)
     filename, data = result
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr(filename, data)
-    zip_name = filename.rsplit(".", 1)[0] + ".zip"
+    content_type, _ = mimetypes.guess_type(filename)
+    content_type = content_type or "application/octet-stream"
 
-    return Response(
-        content=buf.getvalue(),
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type=content_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
