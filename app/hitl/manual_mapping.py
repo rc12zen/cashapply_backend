@@ -51,15 +51,70 @@ from sqlalchemy.orm import Session
 from ..db.models import LineItem, RowStatusHistory, User
 from ..aging import aging_store
 from ..rule_engine.evaluator import DEFAULT_SHORT_PAYMENT_TOLERANCE_PCT
+from ..rule_engine.fx_service import FxService
 
 
-def _received_total(r: LineItem) -> float:
-    """Same Leg-1 conversion the automatic engine uses — credited amount
-    converted into invoice currency, if cross-currency."""
+def _received_total(r: LineItem, selected_currency: str | None) -> tuple[float | None, dict]:
+    """
+    Converts the credited amount into the currency of the invoice(s) the
+    SPOC ACTUALLY SELECTED — not r.invoice_currency / r.is_cross_currency,
+    which were frozen at analysis time against whatever (if anything) the
+    AUTOMATIC extraction guessed.
+
+    PATCH (root cause of a real bug): orchestrator.py's
+    _resolve_invoice_currency() falls back to "same as credited" whenever
+    NO invoice was auto-matched:
+        invoice_currency = _resolve_invoice_currency(...) or credited_currency
+    That is exactly the needs_remittance / unidentified / conflict_exception
+    case this manual-mapping flow exists for — meaning r.is_cross_currency
+    is very often already False on these rows, NOT because the payment is
+    genuinely same-currency, but because nothing was resolved yet when that
+    flag was set. If a SPOC then manually picks a REAL invoice in a
+    genuinely different currency (e.g. invoice is USD, credited was INR),
+    the old code silently reused that stale False flag, skipped conversion
+    entirely, and compared raw INR against raw USD as if they were the same
+    unit — producing nonsensical shortfall/overpayment percentages (a
+    huge, wrong number, not a real business result).
+
+    Fix: ignore the cached fields entirely here. Look at the REAL currency
+    of what was actually selected (selected_currency, passed in by the
+    caller after confirming every selected invoice shares one currency),
+    and resolve a FRESH rate via FxService if it differs from credited
+    currency — same service, same priority order (gl_daily_rates table,
+    then static fallback) the automatic engine itself uses for Leg 1.
+
+    Returns (received_total_or_None, fx_info). received_total is None only
+    when conversion was NEEDED but no rate could be resolved — callers
+    MUST treat that as "cannot compare, do not classify" rather than
+    falling back to an unconverted number. fx_info carries
+    {"is_cross_currency", "credited_currency", "selected_currency",
+    "fx_rate", "fx_rate_source"} for both the qualifies/preview payload and
+    the row-detail audit trail.
+    """
     credit_amount = float(r.credit_amount or 0)
-    if r.is_cross_currency and r.fx_credit_to_invoice:
-        return round(credit_amount * float(r.fx_credit_to_invoice), 2)
-    return credit_amount
+    credited_currency = (r.statement_currency or "").upper().strip()
+    selected_currency = (selected_currency or "").upper().strip()
+
+    fx_info = {
+        "is_cross_currency": False,
+        "credited_currency": credited_currency or None,
+        "selected_currency": selected_currency or None,
+        "fx_rate": None,
+        "fx_rate_source": None,
+    }
+
+    if not selected_currency or not credited_currency or selected_currency == credited_currency:
+        return credit_amount, fx_info
+
+    fx_info["is_cross_currency"] = True
+    fx = FxService()
+    rate, source = fx.get_rate_with_source(credited_currency, selected_currency, r.statement_date)
+    if not rate:
+        return None, fx_info
+
+    fx_info["fx_rate"] = rate
+    fx_info["fx_rate_source"] = source
+    return round(credit_amount * rate, 2), fx_info
 
 
 def _serialize_invoice(v) -> dict:
@@ -141,17 +196,61 @@ def _classify(r: LineItem, selected: list[dict]) -> dict:
     same tolerance, same rule IDs) — see that file for the canonical
     version. `selected` amounts always come from the aging report, never
     SPOC-typed.
+
+    PATCH: two real gaps fixed here —
+      1. Selected invoices are now required to share ONE currency before
+         being summed together (mirrors the existing same-customer check
+         just above this call) — previously nothing stopped a SPOC
+         selecting invoices in different currencies and having their raw
+         outstanding_amounts summed as if they were the same unit.
+      2. received_total is now converted into the REAL selected invoice
+         currency via a fresh FX lookup (_received_total), not the stale
+         analysis-time is_cross_currency/fx_credit_to_invoice fields — see
+         that function's docstring for the exact bug this fixes. If the
+         rate can't be resolved, this returns a clear FX_RATE_MISSING
+         result instead of silently comparing unconverted amounts.
     """
+    selected_currencies = {(v.get("currency") or "").upper().strip() for v in selected if v.get("currency")}
+    if len(selected_currencies) > 1:
+        return {
+            "error": (
+                f"Selected invoices are in different currencies ({', '.join(sorted(selected_currencies))}) — "
+                f"select invoices in a single currency only."
+            ),
+        }
+    selected_currency = next(iter(selected_currencies), None)
+
     target_total = round(sum(v["outstanding_amount"] for v in selected), 2)
-    received_total = _received_total(r)
+    received_total, fx_info = _received_total(r, selected_currency)
+
+    if received_total is None:
+        # Cross-currency but no rate resolved -- mirrors evaluator.py's R13
+        # FX_RATE_MISSING. Do NOT fall through and compare raw amounts in
+        # different currencies as if they were equal.
+        return {
+            "target_total": target_total, "received_total": None, "shortfall_pct": None,
+            "qualifies": False, "tag": None, "rule_id": "R13", "reason_code": "FX_RATE_MISSING",
+            "fx_info": fx_info,
+            "message": (
+                f"Credited in {fx_info['credited_currency']}, selected invoice(s) are in "
+                f"{fx_info['selected_currency']} — FX rate could not be resolved. "
+                f"A rate must be available (GL daily rates or static fallback) before this "
+                f"selection can be evaluated."
+            ),
+        }
+
     shortfall_pct = 0.0 if target_total == 0 else round((target_total - received_total) / target_total * 100, 2)
 
-    base = {"target_total": target_total, "received_total": received_total, "shortfall_pct": shortfall_pct}
+    base = {
+        "target_total": target_total, "received_total": received_total, "shortfall_pct": shortfall_pct,
+        "fx_info": fx_info,
+    }
 
     if shortfall_pct < 0:
         return {
             **base, "qualifies": False, "tag": None, "rule_id": "R11", "reason_code": "OVERPAYMENT_UNEXPLAINED",
-            "message": f"Overpayment — received {received_total} exceeds selected invoice total {target_total}. "
+            "message": f"Overpayment — received {received_total} {fx_info['selected_currency'] or ''} exceeds "
+                       f"selected invoice total {target_total} {fx_info['selected_currency'] or ''}. "
                        f"Does not qualify for one-click posting; this needs SPOC review as a conflict/exception.",
         }
 
@@ -259,6 +358,7 @@ def confirm_manual_mapping(
         return {"error": preview["message"], "qualifies": False}
 
     selected = preview["matched_invoices_preview"]
+    fx_info = preview.get("fx_info") or {}
     from_state = r.current_state
 
     r.matched_invoices = [{**v, "stated_amount": v["outstanding_amount"]} for v in selected]
@@ -270,12 +370,26 @@ def confirm_manual_mapping(
     r.current_state  = "review_approve"  # same state automatic ready_for_oracle rows sit in, awaiting Approve
     r.status         = "Ready for Oracle (Manual Mapping)"
 
-    # PATCH: persistent record that THIS row's current mapping came from a
-    # SPOC, not automatic extraction — see the LineItem.manually_mapped
-    # field comment in db/models.py for why this matters (previously the
-    # only trace was a RowStatusHistory log entry, unreadable by the
-    # row-detail page, which is why the Manual Mapping card couldn't tell
-    # "already mapped" apart from "needs mapping").
+    # PATCH: the row's own currency/FX fields were frozen at analysis time
+    # against whatever (if anything) automatic extraction guessed -- often
+    # wrong for exactly the rows this flow exists for (see
+    # _received_total()'s docstring). Overwrite them with the REAL
+    # selected-invoice currency and the freshly-resolved rate, so
+    # oracle/fusion_client.py's build_receipt_creation_payload() -- which
+    # reads these exact fields -- sends the correct Currency/ConversionRate
+    # to Oracle instead of silently reusing the stale, pre-mapping values.
+    if fx_info.get("selected_currency"):
+        r.invoice_currency = fx_info["selected_currency"]
+    r.is_cross_currency = bool(fx_info.get("is_cross_currency"))
+    r.fx_credit_to_invoice = fx_info.get("fx_rate")
+    r.fx_credit_to_invoice_source = fx_info.get("fx_rate_source")
+
+    # PATCH: this used to be a persistent record that THIS row's current
+    # mapping came from a SPOC, not automatic extraction — see the
+    # LineItem.manually_mapped field comment in db/models.py for why this
+    # matters (previously the only trace was a RowStatusHistory log entry,
+    # unreadable by the row-detail page, which is why the Manual Mapping
+    # card couldn't tell "already mapped" apart from "needs mapping").
     r.manually_mapped    = True
     r.manually_mapped_at = dt.datetime.utcnow()
     r.manually_mapped_by = user.email if user else None

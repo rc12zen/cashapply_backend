@@ -115,7 +115,20 @@ def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str
         "invoice_number": m["invoice_number"],
         "customer_name": m["customer_name"],
         "outstanding_amount": m["outstanding_amount"],
-        "currency": r.statement_currency,
+        # PATCH: this used to unconditionally show r.statement_currency
+        # (the CREDITED currency) for every invoice here -- wrong whenever
+        # the invoice's own currency differs from what was credited (e.g.
+        # invoice raised in USD, payment credited in INR) -- confirmed as a
+        # real bug, not a display nuance. Automatic matching stores the
+        # invoice's real currency under the key "invoice_currency" (see
+        # rule_engine/state_machine.py's apply_transition()); manual
+        # mapping stores it under "currency" (see
+        # hitl/manual_mapping.py's _serialize_invoice()) -- two different
+        # key names for the same field depending on which path produced
+        # this entry. Check both before ever falling back to the credited
+        # currency, which should only happen for stale rows that predate
+        # this fix and never had either key populated.
+        "currency": m.get("invoice_currency") or m.get("currency") or r.statement_currency,
         "ou_number": m["ou_number"],
         # Oracle's own "NAME(ou)" display string for the invoice's OU — e.g.
         # "DALLAS(205)" — so cross-OU exceptions can show WHICH entity the

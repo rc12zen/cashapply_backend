@@ -51,7 +51,7 @@ from ..hitl import (
     preview_manual_mapping, confirm_manual_mapping,
 )
 from ..rule_engine.remittance_recheck import recheck_needs_remittance_rows
-from ..rule_engine.customer_name_correction import correct_customer_name
+from ..rule_engine.customer_name_correction import correct_customer_name, get_customer_name_options
 
 router = APIRouter()
 
@@ -284,6 +284,23 @@ def recheck_remittance(id: int, request: Request, db: Session = Depends(get_db),
     return row_result or {"id": id, "changed": False, "reason": "No result produced."}
 
 
+@router.get("/{id}/customer-name-options")
+def customer_name_options_route(id: int, db: Session = Depends(get_db),
+                                  user: User = Depends(require_permission("hitl:map"))):
+    """
+    Real candidate customer names for correcting this row's AI-identified
+    customer — same aging-report-backed pick-list pattern as manual
+    invoice mapping's /mapping-options, so the frontend can offer a
+    searchable list instead of a free-text box. See
+    rule_engine/customer_name_correction.py's get_customer_name_options()
+    for the exact source (aging_map.customers_for_ou()).
+    """
+    result = get_customer_name_options(db, id)
+    if result.get("error"):
+        raise AppError(ErrorCode.CUSTOMER_NAME_CORRECTION_FAILED, detail=result["error"])
+    return result
+
+
 @router.post("/{id}/correct-customer-name")
 def correct_customer_name_route(id: int, payload: dict, request: Request, db: Session = Depends(get_db),
                                   user: User = Depends(require_permission("hitl:map"))):
@@ -297,6 +314,11 @@ def correct_customer_name_route(id: int, payload: dict, request: Request, db: Se
     rule_engine/customer_name_correction.py for the full mechanics and the
     guard against correcting an already-finalized (approved/rejected/
     manually-mapped) row.
+
+    PATCH: `customer_name` in the payload must now be a REAL name from the
+    aging report (see get_customer_name_options() above / the
+    /customer-name-options route) — validated server-side regardless of
+    what the frontend sends, not just a UI restriction.
     """
     corrected_name = (payload.get("customer_name") or "").strip()
     result = correct_customer_name(db, id, corrected_name, corrected_by=user.email)
