@@ -87,6 +87,12 @@ def get_files(db: Session = Depends(get_db), user: User = Depends(require_permis
         out.append({
             "filename": r.filename,
             "bank_name": r.bank_config_key or "Unknown",
+            # Raw matched-config key. Set even when ingest_status="unrecognized"
+            # if the FORMAT was recognised and we refused only because some
+            # account in the file has no config (detector's INCOMPLETE_ACCOUNTS)
+            # — that's how the UI tells "add the missing account" apart from
+            # "this format is unknown".
+            "bank_config_key": r.bank_config_key,
             "size_mb": size_mb,
             "bank_account_id": r.bank_account_id,
             "business_unit": r.business_unit or "",
@@ -125,35 +131,62 @@ def get_pending_by_account(db: Session = Depends(get_db), user: User = Depends(r
         .all()
     )
 
+    # Accounts each file's ROWS were actually attributed to. A file whose
+    # account_locator is a COLUMN holds several accounts, so grouping by
+    # SourceFile.bank_account_id (the primary only) showed a multi-account
+    # statement as if it were a single-account one — hiding the other accounts and
+    # their Business Units from the Confirm Run dialog, which exists specifically
+    # so a wrong BU is caught before Oracle rejects every receipt for it.
+    accounts_by_file: dict[int, set[int]] = {}
+    if files:
+        for fid, aid in (
+            db.query(StatementTransactionRow.source_file_id, StatementTransactionRow.bank_account_id)
+            .filter(StatementTransactionRow.source_file_id.in_([f.id for f in files]))
+            .distinct().all()
+        ):
+            if aid is not None:
+                accounts_by_file.setdefault(fid, set()).add(aid)
+
     groups: dict[int | None, dict] = {}
     for f in files:
-        key = f.bank_account_id
-        if key not in groups:
-            account = db.query(BankAccount).get(key) if key is not None else None
-            # Prefer the account's CURRENT OU mapping (BankAccount.ou_id ->
-            # OrganizationUnit) — the authoritative source the run itself
-            # resolves against. f.business_unit / f.ou_number are only a snapshot
-            # taken at UPLOAD time (ingest_service), so a file ingested before
-            # its account's OU was set up (or before it was fixed on the
-            # Accounts & OU's page) would otherwise show a stale "No Business
-            # Unit" here even though the account is now mapped correctly.
-            ou = account.organization_unit if account else None
-            groups[key] = {
-                "bank_account_id": key,
-                "account_number": account.account_number if account else None,
-                "bank_name": (account.bank_name if account else None) or f.bank_config_key or "Unknown",
-                "business_unit": (ou.ou_name if ou else None) or f.business_unit or "",
-                "ou_number": (ou.ou_number if ou else None) or f.ou_number or "",
-                "files": [],
-                "pending_row_count": 0,
-            }
-        groups[key]["files"].append({
-            "filename": f.filename,
-            "source_file_id": f.id,
-            "ingest_status": f.ingest_status,
-            "new_row_count": f.new_row_count,
-        })
+        # One entry per account in the file; falls back to the file-level account
+        # for files with no rows yet (still ingesting / unrecognised).
+        for key in sorted(accounts_by_file.get(f.id) or {f.bank_account_id},
+                          key=lambda k: (k is None, k)):
+            _add_file_to_group(db, groups, key, f)
 
+    return _finalize_pending_groups(db, groups)
+
+
+def _add_file_to_group(db: Session, groups: dict, key: int | None, f: SourceFile) -> None:
+    if key not in groups:
+        account = db.query(BankAccount).get(key) if key is not None else None
+        # Prefer the account's CURRENT OU mapping (BankAccount.ou_id ->
+        # OrganizationUnit) — the authoritative source the run itself
+        # resolves against. f.business_unit / f.ou_number are only a snapshot
+        # taken at UPLOAD time (ingest_service), so a file ingested before
+        # its account's OU was set up (or before it was fixed on the
+        # Accounts & OU's page) would otherwise show a stale "No Business
+        # Unit" here even though the account is now mapped correctly.
+        ou = account.organization_unit if account else None
+        groups[key] = {
+            "bank_account_id": key,
+            "account_number": account.account_number if account else None,
+            "bank_name": (account.bank_name if account else None) or f.bank_config_key or "Unknown",
+            "business_unit": (ou.ou_name if ou else None) or f.business_unit or "",
+            "ou_number": (ou.ou_number if ou else None) or f.ou_number or "",
+            "files": [],
+            "pending_row_count": 0,
+        }
+    groups[key]["files"].append({
+        "filename": f.filename,
+        "source_file_id": f.id,
+        "ingest_status": f.ingest_status,
+        "new_row_count": f.new_row_count,
+    })
+
+
+def _finalize_pending_groups(db: Session, groups: dict) -> dict:
     for key, group in groups.items():
         if key is not None:
             group["pending_row_count"] = (

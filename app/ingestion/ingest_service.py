@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from ..db.models import BankAccount, OrganizationUnit, SourceFile, StatementTransactionRow, User
 from ..storage.client import get_storage_client
 from ..bank_statement.detector import detect_config, list_matching_configs
+from ..bank_statement.account_locator import match_key
 from ..bank_statement.parser import parse_credit_rows
 from ..audit.service import log_activity
 from .file_hash import check_duplicate_file, compute_file_hash, record_file_hash
@@ -54,6 +55,38 @@ class OUNotMappedError(Exception):
             f"Go to the Config tab and set its Organization Unit and Business Unit, "
             f"then re-upload or reprocess this statement."
         )
+
+
+def _incomplete_accounts_message(detection) -> str:
+    """User-facing reason a fully-recognised file is still refused.
+
+    Only reachable when the statement's rows span several accounts (a per-row
+    account COLUMN) and some of them have no config — those rows would otherwise
+    be attributed to whichever account won first-fit in the detector. Names the
+    exact accounts so the fix is a Config Builder round-trip, not a guess.
+    """
+    parts = []
+    missing = list(getattr(detection, "unregistered_accounts", None) or [])
+    configured = list(getattr(detection, "matched_accounts", None) or [])
+    if missing:
+        shown = ", ".join(missing[:5])
+        more = f" (and {len(missing) - 5} more)" if len(missing) > 5 else ""
+        total = len(missing) + len(configured)
+        # Lead with what's ALREADY fine, so "reconfigure this statement" reads as
+        # "add the one missing account" rather than "redo the whole thing".
+        head = (
+            f"{len(configured)} of the {total} accounts in this statement are already configured. "
+            if configured else ""
+        )
+        parts.append(
+            f"{head}{len(missing)} still need{'s' if len(missing) == 1 else ''} configuring: "
+            f"{shown}{more}. Reconfigure this statement to add "
+            f"{'it' if len(missing) == 1 else 'them'} — the existing recipe is reused, you only "
+            f"set each new account's Organization Unit."
+        )
+    return " ".join(parts) or (
+        "This statement contains accounts that are not configured yet — add them on the Config tab."
+    )
 
 
 def _get_or_create_bank_account(db: Session, account_number: str | None, bank_name: str | None,
@@ -269,6 +302,10 @@ def handle_statement_upload_v2(db: Session, filename: str, data: bytes, uploaded
     warning = None
     if is_ambiguous:
         warning = "Multiple configs match this file — choose the correct one."
+    elif detection.reason == "INCOMPLETE_ACCOUNTS":
+        # Recognised, but not every account in it is configured — a distinct
+        # (and actionable) state from "we don't know this format at all".
+        warning = _incomplete_accounts_message(detection)
     elif not detection.success:
         warning = "Bank format not auto-detected — manual config required."
 
@@ -319,9 +356,29 @@ def ingest_and_parse(db: Session, source_file_id: int) -> dict:
                 source_file_id, record.filename,
             )
             record.ingest_status = "unrecognized"
-            record.ingest_error = "No matching account configuration found for this statement — configure this account to enable ingestion."
+            if detection.reason == "INCOMPLETE_ACCOUNTS":
+                # The format IS recognised — we're refusing because some account
+                # in the file has no config, which would otherwise get its rows
+                # silently attributed to the first-fit account.
+                record.ingest_error = _incomplete_accounts_message(detection)
+                # Persist the matched config so the UI can tell "recognised, but
+                # some accounts are missing" (offer Reconfigure + the detail) from
+                # "we don't know this format at all" (offer Configure). Without
+                # this, a file first uploaded before ANY config existed keeps
+                # bank_config_key=None through the retry and looks unknown.
+                record.bank_config_key = detection.config_key or record.bank_config_key
+            else:
+                record.ingest_error = "No matching account configuration found for this statement — configure this account to enable ingestion."
             db.commit()
             return {"error": record.ingest_error}
+
+        # Persist the config this file actually matched. Only ever set at UPLOAD
+        # time before, so a statement first uploaded when its accounts weren't
+        # configured yet (config_key=None) kept that None through the successful
+        # retry — and the UI, which reads bank_config_key, went on showing it as
+        # "Unknown" even though it had parsed cleanly.
+        if detection.config_key:
+            record.bank_config_key = detection.config_key
 
         raw_rows = parse_credit_rows(local_path, detection, record.filename)
 
@@ -333,7 +390,23 @@ def ingest_and_parse(db: Session, source_file_id: int) -> dict:
         # already re-resolves it fresh on every call but nothing was reading
         # that fresh value back out. Prefer it; fall back to the stored
         # value only if this call's own detection didn't produce one.
-        resolved_ou_number = (detection.ou_info or {}).get("ou_number") or record.ou_number
+        #
+        # PATCH 2 (F2 — cross-account OU contamination): detection.ou_info
+        # describes the FIRST-FIT account only (detector.py picks matches[0]
+        # when several accounts share one layout). Pairing it with row 0's
+        # account number below meant a multi-account file could hand account
+        # B's BankAccount row account A's OU — and _get_or_create_bank_account's
+        # self-heal branch then OVERWRITES a correct ou_id with the wrong one,
+        # a persistent DB mutation, not just a bad read. The parser already
+        # resolves each row's OU from that row's OWN account (parser.py's
+        # step 5f) and nothing was reading it back; prefer it. Reliable now
+        # that detect_config refuses files containing unconfigured accounts,
+        # so row 0's account is always registered and therefore resolvable.
+        resolved_ou_number = (
+            (raw_rows[0].ou_number if raw_rows else None)
+            or (detection.ou_info or {}).get("ou_number")
+            or record.ou_number
+        )
 
         bank_account = _get_or_create_bank_account(
             db,
@@ -343,17 +416,55 @@ def ingest_and_parse(db: Session, source_file_id: int) -> dict:
             currency=(raw_rows[0].currency if raw_rows else None),
         )
         if bank_account:
+            # The file-level account stays as the PRIMARY (first row's) account
+            # for back-compat; per-row attribution below is what's authoritative.
             record.bank_account_id = bank_account.id
+
+        # PER-ROW ACCOUNT ATTRIBUTION (was: every row stamped with row 0's
+        # account). A file whose account_locator is a COLUMN legitimately holds
+        # several accounts, and stamping them all with the first one meant:
+        #   - the run/Confirm dialog showed one account for the whole file
+        #   - every row entered the rule engine under that account's OU, so R14
+        #     (OU mismatch) judged other accounts' rows against the wrong OU
+        #   - row_hash was scoped to one account, so two genuinely different
+        #     rows on different accounts collided and one was silently dropped
+        # detect_config refuses a file containing unconfigured accounts, so every
+        # account here resolves; anything that somehow doesn't falls back to the
+        # primary account rather than being dropped.
+        account_cache: dict[str, BankAccount | None] = {}
+
+        def _account_for(row) -> BankAccount | None:
+            key = match_key(row.account_number)
+            if not key:
+                return bank_account
+            if key not in account_cache:
+                found = next(
+                    (a for a in db.query(BankAccount).filter(
+                        BankAccount.account_last4 == (row.account_number or "")[-4:]).all()
+                     if match_key(a.account_number) == key),
+                    None,
+                )
+                if found is None:
+                    found = _get_or_create_bank_account(
+                        db,
+                        account_number=row.account_number,
+                        bank_name=row.bank_name,
+                        ou_number=row.ou_number or resolved_ou_number,
+                        currency=row.currency,
+                    )
+                account_cache[key] = found or bank_account
+            return account_cache[key]
 
         payload = []
         for r in raw_rows:
+            row_account = _account_for(r)
             row_hash = compute_row_hash(
-                bank_account.id if bank_account else None,
+                row_account.id if row_account else None,
                 r.statement_date, r.credit_amount, r.currency, r.bank_reference, r.narrative,
             )
             payload.append({
                 "source_file_id": source_file_id,
-                "bank_account_id": bank_account.id if bank_account else None,
+                "bank_account_id": row_account.id if row_account else None,
                 "row_hash": row_hash,
                 "statement_date": r.statement_date,
                 "credit_amount": r.credit_amount,
