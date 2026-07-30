@@ -60,6 +60,37 @@ def _is_correctable(r: LineItem) -> tuple[bool, str | None]:
     return True, None
 
 
+def get_customer_name_options(db: Session, line_item_id: int) -> dict:
+    """
+    Real candidate customer names for correcting this row's AI-identified
+    customer — mirrors hitl/manual_mapping.py's get_mapping_options()
+    customer-list branch exactly (same aging_map.customers_for_ou() call,
+    same 500-name cap), so a SPOC corrects a wrong AI guess by PICKING a
+    real customer from the aging report, the same way manual invoice
+    mapping already works, rather than typing free text. Free text invites
+    typos, won't reliably match anything, and duplicates a picker pattern
+    the app already has — this reuses it instead of inventing a second one.
+
+    Returns {"customers": [...], "ou_number": ...} or {"error": ...}.
+    """
+    r = db.query(LineItem).get(line_item_id)
+    if not r:
+        return {"error": "Row not found"}
+
+    eligible, reason = _is_correctable(r)
+    if not eligible:
+        return {"error": reason}
+
+    aging_map = aging_store.get_aging_map()
+    if aging_map is None:
+        return {"error": "No aging report is currently loaded — load one before correcting a customer name."}
+
+    return {
+        "customers": aging_map.customers_for_ou(r.ou_number, limit=500) if r.ou_number else [],
+        "ou_number": r.ou_number,
+    }
+
+
 def correct_customer_name(
     db: Session, line_item_id: int, corrected_customer_name: str, corrected_by: str,
 ) -> dict:
@@ -70,11 +101,24 @@ def correct_customer_name(
     name correction instead of a newly-arrived remittance, and not
     restricted to rows currently sitting in needs_remittance.
 
+    PATCH: corrected_customer_name must now be a REAL customer name that
+    actually exists in the currently-loaded aging report — validated
+    server-side via aging_map.invoices_for_customer(), regardless of
+    what the frontend sends. Previously this accepted ANY string
+    verbatim, which meant a typo'd or entirely made-up name could be
+    "corrected" in without ever matching anything real, silently wasting
+    the correction. The frontend should now offer a pick-list sourced
+    from get_customer_name_options() above (same pattern as manual invoice
+    mapping's customer picker) rather than a free-text box — but this
+    validation is the actual enforcement, not just a UI nicety, the same
+    way every other backend-vs-frontend boundary in this app works.
+
     Returns:
       {"error": "not_found"}
       {"error": "not_eligible", "message": ...}
       {"error": "no_aging_map", "message": ...}
       {"error": "invalid_input", "message": ...}
+      {"error": "invalid_customer", "message": ...}
       {"id":..., "from_rule_id":..., "to_rule_id":..., "to_category":...,
        "from_customer_name":..., "to_customer_name":...}
     """
@@ -94,6 +138,15 @@ def correct_customer_name(
     if aging_map is None:
         return {"error": "no_aging_map", "message": "No aging report loaded — cannot re-evaluate."}
 
+    if not aging_map.invoices_for_customer(corrected_customer_name):
+        return {
+            "error": "invalid_customer",
+            "message": (
+                f"'{corrected_customer_name}' was not found in the currently-loaded aging "
+                f"report. Select a real customer name from the list, not free text."
+            ),
+        }
+
     from_rule_id = r.rule_id
     from_customer_name = r.extracted_customer_name
 
@@ -102,6 +155,7 @@ def correct_customer_name(
     # (correcting a correction) should not overwrite that original record.
     if not r.customer_name_corrected:
         r.ai_extracted_customer_name = r.extracted_customer_name
+
 
     r.extracted_customer_name = corrected_customer_name
     # Human-supplied name is treated as a confirmed exact match, not a
@@ -165,8 +219,15 @@ def correct_customer_name(
     # change" would be invisible in the row's history.
     db.add(RowStatusHistory(
         line_item_id=r.id,
-        from_state=r.current_state.value if r.current_state else None,
-        to_state=r.current_state.value if r.current_state else None,
+        # PATCH: apply_transition() above already reassigns
+        # line_item.current_state to a plain string internally (see
+        # state_machine.py's apply_transition()) -- by this point it is NO
+        # LONGER an Enum instance, so calling .value on it again raises
+        # AttributeError: 'str' object has no attribute 'value'. Confirmed
+        # via a live traceback. r.current_state is already the correct
+        # plain string here; use it directly.
+        from_state=r.current_state,
+        to_state=r.current_state,
         trigger="customer_name_correction",
         rule_id=rule_result.rule_id,
         triggered_by=corrected_by,
