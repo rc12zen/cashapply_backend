@@ -19,9 +19,9 @@ frontend changes required for this swap.
 from __future__ import annotations
 
 import io
+import zipfile
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
 from sqlalchemy.orm import Session
 
 from ..db.models import AppConfig, SourceFile, User
@@ -218,10 +218,16 @@ def aging_download(db: Session = Depends(get_db),
     if not result:
         raise AppError(ErrorCode.STORAGE_FILE_NOT_FOUND)
     filename, data = result
-    return StreamingResponse(
-        io.BytesIO(data),
-        media_type="application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(filename, data)
+    zip_name = filename.rsplit(".", 1)[0] + ".zip"
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
     )
 
 
