@@ -43,10 +43,7 @@ from typing import Optional
 from .configs.account_loader import (  # noqa: F401
     load_account_configs, load_bank_ou_mapping, last4_index, active_recipe,
 )
-from .account_locator import (
-    extract_account_groups, collapse_tokens, mixed_groups, alias_key,
-    normalize_account, match_key,
-)
+from .account_locator import extract_account_groups, normalize_account, match_key
 from .account_validation import account_reject_reason
 from .ou_resolver import resolve_ou
 
@@ -74,8 +71,14 @@ class DetectionResult:
     # Accounts present in the file that have NO config for this format (junk
     # tokens already filtered). Non-empty ⇒ reason == "INCOMPLETE_ACCOUNTS".
     unregistered_accounts: list          = field(default_factory=list)
-    # Cells naming several accounts with no `account_aliases` entry to say which
-    # one is the receipt target, as ["41678876|41678884", …].
+    # Accounts present in the file that ARE already configured. Paired with
+    # unregistered_accounts so the UI can say "3 of 4 are configured, 1 isn't"
+    # instead of only naming what's missing.
+    matched_accounts:      list          = field(default_factory=list)
+    # Retired: mixed header cells no longer block. A config's registered account
+    # is the single answer for a cell/fixed row mapping (see rows_span_accounts).
+    # Kept so any caller still reading it sees an empty list rather than an
+    # AttributeError.
     unresolved_mixed_cells: list         = field(default_factory=list)
     candidates:           list           = field(default_factory=list)
     suggestions:          list           = field(default_factory=list)
@@ -143,19 +146,41 @@ def _candidate(account: str, entry: dict, fmt: str) -> dict:
     }
 
 
-def _aliases(recipe: dict) -> dict:
-    """The recipe's mixed-cell → primary-account map (see account_locator)."""
-    a = recipe.get("account_aliases")
-    return a if isinstance(a, dict) else {}
+def rows_span_accounts(recipe: dict) -> bool:
+    """Do this recipe's ROWS belong to more than one account?
+
+    True only when the per-row `account_number` field is a COLUMN — that's the
+    only mapping where each row can name a different account, and therefore the
+    only case where every account in the file needs its own config + OU.
+
+    A cell/fixed/concat mapping gives every row the SAME account, so exactly one
+    account matters: the one the config is registered under. A header cell naming
+    a main and its sub-account ("41678876 & 41678884") is therefore NOT a reason
+    to demand a second config — the config already declares which of them it is
+    for, and changing that means adding a new config.
+
+    Also requires the locator to be column-based. With a cell locator the wizard
+    offers a single "pick the account this config is for", so there would be no
+    route to configure the extra accounts a block demanded — a dead end. That
+    combination is unsupported for now: the check simply doesn't run.
+    """
+    field = next((f for f in (recipe.get("fields") or [])
+                  if f.get("name") == "account_number"), None)
+    if (field or {}).get("from", {}).get("type") != "column":
+        return False
+    loc = recipe.get("account_locator") or {}
+    if loc.get("type") == "column":
+        return True
+    return loc.get("type") == "regex" and (loc.get("in") or {}).get("type") == "column"
 
 
 def _collect_matches(filepath: str, fmt: str):
     """Return (matches, extracted_accounts, views, registered_keys).
 
     matches       = list of (account_number, entry, recipe) whose FULL account is in the file
-    views[sig]    = {"accounts": set[str], "mixed": list[str]} — what ONE recipe's
-                    locator+aliases sees in this file. Per-recipe because two
-                    recipes can resolve the same mixed cell to different primaries.
+    views[sig]    = {"accounts": set[str]} — what one (locator, source) pair finds
+                    in this file. Safe to cache by that signature because
+                    extraction depends on nothing else.
     registered_keys = match_key of every account that HAS a config for this format
                     (the denominator for "is this file fully configured?").
     """
@@ -175,32 +200,17 @@ def _collect_matches(filepath: str, fmt: str):
     if not candidates:
         return [], set(), {}, set()
 
-    # Extract once per distinct (locator, source) — many configs share a layout.
-    # Groups (per-cell tokens) are alias-independent, so they cache on that sig;
-    # the alias collapse is then applied per recipe below.
-    group_cache: dict[str, list[list[str]]] = {}
-    for _acct, _entry, recipe in candidates:
-        sig = _extract_sig(recipe)
-        if sig not in group_cache:
-            group_cache[sig] = extract_account_groups(
-                filepath, recipe.get("account_locator", {}), recipe.get("source", {})
-            )
-
+    # Extract once per distinct (locator, source) — many configs share a layout,
+    # and extraction depends on nothing else, so this cache is sound.
     views: dict[str, dict] = {}
     for _acct, _entry, recipe in candidates:
         sig = _extract_sig(recipe)
         if sig in views:
             continue
-        aliases = _aliases(recipe)
-        groups = group_cache[sig]
-        accounts: set[str] = set()
-        for g in groups:
-            accounts.update(collapse_tokens(g, aliases))
-        # A mixed cell is "unresolved" only when the alias map doesn't say which
-        # of its accounts is the receipt target.
-        unresolved = [alias_key(g) for g in mixed_groups(groups)
-                      if not aliases.get(alias_key(g))]
-        views[sig] = {"accounts": accounts, "mixed": unresolved}
+        groups = extract_account_groups(
+            filepath, recipe.get("account_locator", {}), recipe.get("source", {})
+        )
+        views[sig] = {"accounts": {a for g in groups for a in g}}
 
     all_extracted: set = set().union(*(v["accounts"] for v in views.values())) if views else set()
     registered_keys = {match_key(e.get("account_number", a)) for a, e, _ in candidates}
@@ -289,42 +299,47 @@ def detect_config(filepath: str) -> DetectionResult:
     # ── Single match, or several accounts sharing one layout (multi-account) ──
     if len(matches) == 1 or len(layouts) == 1:
         acct, entry, recipe = matches[0]     # first fit
-        view = views.get(_extract_sig(recipe), {"accounts": set(), "mixed": []})
+        view = views.get(_extract_sig(recipe), {"accounts": set()})
 
-        # A multi-account file is only safe to ingest when EVERY account in it is
-        # configured — otherwise the unconfigured accounts' rows get attributed to
-        # whichever account won first-fit. Junk tokens (a "TOTAL" footer row picked
-        # up by a column locator) are filtered here, so they can never block a
-        # file; without that filter this check would be a permanent dead end.
-        unregistered = sorted(
-            a for a in view["accounts"]
-            if match_key(a) not in registered_keys and not account_reject_reason(a)
-        )
-        unresolved_mixed = list(view["mixed"])
-        if unregistered or unresolved_mixed:
+        # A file whose ROWS span several accounts is only safe to ingest when every
+        # one of them is configured — otherwise the unconfigured accounts' rows get
+        # attributed to whichever account won first-fit. When rows all share one
+        # account (a cell/fixed mapping) there is nothing to check: the config's
+        # registered account is the answer, and a header cell that happens to name
+        # a sub-account too is not a second account to configure.
+        #
+        # Junk tokens (a "TOTAL"/"PAGE 1 OF 1" row picked up by a column locator)
+        # are filtered here — without that this check would be a permanent dead end.
+        unregistered: list[str] = []
+        already_configured: list[str] = []
+        if rows_span_accounts(recipe):
+            unregistered = sorted(
+                a for a in view["accounts"]
+                if match_key(a) not in registered_keys and not account_reject_reason(a)
+            )
+            already_configured = sorted(
+                a for a in view["accounts"] if match_key(a) in registered_keys
+            )
+        if unregistered:
             result.reason  = "INCOMPLETE_ACCOUNTS"
             result.success = False
             result.unregistered_accounts  = unregistered
-            result.unresolved_mixed_cells = unresolved_mixed
+            result.matched_accounts       = already_configured
             # Keep the matched recipe/account on the result: the UI needs it to
             # offer "add these accounts to this existing config".
             result.config_key     = acct
             result.config         = _recipe_config(recipe, entry)
             result.account_number = normalize_account(entry.get("account_number", acct))
             result.candidates     = [_candidate(a, e, fmt) for a, e, _ in matches]
-            bits = []
-            if unregistered:
-                bits.append(f"{len(unregistered)} account(s) with no '{fmt}' config: "
-                            f"{', '.join(unregistered[:5])}")
-            if unresolved_mixed:
-                bits.append(f"{len(unresolved_mixed)} cell(s) naming several accounts with no "
-                            f"primary chosen: {', '.join(unresolved_mixed[:5])}")
-            result.method_detail = "; ".join(bits)
+            result.method_detail = (
+                f"{len(unregistered)} account(s) with no '{fmt}' config: "
+                f"{', '.join(unregistered[:5])}"
+            )
             logger.warning(
-                "[detect] file=%r -> INCOMPLETE_ACCOUNTS: matched config_key=%r but "
-                "unregistered=%s unresolved_mixed=%s -- ingestion blocked until every "
-                "account in this file is configured.",
-                filepath, acct, unregistered, unresolved_mixed,
+                "[detect] file=%r -> INCOMPLETE_ACCOUNTS: matched config_key=%r but its "
+                "per-row account COLUMN also holds unconfigured account(s) %s -- ingestion "
+                "blocked until every account whose rows this file carries is configured.",
+                filepath, acct, unregistered,
             )
             return result
 

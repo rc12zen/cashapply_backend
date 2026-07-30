@@ -35,7 +35,7 @@ from .credit_rules import eval_credit_rule
 from .transforms import apply_transforms
 from .ou_resolver import resolve_ou
 from .currency import normalize_currency
-from .account_locator import resolve_cell_accounts
+from .account_locator import split_accounts, normalize_account, match_key
 
 logger = logging.getLogger("cashapply.parser")
 
@@ -244,25 +244,34 @@ def _credit_rule_column(credit_rule: dict, fields: list) -> str | None:
     return field  # flag_matches → raw column name
 
 
-def _row_account(value, aliases: dict | None = None) -> str:
-    """Normalize a ROW's account-number cell the same way detection does.
+def _row_account(value, registered: str = "") -> str:
+    """The account a row's receipt is posted against.
 
-    Was a local normalizer that only trimmed a trailing ".0", so the account
-    string stored on a row could differ from the BankAccount.account_number it
-    was meant to correspond to (spaces/dashes survived here but not in
-    account_locator.normalize_account, which detection and the registry use).
-    Now shares that one implementation, and applies the recipe's
-    `account_aliases` so a cell naming a main and its sub-account resolves to the
-    single primary the user picked at config time instead of being stored as the
-    literal "41678876 & 41678884".
+    Normalizes with account_locator.normalize_account — the SAME implementation
+    detection and the registry use. (This was a local normalizer that only
+    trimmed a trailing ".0", so spaces/dashes survived here but not there, and
+    the account stored on a row could fail to match the BankAccount it meant.)
+
+    `registered` is the account this config is registered under. It wins whenever
+    the cell names several accounts — a header cell reading
+    "41678876 & 41678884" resolves to the registered account, not to whichever
+    token happens to come first. That's what makes a cell/fixed-mapped statement
+    deterministic: one config, one account, every row.
     """
-    accounts = resolve_cell_accounts(value, aliases)
+    accounts = split_accounts(value)
     if not accounts:
-        return ""
-    # A cell with several accounts and no alias entry is unresolvable here.
-    # detect_config() refuses to ingest such a file (INCOMPLETE_ACCOUNTS), so
-    # this is only reachable from a direct/test parse — take the first token
-    # rather than inventing a joined value that matches no account.
+        return normalize_account(registered)
+    if len(accounts) > 1:
+        reg = normalize_account(registered)
+        if reg and match_key(reg) in {match_key(a) for a in accounts}:
+            return reg
+        # No registered account to fall back on (a wizard test parse) — take the
+        # first token rather than inventing a joined value that matches nothing.
+        logger.warning(
+            "Account cell %r names %d accounts and none is the registered account "
+            "(%r) — using %r. Register this config under one of them.",
+            value, len(accounts), registered, accounts[0],
+        )
     return accounts[0]
 
 
@@ -408,11 +417,28 @@ def parse_credit_rows(
             f"No config resolved for {filename}; manual assignment required."
         )
 
-    # 1. Extract DataFrame
-    df = ExtractorFactory.extract(filepath, cfg["source"])
+    fields = cfg.get("fields", [])
+
+    # 1. Extract DataFrame. Identifier columns are read as TEXT: pandas infers a
+    # column of digit strings as int64 (or float64 if any row is blank), so an
+    # account stored as "000274178" would arrive as 274178 — the receipt would be
+    # created against the wrong account number, and a 16+ digit account would lose
+    # precision outright. Same reasoning for the bank reference, which feeds the
+    # row hash and Oracle matching. Amounts and dates are excluded on purpose;
+    # they rely on pandas' numeric/datetime handling.
+    _IDENTIFIER_FIELDS = ("account_number", "bank_reference")
+    text_columns: list[str] = []
+    for f in fields:
+        if f.get("name") not in _IDENTIFIER_FIELDS:
+            continue
+        src = f.get("from", {})
+        if src.get("type") == "column" and src.get("name"):
+            text_columns.append(src["name"])
+        elif src.get("type") == "concat":
+            text_columns.extend(src.get("names", []))
+    df = ExtractorFactory.extract(filepath, cfg["source"], text_columns=text_columns or None)
 
     # 2. Validate required columns exist — loud error if not
-    fields = cfg.get("fields", [])
     _validate_columns(df, fields, cfg.get("credit_rule"))
 
     # 3. Resolve file-level fields (cell, fixed, filename_pattern) — once
@@ -430,10 +456,10 @@ def parse_credit_rows(
     # ISO fallback stamped into the recipe at save (config_builder_routes.builder_save)
     # — used when a row's own currency value can't be standardized to ISO.
     config_currency = normalize_currency(cfg.get("currency")) if cfg.get("currency") else None
-    # Mixed-cell → primary-account map chosen once in the wizard (see
-    # account_locator's module docstring). Applied per row so a "main & sub"
-    # account cell resolves to the same account detection matched on.
-    account_aliases = cfg.get("account_aliases") if isinstance(cfg.get("account_aliases"), dict) else {}
+    # The account this config is registered under (stamped by detector's
+    # _recipe_config). Governs the row account whenever the mapped cell names
+    # several accounts — see _row_account. Absent on a wizard test parse.
+    registered_account = str(cfg.get("account_number") or "")
 
     out: list[NormalizedCreditRow] = []
     invalid_amount_count = 0
@@ -483,7 +509,7 @@ def parse_credit_rows(
         # 5f. OU resolution — strictly per row's own account (account_ou_map).
         # No fallback to the detection account: in a multi-account file that would
         # wrongly stamp every row with the identifying account's OU.
-        account_number = _row_account(record.get("account_number", ""), account_aliases)
+        account_number = _row_account(record.get("account_number", ""), registered_account)
         ou_info = resolve_ou(account_number)
         ou_number     = ou_info.get("ou_number")
         business_unit = ou_info.get("business_unit")

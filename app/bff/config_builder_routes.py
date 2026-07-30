@@ -46,8 +46,7 @@ from ..common.errors import AppError
 from ..common.error_codes import ErrorCode
 from ..common.upload_validation import validate_statement_upload, validate_statement_size
 from ..bank_statement.account_locator import (
-    extract_account_groups, collapse_tokens, mixed_groups, alias_key,
-    normalize_account, last4, match_key,
+    extract_accounts, normalize_account, last4, match_key,
 )
 from ..bank_statement.account_validation import account_reject_reason
 from ..bank_statement.field_sanity import check_field_values
@@ -272,9 +271,11 @@ class LocateAccountRequest(BaseModel):
     storage_key: str
     locator: dict
     source: dict | None = None
-    # Draft `account_aliases` (mixed cell → chosen primary account). Sent so the
-    # preview reflects the picks the user has already made in the wizard.
-    aliases: dict | None = None
+    # True when the recipe's per-row account_number field is a COLUMN, i.e. rows
+    # span accounts and every one of them needs its own config. Drives whether
+    # this response invites a fan-out or a single "pick the account this config is
+    # for" (see rows_span_accounts in bank_statement/detector.py).
+    rows_span_accounts: bool = False
 
 
 # How many discovered accounts the wizard is asked to render/onboard at once.
@@ -288,29 +289,22 @@ def builder_locate_account(body: LocateAccountRequest, db: Session = Depends(get
                            user: User = Depends(require_permission("config:manage"))):
     """Run a locator draft against the file and return the account(s) it finds.
 
-    For a COLUMN locator this is normally several accounts — the wizard onboards
-    every one of them against the same recipe (see builder_save's `accounts`), so
-    this response carries everything that table needs: which accounts are already
-    configured, which don't look like real accounts, which cells name more than
-    one account (and so need a primary chosen), and any OU already on record to
-    prefill with.
+    When the recipe's per-row account field is a COLUMN, rows span accounts and
+    the wizard onboards every one of them against the same recipe (see
+    builder_save's `accounts`), so this response carries what that table needs:
+    which accounts are already configured, which don't look like real accounts,
+    and any OU already on record to prefill with.
+
+    Otherwise every row shares one account and the wizard asks the user to pick
+    the single account this config is for — a header cell naming a main and its
+    sub-account is a choice, not two configs to create.
     """
     _record, local_path = _local_path_by_key(db, body.storage_key)
-    aliases = body.aliases if isinstance(body.aliases, dict) else {}
     source = body.source or {}
 
-    groups = extract_account_groups(local_path, body.locator, source)
-    found_all = sorted({a for g in groups for a in collapse_tokens(g, aliases)})
+    found_all = sorted(extract_accounts(local_path, body.locator, source))
     truncated = max(0, len(found_all) - _MAX_DISCOVERED_ACCOUNTS)
     found = found_all[:_MAX_DISCOVERED_ACCOUNTS]
-
-    # Cells naming several accounts. Anything without an alias entry is still
-    # unresolved — the wizard must make the user pick a primary, because a row
-    # whose account cell names two accounts has no single receipt target.
-    mixed = [
-        {"key": alias_key(g), "accounts": g, "chosen": aliases.get(alias_key(g))}
-        for g in mixed_groups(groups)
-    ]
 
     configs = load_account_configs()
     by_key = {match_key(entry.get("account_number", k)): (k, entry) for k, entry in configs.items()}
@@ -346,8 +340,10 @@ def builder_locate_account(body: LocateAccountRequest, db: Session = Depends(get
         "last4s": sorted({last4(a) for a in found}),
         "existing": existing,               # {account: [formats already configured]}
         "account_issues": account_issues,   # {account: reason string | null}
-        "mixed": mixed,                     # [{key, accounts, chosen}]
         "known": known,                     # {account: {ou_number, business_unit, …}}
+        # Echoed back so the wizard renders fan-out vs pick-one from one source of
+        # truth rather than re-deriving the rule client-side.
+        "rows_span_accounts": body.rows_span_accounts,
     }
 
 

@@ -695,9 +695,21 @@ def _run_analysis(run_id: int, selected_files: list[str]) -> None:
                     continue
 
                 if source.ingest_status == "ready":
-                    if source.bank_account_id is not None:
+                    # Every account this file's rows were attributed to. A file
+                    # whose account_locator is a COLUMN holds several accounts, so
+                    # scoping to source.bank_account_id (the PRIMARY only) would
+                    # silently skip the other accounts' rows.
+                    file_account_ids = {
+                        aid for (aid,) in db.query(StatementTransactionRow.bank_account_id)
+                        .filter(StatementTransactionRow.source_file_id == source.id)
+                        .distinct().all()
+                        if aid is not None
+                    }
+                    if not file_account_ids and source.bank_account_id is not None:
+                        file_account_ids = {source.bank_account_id}
+                    if file_account_ids:
                         row_query = db.query(StatementTransactionRow).filter(
-                            StatementTransactionRow.bank_account_id == source.bank_account_id,
+                            StatementTransactionRow.bank_account_id.in_(file_account_ids),
                             StatementTransactionRow.consumed_by_run_id.is_(None),
                         )
                     else:
@@ -725,21 +737,37 @@ def _run_analysis(run_id: int, selected_files: list[str]) -> None:
                     # completed keeps whatever was current when IT ran,
                     # since LineItem.business_unit is a permanent snapshot,
                     # not a live join (see bff/bank_accounts_routes.py).
-                    live_business_unit = None
-                    live_ou_number = None
-                    live_bank_ou_numbers: list[str] | None = None
-                    if source.bank_account_id is not None:
-                        bank_account = db.query(BankAccount).get(source.bank_account_id)
-                        if bank_account and bank_account.organization_unit:
-                            live_ou_number = bank_account.organization_unit.ou_number
-                            live_business_unit = bank_account.organization_unit.ou_name
-                            live_bank_ou_numbers = bank_account.all_ou_numbers
+                    # PATCH 2 (multi-account files): resolved per ROW's own account,
+                    # not once per file. It used to resolve from
+                    # source.bank_account_id and then SHADOW the per-row value
+                    # (`live_business_unit or raw_row_json[...]`), so in a file
+                    # holding several accounts every row entered the rule engine
+                    # under the primary account's OU — precisely what R14 (OU
+                    # mismatch) keys on, and what the parser's per-row OU
+                    # resolution existed to prevent.
+                    ou_cache: dict[int, tuple[str | None, str | None, list[str] | None]] = {}
+
+                    def _live_ou(account_id: int | None):
+                        if account_id is None:
+                            return (None, None, None)
+                        if account_id not in ou_cache:
+                            ba = db.query(BankAccount).get(account_id)
+                            if ba and ba.organization_unit:
+                                ou_cache[account_id] = (
+                                    ba.organization_unit.ou_name,
+                                    ba.organization_unit.ou_number,
+                                    ba.all_ou_numbers,
+                                )
+                            else:
+                                ou_cache[account_id] = (None, None, None)
+                        return ou_cache[account_id]
 
                     unconsumed = row_query.all()
                     for row in unconsumed:
                         if row.id in seen_row_ids:
                             continue
                         seen_row_ids.add(row.id)
+                        live_business_unit, live_ou_number, live_bank_ou_numbers = _live_ou(row.bank_account_id)
                         row_business_unit = live_business_unit or (row.raw_row_json or {}).get("business_unit") or source.business_unit
                         row_ou_number = live_ou_number or (row.raw_row_json or {}).get("ou_number") or source.ou_number
                         all_credit_rows.append(CreditRowSchema(

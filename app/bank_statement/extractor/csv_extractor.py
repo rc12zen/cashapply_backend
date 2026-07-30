@@ -12,7 +12,12 @@ import pandas as pd
 
 class CsvExtractor:
     @staticmethod
-    def extract(filepath: str, source_cfg: dict) -> pd.DataFrame:
+    def extract(filepath: str, source_cfg: dict,
+                text_columns: list[str] | None = None) -> pd.DataFrame:
+        # text_columns is accepted for a uniform extractor signature but is a
+        # no-op: this reader already uses dtype=str for EVERY column, so CSV
+        # sources never lost leading zeros the way Excel ones did.
+        del text_columns
         encoding = source_cfg.get("encoding", "auto")
         delimiter = source_cfg.get("delimiter", "auto")
         header_row = source_cfg.get("header", {}).get("row", 0)

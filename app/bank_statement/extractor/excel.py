@@ -51,7 +51,8 @@ def _resolve_sheet(filepath: str, sheet_cfg: dict, engine: str) -> str | int:
     raise ValueError(f"Unknown sheet selector: '{by}'")
 
 
-def _read_merged_header(filepath: str, sheet, header_cfg: dict, engine: str) -> pd.DataFrame:
+def _read_merged_header(filepath: str, sheet, header_cfg: dict, engine: str,
+                        text_columns: list[str] | None = None) -> pd.DataFrame:
     """Read a DataFrame where the header spans two (or more) rows.
 
     Reads header rows directly (bypassing pandas MultiIndex forward-fill) so that
@@ -113,12 +114,17 @@ def _read_merged_header(filepath: str, sheet, header_cfg: dict, engine: str) -> 
 
     # --- Step 3: read data rows only (skip all header rows) ---
     last_header_row = max([main_row] + sub_row_nums)
+    # Data rows are read with header=None, so columns are POSITIONAL here — map
+    # any text_columns onto their index in flat_cols. (Keying dtype by name would
+    # silently do nothing, since the names aren't applied until Step 4.)
+    dtype = {i: str for i, c in enumerate(flat_cols) if c in (text_columns or [])}
     df = pd.read_excel(
         filepath,
         sheet_name=sheet,
         header=None,
         skiprows=list(range(last_header_row + 1)),
         engine=engine,
+        dtype=dtype or None,
     )
 
     # Align columns (trim extra trailing columns, apply flat names)
@@ -130,17 +136,22 @@ def _read_merged_header(filepath: str, sheet, header_cfg: dict, engine: str) -> 
 
 class ExcelExtractor:
     @staticmethod
-    def extract(filepath: str, source_cfg: dict) -> pd.DataFrame:
+    def extract(filepath: str, source_cfg: dict,
+                text_columns: list[str] | None = None) -> pd.DataFrame:
         engine = _detect_excel_engine(filepath)
         sheet_cfg = source_cfg.get("sheet", {"by": "first"})
         sheet = _resolve_sheet(filepath, sheet_cfg, engine)
         header_cfg = source_cfg.get("header", {"row": 0})
 
         if "merge_rows" in header_cfg:
-            df = _read_merged_header(filepath, sheet, header_cfg, engine)
+            df = _read_merged_header(filepath, sheet, header_cfg, engine, text_columns)
         else:
+            # dtype by NAME here (a header row IS applied). pandas ignores keys for
+            # columns that don't exist, so an unmatched name is harmless.
+            dtype = {c: str for c in (text_columns or [])}
             df = pd.read_excel(
-                filepath, sheet_name=sheet, header=header_cfg["row"], engine=engine
+                filepath, sheet_name=sheet, header=header_cfg["row"], engine=engine,
+                dtype=dtype or None,
             )
             df.columns = [str(c).strip() for c in df.columns]
 
