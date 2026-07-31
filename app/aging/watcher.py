@@ -41,6 +41,7 @@ from ..db.models import SourceFile
 from ..db.settings import get_settings
 from ..storage.client import get_storage_client
 from ..aging.parser import refresh_aging_map
+from .file_sniff import check_extension_mismatch
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +81,26 @@ def _process_file(filepath: Path) -> bool:
 
     try:
         data = filepath.read_bytes()
+
+        # PATCH: reject up front if the file's actual bytes don't match
+        # its extension (e.g. a legacy .xls binary dropped in the watch
+        # folder with a .xlsx name). Without this, ingestion silently
+        # "succeeds" -- pandas can often still parse it for the AgingMap
+        # if xlrd happens to be installed -- and the mismatch only
+        # surfaces much later when someone downloads the raw file from
+        # the app and a real Excel client refuses to open it. Logged and
+        # skipped (not raised) to match this function's existing
+        # log-and-return-False contract; see file_sniff.py for the exact
+        # detection logic. The file itself is left untouched in the watch
+        # folder, so a corrected drop-in replacement with the same
+        # filename won't be picked up automatically (see this module's
+        # docstring: "same filename = skipped, rename to force a reload")
+        # -- whoever fixes it should drop it in under a new filename.
+        mismatch = check_extension_mismatch(filename, data)
+        if mismatch:
+            log.error(f"[aging_watcher] Skipping '{filename}': {mismatch}")
+            return False
+
         storage = get_storage_client()
         storage.save(AGING_BUCKET, filename, data)
 

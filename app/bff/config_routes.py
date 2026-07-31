@@ -33,6 +33,7 @@ from ..common.error_codes import ErrorCode
 from ..aging.uploader import handle_aging_upload
 from ..aging.parser import refresh_aging_map
 from ..aging.preview import preview_aging_file, load_active_aging_file
+from ..aging.file_sniff import correct_extension_for
 from ..aging import aging_store
 
 router = APIRouter()
@@ -229,11 +230,22 @@ def aging_download(source_file_id: int | None = None, db: Session = Depends(get_
     stream the real file with its own name/content-type, no wrapper.
 
     PATCH: also accepts source_file_id, same reasoning as aging_preview above.
+
+    PATCH: also self-corrects the served filename's extension when it
+    doesn't match the file's actual bytes (e.g. a legacy .xls binary
+    stored under a ".xlsx" name from before file_sniff.py's ingestion-time
+    check existed, or from a watch-folder drop that predates it). Without
+    this, downloading it gives you the EXACT same "file format may not be
+    matching with the file extension" Excel error this whole PATCH history
+    was about -- just moved one level down, from "wrapped in a zip" to
+    "wrong extension on the real file". The stored bytes/key are never
+    touched -- only the name in the response headers.
     """
     result = load_active_aging_file(db, source_file_id=source_file_id)
     if not result:
         raise AppError(ErrorCode.STORAGE_FILE_NOT_FOUND)
     filename, data = result
+    filename = correct_extension_for(filename, data)
 
     content_type, _ = mimetypes.guess_type(filename)
     content_type = content_type or "application/octet-stream"

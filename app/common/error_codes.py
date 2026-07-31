@@ -178,6 +178,12 @@ class ErrorCode:
         "File too large",
         "Bank statement files must be 10 MB or smaller. Please upload a smaller file.",
     )
+    AGING_FORMAT_MISMATCH = ErrorDef(
+        2011, "AGING_FORMAT_MISMATCH", 400,
+        "File format doesn't match its extension",
+        "This file's actual format doesn't match its file extension (e.g. a legacy .xls "
+        "file saved with a .xlsx name). Excel will refuse to open it later if uploaded as-is.",
+    )
 
     # ── 3000-3999  Config / Config Builder ──────────────────────────────────
     CONFIG_NOT_FOUND = ErrorDef(
