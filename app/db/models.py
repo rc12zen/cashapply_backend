@@ -83,6 +83,12 @@ class RowState(str, enum.Enum):
     # and confirms it. See bank_statement/settlement_identifier.py and
     # rule_engine/evaluator.py's R16/R17/R18.
     NEEDS_DISTRIBUTION       = "needs_distribution"
+    # NEW: a SPOC-decided terminal state for unidentified rows that were
+    # reviewed and judged NOT eligible for a receipt at all (garbage
+    # narration, internal transfer, etc.) — distinct from "rejected", which
+    # implies a receipt/mapping decision existed and was reversed. See
+    # LineItem.receipt_eligibility and hitl/service.py's discard_row().
+    DISCARDED                = "discarded"
 
 
 class SettlementIdentifierType(str, enum.Enum):
@@ -248,6 +254,22 @@ class LineItem(Base):
     fx_invoice_to_functional        = Column(Float, nullable=True)       # = Oracle ConversionRate
     fx_invoice_to_functional_source = Column(String, nullable=True)
 
+    # ── GL rate manual edit (post-receipt-creation correction) ────────────────
+    # PATCH standard rate (fx_invoice_to_functional above) with a SPOC-typed
+    # override, via OracleFusionClient.patch_standard_receipt -- see
+    # hitl/service.py's edit_gl_rate(). Only permitted while standard_receipt_id
+    # exists AND no remittanceReferences have been posted yet (reference_status
+    # is not "success") -- editing after invoice mapping would desync the
+    # applied amounts from the receipt's own stated rate. fx_invoice_to_functional
+    # itself is overwritten with the new value on a successful edit; these
+    # fields keep the ORIGINAL Oracle-resolved rate and a full audit trail,
+    # since fx_invoice_to_functional_source flipping to "spoc_manual" only
+    # tells you THAT it was overridden, not what it was overridden FROM.
+    gl_rate_original       = Column(Float, nullable=True)
+    gl_rate_edited_at      = Column(DateTime, nullable=True)
+    gl_rate_edited_by      = Column(String, nullable=True)   # SPOC email
+    gl_rate_edit_reason    = Column(Text, nullable=True)
+
     # ── Problem 2: cross-OU business flag ────────────────────────────────────
     # True when the row reaches ready_to_post / acceptable_short_payment AND
     # the customer's aging invoices are in a different OU than the bank account.
@@ -303,6 +325,17 @@ class LineItem(Base):
     # narration pattern alone, not a named payer.
     settlement_type     = Column(String, nullable=True)   # "card_narrative" | "cheque_narrative" | "third_party_provider"
     settlement_provider = Column(String, nullable=True)   # e.g. "Accurant" -- third-party rows only
+
+    # ── Receipt eligibility (unidentified rows only) ──────────────────────────
+    # Step 4.5 (rule_engine/orchestrator.py) used to create a bare Oracle
+    # receipt for EVERY credit row unconditionally, including rows with zero
+    # signal (R8/NO_SIGNAL) that may not be a real receivable transaction at
+    # all. This gate holds receipt creation for unidentified rows specifically
+    # until a SPOC decides -- see hitl/service.py's mark_eligible_for_receipt()
+    # / discard_row(). None = undecided (receipt NOT yet created for this row).
+    receipt_eligibility          = Column(String, nullable=True)  # None | "eligible" | "discarded"
+    receipt_eligibility_at       = Column(DateTime, nullable=True)
+    receipt_eligibility_by       = Column(String, nullable=True)  # SPOC email
 
     # ── Manual invoice mapping tracking ───────────────────────────────────────
     # Set by hitl/manual_mapping.py's confirm_manual_mapping() — the only

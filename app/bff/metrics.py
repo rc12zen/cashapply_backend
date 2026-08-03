@@ -69,6 +69,12 @@ GROUP_CONFLICT_EXCEPTION  = "conflict_exception"
 GROUP_PROCESSED           = "processed"           # terminal — overrides rule_id
 GROUP_REJECTED            = "rejected"             # terminal — overrides rule_id
 GROUP_POST_FAILED         = "post_failed"          # terminal — overrides rule_id
+# NEW — see LineItem.receipt_eligibility and hitl/service.py's discard_row().
+# A SPOC-reviewed unidentified row judged NOT a real receivable transaction
+# at all. Terminal, like rejected/processed — but distinct from "rejected"
+# (which implies a receipt/mapping decision existed and was reversed): a
+# discarded row never had a receipt created for it in the first place.
+GROUP_DISCARDED           = "discarded"
 
 # Every group that _category_for_row() can ever return — the single list
 # every aggregation dict below is initialized from, so adding a new group
@@ -78,7 +84,7 @@ GROUP_POST_FAILED         = "post_failed"          # terminal — overrides rule
 ALL_GROUPS: tuple[str, ...] = (
     GROUP_UNIDENTIFIED, GROUP_NEEDS_REMITTANCE, GROUP_NEEDS_DISTRIBUTION,
     GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_CONFLICT_EXCEPTION,
-    GROUP_PROCESSED, GROUP_REJECTED, GROUP_POST_FAILED,
+    GROUP_PROCESSED, GROUP_REJECTED, GROUP_POST_FAILED, GROUP_DISCARDED,
 )
 
 RULE_ID_TO_GROUP: dict[str, str] = {
@@ -127,6 +133,7 @@ GROUP_LABELS: dict[str, str] = {
     GROUP_PROCESSED:          "Processed",
     GROUP_REJECTED:           "Rejected",
     GROUP_POST_FAILED:        "Post Failed",
+    GROUP_DISCARDED:          "Discarded",
 }
 
 
@@ -153,6 +160,13 @@ def _category_for_row(r: LineItem) -> str:
         return GROUP_REJECTED
     if r.reference_status == "failed":
         return GROUP_POST_FAILED
+    # NEW — see LineItem.receipt_eligibility. Checked before the rule_id
+    # lookup below since a discarded row's rule_id is still "R8" (the
+    # underlying NO_SIGNAL fact about the row never changes) — without this
+    # check first, a discarded row would keep showing as "Unidentified"
+    # forever instead of moving to its own resolved bucket.
+    if r.receipt_eligibility == "discarded":
+        return GROUP_DISCARDED
     return RULE_ID_TO_GROUP.get(r.rule_id, GROUP_CONFLICT_EXCEPTION)
 
 
@@ -396,6 +410,7 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
     total_ready_for_oracle = 0
     total_short_payment = 0
     total_needs_distribution = 0
+    total_discarded = 0
     for r in rows:
         cat = _category_for_row(r)
         if cat == GROUP_UNIDENTIFIED:
@@ -406,6 +421,8 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
             total_short_payment += 1
         if cat == GROUP_NEEDS_DISTRIBUTION:
             total_needs_distribution += 1
+        if cat == GROUP_DISCARDED:
+            total_discarded += 1
     total_identified = len(rows) - total_unidentified
 
     # PATCH: the aging report snapshot this run actually matched against —
@@ -437,6 +454,7 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
         "total_ready_for_oracle": total_ready_for_oracle,
         "total_short_payment": total_short_payment,
         "total_needs_distribution": total_needs_distribution,
+        "total_discarded":          total_discarded,
         # ── Legacy fields — kept for backward compatibility ──────────────────
         "total_matched": matched,
         "total_not_found": not_found,
@@ -519,6 +537,7 @@ def compute_run_summary(db: Session, run_id: int) -> dict:
         "processed":                len(rows_by_group[GROUP_PROCESSED]),
         "rejected":                 len(rows_by_group[GROUP_REJECTED]),
         "post_failed":              len(rows_by_group[GROUP_POST_FAILED]),
+        "discarded":                len(rows_by_group[GROUP_DISCARDED]),
     }
 
     # _source on each serialized row controls whether the frontend's row-click

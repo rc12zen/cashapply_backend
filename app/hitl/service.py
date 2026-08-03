@@ -37,7 +37,7 @@ from sqlalchemy.orm import Session
 from ..db.models import LineItem, RowStatusHistory
 from ..oracle.fusion_client import OracleFusionClient, build_remittance_reference_payloads
 from ..oracle.receipt_creation import create_receipt_for_line_item
-from ..bff.metrics import _category_for_row, GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_LABELS
+from ..bff.metrics import _category_for_row, GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_UNIDENTIFIED, GROUP_LABELS
 from ..rule_engine.invoice_ledger import confirm_applications, release_applications
 
 logger = logging.getLogger(__name__)
@@ -341,6 +341,205 @@ def reject_row(
     ))
     db.commit()
     return {"id": r.id, "status": "Rejected"}
+
+
+def _guard_unidentified_undecided(r: LineItem) -> dict | None:
+    """Shared guard for both eligibility actions below — returns an error
+    dict if this row isn't a genuinely-undecided unidentified row, else
+    None. Both actions only make sense once, on a row that's actually
+    sitting in Unidentified with no prior eligibility decision."""
+    if _category_for_row(r) != GROUP_UNIDENTIFIED:
+        return {
+            "error": "not_eligible_for_action",
+            "message": (
+                f"Row {r.id} is not in the Unidentified category — this "
+                f"action only applies to rows with no extracted signal at all."
+            ),
+        }
+    if r.receipt_eligibility is not None:
+        return {
+            "error": "already_decided",
+            "message": (
+                f"Row {r.id} already has a recorded eligibility decision "
+                f"('{r.receipt_eligibility}') and cannot be decided again."
+            ),
+        }
+    return None
+
+
+def mark_eligible_for_receipt(db: Session, line_item_id: int, triggered_by: str) -> dict:
+    """
+    The SPOC has looked at an Unidentified row and confirmed it IS a real
+    receivable transaction (just one the automatic extraction couldn't
+    read) — creates the bare Oracle receipt right now, the same call
+    Step 4.5 would have made automatically for every other category (see
+    rule_engine/orchestrator.py's Step 4.5 docstring for why unidentified
+    rows are held back from that automatic step in the first place).
+
+    The row's category doesn't change here — it's still R8/NO_SIGNAL, still
+    Unidentified, still needs a customer/invoice match via Manual Invoice
+    Mapping (hitl/manual_mapping.py) same as before. This action ONLY
+    unblocks receipt creation; it is not a substitute for actually mapping
+    the row.
+    """
+    r = db.query(LineItem).get(line_item_id)
+    if not r:
+        return {"error": "not found"}
+
+    guard_error = _guard_unidentified_undecided(r)
+    if guard_error:
+        return guard_error
+
+    result = create_receipt_for_line_item(db, r)
+
+    r.receipt_eligibility    = "eligible"
+    r.receipt_eligibility_at = dt.datetime.utcnow()
+    r.receipt_eligibility_by = triggered_by
+
+    db.add(RowStatusHistory(
+        line_item_id=r.id, from_state="unidentified", to_state="unidentified",
+        trigger="spoc_mark_eligible", rule_id=r.rule_id,
+        triggered_by=triggered_by,
+        comment=(
+            f"Marked eligible for receipt creation — "
+            f"{'receipt created (' + str(r.oracle_ref_no) + ')' if result.get('success') else 'receipt creation FAILED: ' + str(result.get('message'))}"
+        ),
+    ))
+    db.commit()
+
+    return {
+        "id": r.id,
+        "receipt_eligibility": "eligible",
+        "receipt_created": bool(result.get("success")),
+        "oracle_ref_no": r.oracle_ref_no,
+        "standard_receipt_id": r.standard_receipt_id,
+        "message": result.get("message"),
+    }
+
+
+def discard_row(db: Session, line_item_id: int, comment: str | None, triggered_by: str) -> dict:
+    """
+    The SPOC has looked at an Unidentified row and judged it is NOT a real
+    receivable transaction at all (garbage narration, an internal transfer,
+    a duplicate bank feed entry, etc.) — moves it to its own terminal
+    `discarded` state WITHOUT ever creating an Oracle receipt for it. See
+    db/models.py's RowState.DISCARDED and bff/metrics.py's GROUP_DISCARDED
+    for why this is deliberately distinct from `rejected` (which implies a
+    receipt/mapping decision existed and was reversed).
+    """
+    r = db.query(LineItem).get(line_item_id)
+    if not r:
+        return {"error": "not found"}
+
+    guard_error = _guard_unidentified_undecided(r)
+    if guard_error:
+        return guard_error
+
+    r.receipt_eligibility    = "discarded"
+    r.receipt_eligibility_at = dt.datetime.utcnow()
+    r.receipt_eligibility_by = triggered_by
+    r.current_state          = "discarded"
+    r.status                 = "Discarded"
+    r.version                = (r.version or 0) + 1
+
+    db.add(RowStatusHistory(
+        line_item_id=r.id, from_state="unidentified", to_state="discarded",
+        trigger="spoc_discard", rule_id=r.rule_id,
+        triggered_by=triggered_by, comment=comment,
+    ))
+    db.commit()
+
+    return {"id": r.id, "status": "Discarded"}
+
+
+def edit_gl_rate(
+    db: Session, line_item_id: int, new_rate: float, reason: str | None, triggered_by: str,
+) -> dict:
+    """
+    Overrides the Leg 2 (invoice -> functional) GL conversion rate on a
+    receipt that's ALREADY been created in Oracle — e.g. Oracle resolved
+    83.67 at receipt-creation time, but finance wants 83.98 applied
+    instead. PATCHes Oracle directly (OracleFusionClient.
+    patch_standard_receipt); see that method's docstring for the exact
+    request shape (mirrors the ConversionRateType: "User" / ConversionRate
+    case fusion_client.build_receipt_creation_payload already builds for
+    the ORIGINAL rate — this just overrides it after the fact).
+
+    GUARD (business decision, confirmed): only allowed BEFORE invoice
+    mapping exists on this receipt (reference_status != "success"). Once
+    remittanceReferences are posted, Oracle has already applied this
+    receipt against specific invoice amounts using the ORIGINAL rate —
+    changing it afterward would desync the applied amounts from what the
+    receipt now claims its rate was. A correction needed after that point
+    is a reverse-and-recreate action, not a field edit, and isn't handled
+    here.
+    """
+    r = db.query(LineItem).get(line_item_id)
+    if not r:
+        return {"error": "not found"}
+
+    if not r.is_cross_ledger:
+        return {
+            "error": "not_cross_ledger",
+            "message": f"Row {r.id} is not a cross-ledger-currency row — there is no GL rate to edit.",
+        }
+    if not r.standard_receipt_id:
+        return {
+            "error": "no_receipt",
+            "message": f"Row {r.id} has no Oracle receipt yet — nothing to PATCH.",
+        }
+    if r.reference_status == "success":
+        return {
+            "error": "already_mapped",
+            "message": (
+                f"Row {r.id} already has invoice mapping (remittanceReferences) posted "
+                f"against this receipt — the GL rate can no longer be edited here. "
+                f"This needs a reverse-and-recreate correction instead."
+            ),
+        }
+
+    client = OracleFusionClient()
+    result = client.patch_standard_receipt(
+        r.standard_receipt_id,
+        {"ConversionRateType": "User", "ConversionRate": new_rate},
+    )
+
+    if not result.get("success"):
+        return {
+            "error": "oracle_patch_failed",
+            "message": f"Oracle rejected the rate change: {result.get('message')}",
+        }
+
+    # Keep the ORIGINAL Oracle-resolved rate exactly once — a second edit
+    # must not overwrite gl_rate_original with the first edit's value,
+    # or the audit trail loses what Oracle actually calculated on its own.
+    if r.gl_rate_original is None:
+        r.gl_rate_original = r.fx_invoice_to_functional
+
+    old_rate = r.fx_invoice_to_functional
+    r.fx_invoice_to_functional        = new_rate
+    r.fx_invoice_to_functional_source = "spoc_manual"
+    r.gl_rate_edited_at               = dt.datetime.utcnow()
+    r.gl_rate_edited_by               = triggered_by
+    r.gl_rate_edit_reason             = reason
+
+    db.add(RowStatusHistory(
+        line_item_id=r.id, from_state=r.current_state.value if r.current_state else None,
+        to_state=r.current_state.value if r.current_state else None,
+        trigger="spoc_edit_gl_rate", rule_id=r.rule_id,
+        triggered_by=triggered_by,
+        comment=f"GL rate changed from {old_rate} to {new_rate}" + (f" — {reason}" if reason else ""),
+    ))
+    db.commit()
+
+    return {
+        "id": r.id,
+        "success": True,
+        "old_rate": old_rate,
+        "new_rate": new_rate,
+        "gl_rate_original": r.gl_rate_original,
+        "message": f"GL rate updated to {new_rate} on Oracle receipt {r.standard_receipt_id}.",
+    }
 
 
 def get_hitl_history(db: Session) -> dict:

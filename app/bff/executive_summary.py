@@ -70,7 +70,7 @@ from ..auth import require_permission
 from .metrics import (
     GROUP_CONFLICT_EXCEPTION, GROUP_NEEDS_REMITTANCE, GROUP_POST_FAILED,
     GROUP_REJECTED, GROUP_UNIDENTIFIED, GROUP_NEEDS_DISTRIBUTION, GROUP_SHORT_PAYMENT,
-    GROUP_LABELS, _category_for_row,
+    GROUP_DISCARDED, GROUP_LABELS, _category_for_row,
 )
 from .date_range import parse_date_from, parse_date_to
 
@@ -380,10 +380,14 @@ def export_executive_csv(
 # receipt yet, and short_payment is an open shortfall against an invoice
 # that finance may want visibility into even though the row itself isn't
 # "stuck". GROUP_READY_FOR_ORACLE (now exact-match only) and GROUP_PROCESSED
-# remain excluded for the original reason.
+# remain excluded for the original reason. GROUP_DISCARDED is included on
+# the same basis as GROUP_REJECTED already was — a discarded row never got
+# a receipt / never reached Oracle, so it belongs in "not posted" even
+# though the decision on it is final.
 NON_POSTED_GROUPS = [
     GROUP_UNIDENTIFIED, GROUP_NEEDS_REMITTANCE, GROUP_NEEDS_DISTRIBUTION,
     GROUP_SHORT_PAYMENT, GROUP_CONFLICT_EXCEPTION, GROUP_REJECTED, GROUP_POST_FAILED,
+    GROUP_DISCARDED,
 ]
 
 # NOTE: no standalone "Cross OU" pill here. is_cross_ou_currency is only ever

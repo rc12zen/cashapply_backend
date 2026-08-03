@@ -242,6 +242,71 @@ class OracleFusionClient:
             }
 
 
+    def patch_standard_receipt(self, standard_receipt_id: str, payload: dict) -> dict:
+        """
+        Edits fields on an ALREADY-CREATED receipt via
+            PATCH /standardReceipts/{standard_receipt_id}
+        — used today for exactly one field: a SPOC-entered override of the
+        Leg 2 (invoice -> functional) GL conversion rate (ConversionRate /
+        ConversionRateType), for a cross-ledger-currency row where the
+        Oracle-resolved rate needs a manual correction (e.g. finance wants
+        83.98 instead of the 83.67 GL rate that was in effect at receipt-
+        creation time). See hitl/service.py's edit_gl_rate() for the
+        business guard on WHEN this is allowed (before invoice mapping only
+        — see that function's docstring for why).
+
+        Returns the same normalised shape as post_standard_receipt/
+        post_remittance_reference: { success, status_code, message, raw }.
+        Oracle's PATCH returns 200 with the updated resource body on
+        success (no 201, since nothing is being created).
+        """
+        s = self.settings
+        url = f"{s.ORACLE_FUSION_BASE_URL}/standardReceipts/{standard_receipt_id}"
+        auth = (
+            (s.ORACLE_BASIC_USERNAME, s.ORACLE_BASIC_PASSWORD)
+            if s.ORACLE_AUTH_MODE == "basic"
+               and s.ORACLE_BASIC_USERNAME
+               and s.ORACLE_BASIC_PASSWORD
+            else None
+        )
+        headers = self._auth_headers()
+
+        log_oracle_request(
+            "PATCH", url, headers=headers, auth=auth, json_body=payload,
+            tag="oracle.standardReceipts.patch",
+        )
+
+        try:
+            resp = httpx.patch(
+                url, json=payload,
+                headers=headers, auth=auth, timeout=60,
+            )
+            log_oracle_response(resp, tag="oracle.standardReceipts.patch")
+
+            if resp.status_code in (200, 201, 204):
+                data = resp.json() if resp.content else {}
+                return {
+                    "success":     True,
+                    "status_code": str(resp.status_code),
+                    "message":     "Receipt updated successfully",
+                    "raw":         data,
+                }
+            return {
+                "success":     False,
+                "status_code": str(resp.status_code),
+                "message":     resp.text[:2000],
+                "raw":         None,
+            }
+        except httpx.HTTPError as e:
+            log_oracle_error(e, tag="oracle.standardReceipts.patch")
+            return {
+                "success":     False,
+                "status_code": "connection_error",
+                "message":     str(e),
+                "raw":         None,
+            }
+
+
 def _build_receipt_number(line_item: LineItem) -> str:
     """
     Generates the Oracle `ReceiptNumber` -- supplied by us, not Oracle.
