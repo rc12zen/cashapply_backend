@@ -52,6 +52,7 @@ from ..db.models import LineItem, RowStatusHistory, User
 from ..aging import aging_store
 from ..rule_engine.evaluator import DEFAULT_SHORT_PAYMENT_TOLERANCE_PCT
 from ..rule_engine.fx_service import FxService
+from ..rule_engine.invoice_ledger import check_duplicate, record_application
 
 
 def _received_total(r: LineItem, selected_currency: str | None) -> tuple[float | None, dict]:
@@ -267,10 +268,23 @@ def _classify(r: LineItem, selected: list[dict]) -> dict:
                        f"— this mapping qualifies for Ready for Oracle.",
         }
 
+    # PATCH (business decision, confirmed): a shortfall beyond the auto
+    # tolerance used to be a dead end here — qualifies=False, and
+    # confirm_manual_mapping() refused to persist ANYTHING, so a SPOC could
+    # never actually record "yes, this payment is against these invoices,
+    # and yes, the rest is a genuine open shortage." That's now allowed:
+    # ANY non-negative shortfall qualifies (posting goes through as a
+    # partial receipt; the remaining balance stays open on the invoice for
+    # collections, same as a partial payment would in Oracle itself).
+    # shortfall_pct < 0 (overpayment) is UNCHANGED and still never
+    # qualifies here — see the overpayment branch above; "until it is not
+    # over paid" is exactly that boundary.
     return {
-        **base, "qualifies": False, "tag": None, "rule_id": "R9c", "reason_code": "UNEXPLAINED_SHORTAGE",
-        "message": f"Shortage of {shortfall_pct}% exceeds the {DEFAULT_SHORT_PAYMENT_TOLERANCE_PCT}% tolerance — "
-                   f"does not qualify for one-click posting.",
+        **base, "qualifies": True, "tag": "short_payment_recorded", "rule_id": "R9d",
+        "reason_code": "SHORT_PAYMENT_RECORDED",
+        "message": f"Shortage of {shortfall_pct}% exceeds the {DEFAULT_SHORT_PAYMENT_TOLERANCE_PCT}% auto-tolerance, "
+                   f"but is recorded as a genuine short payment against the selected invoice(s) — this mapping "
+                   f"qualifies for Ready for Oracle. The remaining balance stays open for collections.",
     }
 
 
@@ -307,6 +321,23 @@ def preview_manual_mapping(db: Session, line_item_id: int, invoice_numbers: list
             "error": f"Selected invoices belong to different customers ({', '.join(customer_names)}) — "
                      f"select invoices from one customer only."
         }
+
+    # PATCH: real duplicate-mapping protection -- see rule_engine/
+    # invoice_ledger.py's module docstring for exactly what this replaces
+    # (a permanent False stub). Checked per invoice BEFORE shortfall
+    # classification, since it doesn't matter whether the selection would
+    # otherwise be an exact match or a short payment -- if another row has
+    # already claimed this invoice's outstanding amount, this selection is
+    # blocked outright, not silently allowed to double up on it.
+    for v in selected:
+        dup = check_duplicate(
+            db, v["invoice_number"], v["ou_number"],
+            outstanding_amount=v["outstanding_amount"],
+            new_amount=v["outstanding_amount"],
+            exclude_line_item_id=line_item_id,
+        )
+        if dup["blocked"]:
+            return {"error": dup["message"], "qualifies": False, "duplicate": dup}
 
     result = _classify(r, selected)
     result["matched_invoices_preview"] = selected
@@ -400,6 +431,12 @@ def confirm_manual_mapping(
         triggered_by=user.email if user else None,
         comment=f"Manually mapped to invoice(s): {', '.join(invoice_numbers)}",
     ))
+    # PATCH: register this mapping in the ledger the moment it's confirmed
+    # (status="pending", not yet "confirmed" -- that upgrade happens at
+    # Approve, see hitl/service.py) -- so a SECOND row trying to map the
+    # SAME invoice sees it as already claimed immediately, not only after
+    # this row is later approved.
+    record_application(db, r, status="pending")
     db.commit()
 
     return {

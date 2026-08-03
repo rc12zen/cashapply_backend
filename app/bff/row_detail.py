@@ -10,7 +10,7 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from ..db.models import LineItem, RemittanceExtraction, RemittanceInvoiceLine
-from ..bff.metrics import _category_for_row, GROUP_LABELS, GROUP_READY_FOR_ORACLE
+from ..bff.metrics import _category_for_row, GROUP_LABELS, GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT
 from ..oracle.fusion_client import build_receipt_creation_payload, build_remittance_reference_payloads
 from ..rule_engine.fx_service import get_ou_display_name
 from ..hitl.actions_registry import get_available_actions
@@ -170,7 +170,7 @@ def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str
     # receipt-payload preview above.
     reference_payload = r.reference_payload
     reference_is_preview = False
-    if not reference_payload and _cat == GROUP_READY_FOR_ORACLE:
+    if not reference_payload and _cat in (GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT):
         try:
             reference_payload = build_remittance_reference_payloads(r, invoice_breakup=None)
             reference_is_preview = True
@@ -210,6 +210,12 @@ def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str
         "manually_mapped":    bool(r.manually_mapped),
         "manually_mapped_at": r.manually_mapped_at.isoformat() if r.manually_mapped_at else None,
         "manually_mapped_by": r.manually_mapped_by,
+        # NEW: row identity for credit card / cheque / third-party provider
+        # settlements — see LineItem.settlement_type's comment in
+        # db/models.py and rule_engine/evaluator.py's R16/R17/R18. Drives
+        # specialFlags.tsx's three new badges on the frontend.
+        "settlement_type":     getattr(r, "settlement_type", None),
+        "settlement_provider": getattr(r, "settlement_provider", None),
         "bank_statement": {
             "bank_name": r.bank_name,
             "statement_date": r.statement_date.isoformat() if r.statement_date else None,

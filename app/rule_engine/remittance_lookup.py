@@ -67,6 +67,11 @@ def build_remittance_view(db: Session, line_item, aging_customer_hint: str | Non
         "amount_paid": float(l.amount_paid) if l.amount_paid is not None else None,
         "amount_withheld": float(l.amount_withheld) if l.amount_withheld is not None else None,
         "document_amount": float(l.document_amount) if l.document_amount is not None else None,
+        # NEW — only populated when ext.document_type is "card_breakdown" /
+        # "cheque_scan" (see agent's claude_extractor.py + shared-column
+        # note on RemittanceInvoiceLine in db/models.py). None for every
+        # ordinary remittance line.
+        "customer_name": l.customer_name,
     } for l in lines]
 
     customer_conflicts = False
@@ -74,13 +79,26 @@ def build_remittance_view(db: Session, line_item, aging_customer_hint: str | Non
         score = fuzz.token_sort_ratio(ext.raw_customer_text.upper(), aging_customer_hint.upper())
         customer_conflicts = score < CUSTOMER_FUZZY_MIN
 
+    # NEW: this used to be a hardcoded False with a "future grouping step"
+    # comment -- now real, now that App2 can actually tell us which
+    # customer each line belongs to. Still harmless for the settlement
+    # rows this was written for: a card_breakdown/cheque_scan bank row is
+    # tagged by R16/R17/R18 (see rule_engine/evaluator.py) BEFORE this
+    # remittance/R6 path is ever reached, so multiple_customers=True here
+    # never actually fires R6 for those rows. It's exposed for the
+    # upcoming Split & Map screen, which needs exactly this per-line
+    # customer breakdown, not for R6 to act on today.
+    distinct_customers = {l.customer_name for l in lines if l.customer_name}
+    multiple_customers = ext.document_type in ("card_breakdown", "cheque_scan") and len(distinct_customers) > 1
+
     return {
         "found": True,
         "invoices": invoices,
         "ambiguous": False,
         "customer_conflicts_with_aging": customer_conflicts,
-        "multiple_customers": False,   # set True by a future grouping step (Scenario 5/6 consolidation)
+        "multiple_customers": multiple_customers,
         "payer_explains_overpayment": False,
         "extraction_id": ext.id,
         "raw_customer_text": ext.raw_customer_text,
+        "document_type": ext.document_type or "customer_remittance",
     }

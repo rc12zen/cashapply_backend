@@ -83,6 +83,7 @@ from ..aging import aging_store
 from ..extraction.debug_logger import dbg
 from ..bank_statement.detector import detect_config
 from ..bank_statement.parser import parse_credit_rows
+from ..bank_statement.settlement_identifier import classify_settlement
 from ..schemas.chunk import CreditRowSchema
 
 from ..extraction.chunk_processor import dispatch_chunks
@@ -276,6 +277,12 @@ def _build_rule_input(
     """
     orig = payment.original
 
+    # ── Settlement identity (credit card / cheque / third-party provider) ────
+    # See bank_statement/settlement_identifier.py -- computed once here and
+    # reused for both dict keys below, rather than calling the classifier
+    # (and re-hitting the SettlementIdentifier table) twice.
+    _settlement_match = classify_settlement(db, orig.narrative, payment.customer_name) if db is not None else None
+
     # ── Remittance (Pass 2 only) ──────────────────────────────────────────────
     remittance_view = (
         build_remittance_view(db, line_item, payment.customer_name)
@@ -405,6 +412,18 @@ def _build_rule_input(
         },
         "duplicate_invoice_across_customers": False,
         "already_processed_match":            False,
+        # PATCH: settlement identity (credit card / cheque / third-party
+        # provider) -- see bank_statement/settlement_identifier.py and
+        # evaluator.py's R16/R17/R18. Computed fresh on both passes (it's a
+        # cheap narration/payer-name check against a small config table) so
+        # a settlement row is tagged as early as possible rather than only
+        # on Pass 2. `db is None` on Pass 1 in some call sites -- settlement
+        # detection needs no aging/remittance data, but it does need a
+        # session to read the SettlementIdentifier config table, so it's
+        # skipped (not guessed at) on that pass and simply re-evaluated on
+        # Pass 2 once a session is available.
+        "settlement_type":     _settlement_match.settlement_type if _settlement_match else None,
+        "settlement_provider": _settlement_match.settlement_provider if _settlement_match else None,
     }
 
 

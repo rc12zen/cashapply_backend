@@ -52,19 +52,45 @@ from .date_range import parse_date_from, parse_date_to
 # can't distinguish R7 from R9a from R11, etc — see state_machine.py
 # CATEGORY_TO_STATE). Every rule_id below maps 1:1 to exactly one of the
 # groups the dashboard/ledger now show.
-GROUP_UNIDENTIFIED       = "unidentified"
-GROUP_NEEDS_REMITTANCE   = "needs_remittance"
-GROUP_READY_FOR_ORACLE   = "ready_for_oracle"   # MERGED: R9a (exact) + R9b (within tolerance)
-GROUP_CONFLICT_EXCEPTION = "conflict_exception"
-GROUP_PROCESSED          = "processed"           # terminal — overrides rule_id
-GROUP_REJECTED           = "rejected"             # terminal — overrides rule_id
-GROUP_POST_FAILED        = "post_failed"          # terminal — overrides rule_id
+GROUP_UNIDENTIFIED        = "unidentified"
+GROUP_NEEDS_REMITTANCE    = "needs_remittance"
+GROUP_NEEDS_DISTRIBUTION  = "needs_distribution"  # R16/R17/R18 — card/cheque/third-party settlement identity
+GROUP_READY_FOR_ORACLE    = "ready_for_oracle"    # R9a (exact match) ONLY as of this patch — see below
+# NEW: previously R9b/R9d were merged into GROUP_READY_FOR_ORACLE ("both go
+# through the identical SPOC-approve -> Oracle POST path"). Split out on
+# request — a short payment (whether within the auto-tolerance, R9b, or a
+# manually-recorded one beyond it, R9d) is operationally identical to an
+# exact match (Approve -> Oracle POST) but is a genuinely different
+# financial fact — an open shortfall still exists on the invoice — so it
+# now gets its own list bucket and its own executive-summary visibility
+# instead of being invisible inside "Ready for Oracle".
+GROUP_SHORT_PAYMENT       = "short_payment"
+GROUP_CONFLICT_EXCEPTION  = "conflict_exception"
+GROUP_PROCESSED           = "processed"           # terminal — overrides rule_id
+GROUP_REJECTED            = "rejected"             # terminal — overrides rule_id
+GROUP_POST_FAILED         = "post_failed"          # terminal — overrides rule_id
+
+# Every group that _category_for_row() can ever return — the single list
+# every aggregation dict below is initialized from, so adding a new group
+# can never again silently miss one of these dicts (that gap is exactly
+# what let GROUP_NEEDS_DISTRIBUTION ship without being wired into any of
+# them — see the fix in this same patch).
+ALL_GROUPS: tuple[str, ...] = (
+    GROUP_UNIDENTIFIED, GROUP_NEEDS_REMITTANCE, GROUP_NEEDS_DISTRIBUTION,
+    GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_CONFLICT_EXCEPTION,
+    GROUP_PROCESSED, GROUP_REJECTED, GROUP_POST_FAILED,
+)
 
 RULE_ID_TO_GROUP: dict[str, str] = {
     "R8":  GROUP_UNIDENTIFIED,
     "R7":  GROUP_NEEDS_REMITTANCE,
-    "R9a": GROUP_READY_FOR_ORACLE,
-    "R9b": GROUP_READY_FOR_ORACLE,
+    "R9a": GROUP_READY_FOR_ORACLE,     # exact match only
+    "R9b": GROUP_SHORT_PAYMENT,        # acceptable short payment, within auto-tolerance
+    # NEW — see hitl/manual_mapping.py's _classify(). A shortfall beyond the
+    # auto-tolerance, manually confirmed by a SPOC as a genuine short
+    # payment (not an overpayment) — same downstream Approve->Oracle path,
+    # same bucket as R9b.
+    "R9d": GROUP_SHORT_PAYMENT,
     "R0":  GROUP_CONFLICT_EXCEPTION,
     "R1":  GROUP_CONFLICT_EXCEPTION,
     "R2":  GROUP_CONFLICT_EXCEPTION,
@@ -76,13 +102,27 @@ RULE_ID_TO_GROUP: dict[str, str] = {
     "R11": GROUP_CONFLICT_EXCEPTION,
     "R13": GROUP_CONFLICT_EXCEPTION,
     "R14": GROUP_CONFLICT_EXCEPTION,
+    # NEW — see evaluator.py's R16/R17/R18. Deliberately its OWN group, not
+    # folded into conflict_exception: nothing is actually wrong with these
+    # rows, they just need a SPOC-entered breakdown before they can be
+    # mapped/posted, which is a different queue with a different action.
+    "R16": GROUP_NEEDS_DISTRIBUTION,   # credit card settlement
+    "R17": GROUP_NEEDS_DISTRIBUTION,   # cheque settlement
+    "R18": GROUP_NEEDS_DISTRIBUTION,   # third-party provider
+    # NEW — see rule_engine/state_machine.py's duplicate-override block and
+    # rule_engine/invoice_ledger.py. An automatic R9a/R9b match gets
+    # overridden to this when the invoice it matched is already claimed
+    # (pending/confirmed) by a different row.
+    "R19": GROUP_CONFLICT_EXCEPTION,   # invoice already applied elsewhere (duplicate)
 }
 
 # Display labels — used wherever a human-readable group name is needed.
 GROUP_LABELS: dict[str, str] = {
     GROUP_UNIDENTIFIED:       "Unidentified",
     GROUP_NEEDS_REMITTANCE:   "Needs Remittance",
+    GROUP_NEEDS_DISTRIBUTION: "Needs Distribution",
     GROUP_READY_FOR_ORACLE:   "Ready for Oracle",
+    GROUP_SHORT_PAYMENT:      "Short Payment",
     GROUP_CONFLICT_EXCEPTION: "Conflict / Exception",
     GROUP_PROCESSED:          "Processed",
     GROUP_REJECTED:           "Rejected",
@@ -302,29 +342,15 @@ def _to_usd(r: LineItem) -> float:
 
 def _group_amounts(rows: list[LineItem]) -> dict:
     """USD-equivalent total credit amount per display group."""
-    amounts = {g: 0.0 for g in (
-        GROUP_UNIDENTIFIED, GROUP_NEEDS_REMITTANCE, GROUP_READY_FOR_ORACLE,
-        GROUP_CONFLICT_EXCEPTION, GROUP_PROCESSED, GROUP_REJECTED, GROUP_POST_FAILED,
-    )}
+    amounts = {g: 0.0 for g in ALL_GROUPS}
     for r in rows:
         amounts[_category_for_row(r)] += _to_usd(r)
     return {k: round(v, 2) for k, v in amounts.items()}
-    """Counts every row into exactly one of the 7 display groups."""
-    counts = {g: 0 for g in (
-        GROUP_UNIDENTIFIED, GROUP_NEEDS_REMITTANCE, GROUP_READY_FOR_ORACLE,
-        GROUP_CONFLICT_EXCEPTION, GROUP_PROCESSED, GROUP_REJECTED, GROUP_POST_FAILED,
-    )}
-    for r in rows:
-        counts[_category_for_row(r)] += 1
-    return counts
 
 
 def _group_counts(rows: list[LineItem]) -> dict:
-    """Counts every row into exactly one of the 7 display groups."""
-    counts = {g: 0 for g in (
-        GROUP_UNIDENTIFIED, GROUP_NEEDS_REMITTANCE, GROUP_READY_FOR_ORACLE,
-        GROUP_CONFLICT_EXCEPTION, GROUP_PROCESSED, GROUP_REJECTED, GROUP_POST_FAILED,
-    )}
+    """Counts every row into exactly one of the display groups (ALL_GROUPS)."""
+    counts = {g: 0 for g in ALL_GROUPS}
     for r in rows:
         counts[_category_for_row(r)] += 1
     return counts
@@ -352,8 +378,10 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
                            was found — customer and/or invoice — regardless
                            of whether it's fully reconciled yet)
       unidentified       = R8, NO_SIGNAL — nothing extracted at all
-      ready_for_oracle   = R9a (exact match) + R9b (acceptable short payment)
-                           — the only rows eligible for one-click Approve
+      ready_for_oracle   = R9a (exact match) only — R9b/R9d (short payments)
+                           now have their own group, GROUP_SHORT_PAYMENT/
+                           total_short_payment, split out on request; both
+                           groups are still one-click-Approve eligible
 
     Legacy fields (total_matched, total_not_found, pending_hitl, etc.) are
     KEPT for backward compatibility with any other consumer of this row
@@ -366,12 +394,18 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
 
     total_unidentified = 0
     total_ready_for_oracle = 0
+    total_short_payment = 0
+    total_needs_distribution = 0
     for r in rows:
         cat = _category_for_row(r)
         if cat == GROUP_UNIDENTIFIED:
             total_unidentified += 1
         if cat == GROUP_READY_FOR_ORACLE:
             total_ready_for_oracle += 1
+        if cat == GROUP_SHORT_PAYMENT:
+            total_short_payment += 1
+        if cat == GROUP_NEEDS_DISTRIBUTION:
+            total_needs_distribution += 1
     total_identified = len(rows) - total_unidentified
 
     # PATCH: the aging report snapshot this run actually matched against —
@@ -401,6 +435,8 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
         "total_identified": total_identified,
         "total_unidentified": total_unidentified,
         "total_ready_for_oracle": total_ready_for_oracle,
+        "total_short_payment": total_short_payment,
+        "total_needs_distribution": total_needs_distribution,
         # ── Legacy fields — kept for backward compatibility ──────────────────
         "total_matched": matched,
         "total_not_found": not_found,
@@ -464,11 +500,11 @@ def compute_run_summary(db: Session, run_id: int) -> dict:
     """
     rows = db.query(LineItem).filter(LineItem.run_id == run_id).all()
 
-    # Compute each row's group exactly once.
-    rows_by_group: dict[str, list[LineItem]] = {
-        GROUP_UNIDENTIFIED: [], GROUP_NEEDS_REMITTANCE: [], GROUP_READY_FOR_ORACLE: [],
-        GROUP_CONFLICT_EXCEPTION: [], GROUP_PROCESSED: [], GROUP_REJECTED: [], GROUP_POST_FAILED: [],
-    }
+    # Compute each row's group exactly once. Keyed off ALL_GROUPS so a
+    # future new group can never again ship without being wired in here —
+    # see ALL_GROUPS's own comment for the exact bug this fixes retroactively
+    # (needs_distribution rows would have raised a KeyError below).
+    rows_by_group: dict[str, list[LineItem]] = {g: [] for g in ALL_GROUPS}
     for r in rows:
         rows_by_group[_category_for_row(r)].append(r)
 
@@ -476,7 +512,9 @@ def compute_run_summary(db: Session, run_id: int) -> dict:
         "total_rows":              len(rows),
         "unidentified":             len(rows_by_group[GROUP_UNIDENTIFIED]),
         "needs_remittance":         len(rows_by_group[GROUP_NEEDS_REMITTANCE]),
+        "needs_distribution":       len(rows_by_group[GROUP_NEEDS_DISTRIBUTION]),
         "ready_for_oracle":         len(rows_by_group[GROUP_READY_FOR_ORACLE]),
+        "short_payment":            len(rows_by_group[GROUP_SHORT_PAYMENT]),
         "conflict_exception":       len(rows_by_group[GROUP_CONFLICT_EXCEPTION]),
         "processed":                len(rows_by_group[GROUP_PROCESSED]),
         "rejected":                 len(rows_by_group[GROUP_REJECTED]),
@@ -488,15 +526,7 @@ def compute_run_summary(db: Session, run_id: int) -> dict:
     # identified/matched at extraction time make sense to drill into).
     # "Unidentified" rows have no extraction to inspect — keep source "not_found".
     # Every other group had a real extraction result, so source "matched".
-    SOURCE_FOR_GROUP = {
-        GROUP_UNIDENTIFIED:       "not_found",
-        GROUP_NEEDS_REMITTANCE:   "matched",
-        GROUP_READY_FOR_ORACLE:   "matched",
-        GROUP_CONFLICT_EXCEPTION: "matched",
-        GROUP_PROCESSED:          "matched",
-        GROUP_REJECTED:           "matched",
-        GROUP_POST_FAILED:        "matched",
-    }
+    SOURCE_FOR_GROUP = {g: ("not_found" if g == GROUP_UNIDENTIFIED else "matched") for g in ALL_GROUPS}
 
     tabs = {
         group: {

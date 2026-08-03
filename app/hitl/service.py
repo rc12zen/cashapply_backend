@@ -37,7 +37,8 @@ from sqlalchemy.orm import Session
 from ..db.models import LineItem, RowStatusHistory
 from ..oracle.fusion_client import OracleFusionClient, build_remittance_reference_payloads
 from ..oracle.receipt_creation import create_receipt_for_line_item
-from ..bff.metrics import _category_for_row, GROUP_READY_FOR_ORACLE, GROUP_LABELS
+from ..bff.metrics import _category_for_row, GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_LABELS
+from ..rule_engine.invoice_ledger import confirm_applications, release_applications
 
 logger = logging.getLogger(__name__)
 
@@ -221,14 +222,18 @@ def approve_row(
             "current_version": r.version,
         }
 
-    # ── PATCH: server-side gate — ONLY ready_for_oracle (R9a/R9b) rows may
-    # ever reach an Oracle POST. This is the actual enforcement; the
+    # ── PATCH: server-side gate — ONLY ready_for_oracle (R9a) and
+    # short_payment (R9b/R9d) rows may ever reach an Oracle POST. GROUP_
+    # SHORT_PAYMENT was split out of GROUP_READY_FOR_ORACLE into its own
+    # dashboard/ledger bucket on request, but it did NOT change which rows
+    # are actually approvable — both groups still go through the identical
+    # Approve -> Oracle POST path, so both must pass this gate. The
     # frontend disabling the Approve button is a convenience, not a
     # security boundary. Uses the SAME mapping bff/metrics.py uses for
     # dashboard/ledger grouping, so this can never silently drift out of
-    # sync with what the UI calls "Ready for Oracle".
+    # sync with what the UI calls "Ready for Oracle" / "Short Payment".
     category = _category_for_row(r)
-    if category != GROUP_READY_FOR_ORACLE:
+    if category not in (GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT):
         return {
             "id": r.id,
             "error": "not_approvable",
@@ -237,11 +242,11 @@ def approve_row(
             "category_label": GROUP_LABELS.get(category, category),
             "message": (
                 f"Row {r.id} is in category '{GROUP_LABELS.get(category, category)}' "
-                f"(rule_id={r.rule_id}) — only rows in 'Ready for Oracle' "
-                f"(exact match or acceptable short payment) can be approved "
-                f"and posted to Oracle. Resolve the underlying issue first "
-                f"(provide remittance, correct the match, etc.) to re-evaluate "
-                f"this row into Ready for Oracle before approving."
+                f"(rule_id={r.rule_id}) — only rows in 'Ready for Oracle' or 'Short Payment' "
+                f"(exact match, acceptable short payment, or a manually-recorded short "
+                f"payment) can be approved and posted to Oracle. Resolve the underlying "
+                f"issue first (provide remittance, correct the match, etc.) to re-evaluate "
+                f"this row into one of those categories before approving."
             ),
         }
 
@@ -250,6 +255,15 @@ def approve_row(
     r.current_state = "processed" if result["success"] else "post_failed"
     r.status        = "Processed" if result["success"] else "Post Failed"
     r.version       = (r.version or 0) + 1
+
+    # PATCH: upgrade this row's ledger entries from "pending" to
+    # "confirmed" once the Oracle invoice-mapping call actually succeeds —
+    # see rule_engine/invoice_ledger.py. Left as "pending" on failure (not
+    # released) since the invoice IS still genuinely claimed by this row;
+    # a failed Oracle call is a posting problem, not a reason to free the
+    # invoice back up for another row to grab.
+    if result["success"]:
+        confirm_applications(db, r)
 
     db.add(RowStatusHistory(
         line_item_id=r.id, from_state="review_approve",
@@ -313,6 +327,12 @@ def reject_row(
     r.current_state = "rejected"
     r.status        = "Rejected"
     r.version       = (r.version or 0) + 1
+
+    # PATCH: free every invoice this row had claimed — see
+    # rule_engine/invoice_ledger.py. Without this, rejecting a row would
+    # leave its invoice(s) permanently marked "pending" in the ledger,
+    # falsely blocking a correct future mapping to the same invoice.
+    release_applications(db, r)
 
     db.add(RowStatusHistory(
         line_item_id=r.id, from_state="review_approve", to_state="rejected",
