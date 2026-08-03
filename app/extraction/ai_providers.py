@@ -222,6 +222,19 @@ _STATUS_CACHE_TTL_SECONDS = 60
 _status_cache: dict | None = None
 _status_cache_at: float = 0.0
 
+# Human-facing names for the raw AI_PROVIDER tokens, so status messages read
+# "Azure OpenAI" rather than "azure_openai" (the frontend mirrors this map in
+# app/home/page.tsx's prettyProvider()).
+_PROVIDER_LABELS = {
+    "azure_openai": "Azure OpenAI",
+    "openai": "OpenAI",
+    "anthropic": "Anthropic (Claude)",
+}
+
+
+def _pretty_provider(provider: str | None) -> str:
+    return _PROVIDER_LABELS.get(provider or "", provider or "the AI provider")
+
 
 def _check_anthropic_reachable() -> tuple[bool, str | None]:
     from ..db.settings import get_settings
@@ -317,16 +330,20 @@ def get_ai_status(force_refresh: bool = False) -> dict:
         model = None
         active, error, configured = False, f"Unknown AI_PROVIDER '{provider}'", False
 
+    label = _pretty_provider(provider)
     if active:
-        message = f"AI extraction is active ({provider} {model})."
+        message = f"AI extraction is active ({label}, model {model})."
     elif not configured:
         message = (
-            f"No API key configured for {provider} -- AI extraction fallback will not run. "
-            f"Analysis can still proceed using pattern/regex matching only, but unresolved rows "
-            f"won't get the AI second pass."
+            f"No API key is configured for {label}. "
+            f"AI extraction can't run until an administrator adds a valid key."
         )
     else:
-        message = f"{provider} is configured but not reachable right now ({error}). Contact an administrator."
+        # `error` is the provider's own failure text (expired/invalid key,
+        # service outage, wrong deployment name, ...) -- surfaced as the
+        # specific reason, trimmed of surrounding whitespace/newlines.
+        detail = " ".join(str(error).split()) if error else "the service could not be reached"
+        message = f"{label} is configured but isn't reachable right now: {detail}. Contact an administrator."
 
     result = {
         "provider": provider,
