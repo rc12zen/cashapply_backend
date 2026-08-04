@@ -307,12 +307,33 @@ def get_ai_status(force_refresh: bool = False) -> dict:
     import time as _time
     global _status_cache, _status_cache_at
 
-    if not force_refresh and _status_cache is not None and (_time.monotonic() - _status_cache_at) < _STATUS_CACHE_TTL_SECONDS:
-        return {**_status_cache, "cached": True}
-
     from ..db.settings import get_settings
     s = get_settings()
     provider = (s.AI_PROVIDER or "anthropic").strip().lower()
+
+    # Master switch OFF (.env: AI_EXTRACTION_ENABLED=false) -- report a neutral
+    # "disabled" state WITHOUT pinging the provider (local dev needs no valid
+    # key). enabled=false tells the frontend the gate should stay OPEN
+    # (upload/analyse proceed regex-only), NOT that there's an outage. The
+    # matching skip is in layer_2b_ai.py's run_layer_2b().
+    if not s.AI_EXTRACTION_ENABLED:
+        return {
+            "provider": provider,
+            "model": None,
+            "enabled": False,
+            "configured": False,
+            "active": False,
+            "checked_at": _dt.datetime.utcnow().isoformat(),
+            "message": (
+                "AI extraction is turned OFF (AI_EXTRACTION_ENABLED=false). "
+                "Analysis runs with pattern/regex matching only -- unresolved rows "
+                "won't get the AI second pass. Upload and analysis are still allowed."
+            ),
+            "cached": False,
+        }
+
+    if not force_refresh and _status_cache is not None and (_time.monotonic() - _status_cache_at) < _STATUS_CACHE_TTL_SECONDS:
+        return {**_status_cache, "cached": True}
 
     if provider == "azure_openai":
         model = s.AZURE_OPENAI_DEPLOYMENT
@@ -348,6 +369,7 @@ def get_ai_status(force_refresh: bool = False) -> dict:
     result = {
         "provider": provider,
         "model": model,
+        "enabled": True,
         "configured": configured,
         "active": active,
         "checked_at": _dt.datetime.utcnow().isoformat(),

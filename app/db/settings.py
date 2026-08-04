@@ -112,6 +112,18 @@ class Settings(BaseSettings):
     # whichever provider you pick.
     AI_PROVIDER: Literal["anthropic", "openai", "azure_openai"] = "anthropic"
 
+    # ── AI extraction master switch (.env: AI_EXTRACTION_ENABLED) ─────────────
+    # Turns the Layer 2B AI fallback pass ON/OFF entirely. Default True. Set to
+    # false in local dev to avoid spending provider tokens while working on
+    # unrelated things: the pipeline still runs (regex/pattern matching only),
+    # unresolved rows just land as "unidentified" instead of getting the AI
+    # second pass. When false, get_ai_status() reports a neutral "disabled"
+    # state WITHOUT pinging the provider (no valid key needed locally), and the
+    # frontend gate treats that as "allowed" (upload/analyse proceed) rather
+    # than an outage. See extraction/ai_providers.py get_ai_status() and
+    # extraction/layer_2b_ai.py run_layer_2b(), which both check this flag.
+    AI_EXTRACTION_ENABLED: bool = True
+
     # ── AI usage / cost tracking (app.ai_usage) ──────────────────────────────
     # Per-token USD rates -- ONE pair per provider family, since pricing
     # differs. azure_openai reuses the OPENAI_* rates below (Azure OpenAI's

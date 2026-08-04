@@ -598,6 +598,24 @@ def run_layer_2b(layer_2a_result: Layer2AResultSchema, aging_map: AgingMap) -> L
     batch_size, max_concurrency = _batch_settings()
 
     all_rows = layer_2a_result.no_invoice_found
+
+    # Master switch (.env: AI_EXTRACTION_ENABLED=false) -- skip the ENTIRE Layer
+    # 2B AI pass without making a single provider call, so local dev spends zero
+    # tokens. Every unresolved row is returned as UnknownPayment with
+    # ai_attempted=False (exactly as if the AI found nothing), so downstream
+    # treats them as unidentified -- same handling as an empty-narrative row.
+    from ..db.settings import get_settings
+    if not get_settings().AI_EXTRACTION_ENABLED:
+        dbg(run_id, "2B", "CHUNK",
+            f"{chunk_ref} AI extraction DISABLED (AI_EXTRACTION_ENABLED=false) -- "
+            f"skipping all {len(all_rows)} unresolved row(s), 0 AI calls")
+        for row in all_rows:
+            result.unknown.append(UnknownPayment(
+                original=row.original, regex_candidates_tried=row.regex_candidate_invoices,
+                ai_attempted=False, failure_reason="ai_disabled",
+            ))
+        return result
+
     dbg(run_id, "2B", "CHUNK",
         f"{chunk_ref} starting AI fallback for {len(all_rows)} unresolved rows "
         f"(batch_size={batch_size} from .env: AI_BATCH_SIZE, "
