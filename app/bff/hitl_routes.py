@@ -49,6 +49,7 @@ from ..hitl import (
     check_receipt_retry_eligibility_for_run, serialize_line_item,
     get_mapping_options, get_invoices_for_customer,
     preview_manual_mapping, confirm_manual_mapping,
+    mark_eligible_for_receipt, discard_row, edit_gl_rate,
 )
 from ..rule_engine.remittance_recheck import recheck_needs_remittance_rows
 from ..rule_engine.customer_name_correction import correct_customer_name, get_customer_name_options
@@ -126,6 +127,77 @@ def reject(id: int, payload: dict, request: Request, db: Session = Depends(get_d
 
     log_activity(db, user, action="hitl.reject", entity_type="LineItem", entity_id=id,
                  ip_address=_client_ip(request), metadata={"comment": payload.get("comment")})
+    db.commit()
+    return result
+
+
+@router.post("/mark-eligible/{id}")
+def mark_eligible(id: int, request: Request, db: Session = Depends(get_db),
+                   user: User = Depends(require_permission("hitl:map"))):
+    """
+    Unidentified rows only — see hitl/service.py's mark_eligible_for_receipt().
+    Confirms this row IS a real receivable transaction and creates the bare
+    Oracle receipt right now (Step 4.5 holds it back automatically for
+    unidentified rows — see rule_engine/orchestrator.py).
+    """
+    result = mark_eligible_for_receipt(db, id, triggered_by=user.email)
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") in ("not_eligible_for_action", "already_decided"):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
+
+    log_activity(db, user, action="hitl.mark_eligible", entity_type="LineItem", entity_id=id,
+                 ip_address=_client_ip(request),
+                 metadata={"receipt_created": result.get("receipt_created"),
+                           "oracle_ref_no": result.get("oracle_ref_no")})
+    db.commit()
+    return result
+
+
+@router.post("/discard/{id}")
+def discard(id: int, payload: dict, request: Request, db: Session = Depends(get_db),
+            user: User = Depends(require_permission("hitl:reject"))):
+    """
+    Unidentified rows only — see hitl/service.py's discard_row(). SPOC has
+    judged this row is NOT a real receivable transaction at all; moves it
+    to its own `discarded` state without ever creating an Oracle receipt.
+    Same permission tier as Reject — this is the same weight of decision.
+    """
+    result = discard_row(db, id, payload.get("comment"), triggered_by=user.email)
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") in ("not_eligible_for_action", "already_decided"):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
+
+    log_activity(db, user, action="hitl.discard", entity_type="LineItem", entity_id=id,
+                 ip_address=_client_ip(request), metadata={"comment": payload.get("comment")})
+    db.commit()
+    return result
+
+
+@router.put("/gl-rate/{id}")
+def update_gl_rate(id: int, payload: dict, request: Request, db: Session = Depends(get_db),
+                    user: User = Depends(require_permission("oracle:post"))):
+    """
+    Cross-ledger-currency rows only, and only BEFORE invoice mapping exists
+    on the receipt — see hitl/service.py's edit_gl_rate() docstring for the
+    exact guard and why. Same permission tier as Approve/Retry — this
+    directly PATCHes an Oracle receipt.
+    """
+    new_rate = payload.get("new_rate")
+    if new_rate is None:
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail="new_rate is required.")
+
+    result = edit_gl_rate(db, id, float(new_rate), payload.get("reason"), triggered_by=user.email)
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") in ("not_cross_ledger", "no_receipt", "already_mapped", "oracle_patch_failed"):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
+
+    log_activity(db, user, action="hitl.edit_gl_rate", entity_type="LineItem", entity_id=id,
+                 ip_address=_client_ip(request),
+                 metadata={"old_rate": result.get("old_rate"), "new_rate": result.get("new_rate"),
+                           "reason": payload.get("reason")})
     db.commit()
     return result
 

@@ -83,6 +83,7 @@ from ..aging import aging_store
 from ..extraction.debug_logger import dbg
 from ..bank_statement.detector import detect_config
 from ..bank_statement.parser import parse_credit_rows
+from ..bank_statement.settlement_identifier import classify_settlement
 from ..schemas.chunk import CreditRowSchema
 
 from ..extraction.chunk_processor import dispatch_chunks
@@ -276,6 +277,12 @@ def _build_rule_input(
     """
     orig = payment.original
 
+    # ── Settlement identity (credit card / cheque / third-party provider) ────
+    # See bank_statement/settlement_identifier.py -- computed once here and
+    # reused for both dict keys below, rather than calling the classifier
+    # (and re-hitting the SettlementIdentifier table) twice.
+    _settlement_match = classify_settlement(db, orig.narrative, payment.customer_name) if db is not None else None
+
     # ── Remittance (Pass 2 only) ──────────────────────────────────────────────
     remittance_view = (
         build_remittance_view(db, line_item, payment.customer_name)
@@ -405,6 +412,18 @@ def _build_rule_input(
         },
         "duplicate_invoice_across_customers": False,
         "already_processed_match":            False,
+        # PATCH: settlement identity (credit card / cheque / third-party
+        # provider) -- see bank_statement/settlement_identifier.py and
+        # evaluator.py's R16/R17/R18. Computed fresh on both passes (it's a
+        # cheap narration/payer-name check against a small config table) so
+        # a settlement row is tagged as early as possible rather than only
+        # on Pass 2. `db is None` on Pass 1 in some call sites -- settlement
+        # detection needs no aging/remittance data, but it does need a
+        # session to read the SettlementIdentifier config table, so it's
+        # skipped (not guessed at) on that pass and simply re-evaluated on
+        # Pass 2 once a session is available.
+        "settlement_type":     _settlement_match.settlement_type if _settlement_match else None,
+        "settlement_provider": _settlement_match.settlement_provider if _settlement_match else None,
     }
 
 
@@ -906,31 +925,38 @@ def _run_analysis(run_id: int, selected_files: list[str]) -> None:
             # ── Step 4.5: Create a bare Oracle receipt for EVERY credit row ────
             # in this run — regardless of category (unidentified,
             # needs_remittance, ready_for_oracle, conflict_exception, all of
-            # it). This is the "Receipt Creation" half of the new two-step
-            # flow: no longer gated on ready_for_oracle / SPOC approval, and
-            # deliberately sent WITHOUT remittanceReferences (see
-            # oracle.fusion_client.build_receipt_creation_payload). Invoice
-            # mapping (attaching remittanceReferences to this same receipt)
-            # happens later, only for ready_for_oracle rows, at SPOC-approval
-            # time — see hitl/service.py.
+            # it) — WITH ONE EXCEPTION as of this patch: unidentified (R8,
+            # NO_SIGNAL) rows are HELD until a SPOC decides whether they're
+            # even a real receivable transaction at all (see
+            # LineItem.receipt_eligibility and hitl/service.py's
+            # mark_eligible_for_receipt() / discard_row()). Creating a bare
+            # Oracle receipt for a row with zero extracted signal — which may
+            # turn out to be an internal transfer, a bank fee, garbage
+            # narration, anything — meant every one of those needed a manual
+            # Oracle-side reversal later if it turned out not to be a real
+            # receipt. Holding creation costs nothing (the receipt is created
+            # the moment a SPOC marks it eligible instead) and avoids that
+            # cleanup entirely for the rows that get discarded.
             #
-            # PARALLELIZED via ThreadPoolExecutor (mirrors extraction/
-            # chunk_processor.py's dispatch_chunks pattern) — each row's
-            # Oracle HTTP call is independent of every other row's, so
-            # rows are fanned out across Settings.ORACLE_RECEIPT_MAX_WORKERS
-            # threads instead of one-at-a-time. Each worker thread opens its
-            # OWN DB session via session_scope() (the outer `db` session used
-            # for the rest of this function is NOT thread-safe and must never
-            # be shared across threads) — it re-fetches the LineItem by id,
-            # runs create_receipt_for_line_item against ITS session, and
-            # session_scope() commits/rolls back and closes that session when
-            # the thread's work is done. This keeps the existing
-            # "commit after each row so a mid-batch failure doesn't lose
-            # progress" guarantee, just per-thread instead of per-iteration
-            # of a single loop.
+            # Every other category is UNCHANGED — still created automatically,
+            # immediately, exactly as before. This is deliberately narrow: it
+            # is NOT a general eligibility gate, only the one this was asked
+            # for.
+            unidentified_undecided_ids: set[int] = {
+                li.id for li in db.query(LineItem.id).filter(
+                    LineItem.run_id == run_id,
+                    LineItem.rule_id == "R8",
+                    LineItem.receipt_eligibility.is_(None),
+                ).all()
+            }
             all_line_item_ids_this_run = [
                 li.id for li in db.query(LineItem.id).filter(LineItem.run_id == run_id).all()
+                if li.id not in unidentified_undecided_ids
             ]
+            if unidentified_undecided_ids:
+                dbg(run_id, "ORACLE", "batch",
+                    f"Step 4.5: holding receipt creation for {len(unidentified_undecided_ids)} "
+                    f"unidentified row(s) pending SPOC eligibility decision.")
             total_receipt_rows = len(all_line_item_ids_this_run)
             max_workers = max(1, get_settings().ORACLE_RECEIPT_MAX_WORKERS)
             dbg(run_id, "ORACLE", "batch",

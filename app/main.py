@@ -25,7 +25,7 @@ from .bff import (
     run_routes, results_routes, hitl_routes, config_routes, filters_routes,
     executive_summary, config_builder_routes, auth_routes, admin_routes,
     activity_log_routes, ai_usage_routes, storage_routes, bank_accounts_routes,
-    remittance_inbox_routes,
+    remittance_inbox_routes, settlement_identifier_routes,
 )
 
 app = FastAPI(title="CashApply Backend", version="1.1.0")
@@ -136,4 +136,5 @@ app.include_router(activity_log_routes.router, prefix="/api/activity-log",  tags
 app.include_router(ai_usage_routes.router,     prefix="/api/ai-usage",      tags=["ai-usage"])
 app.include_router(storage_routes.router,      prefix="/api/storage",       tags=["storage"])
 app.include_router(bank_accounts_routes.router, prefix="/api/bank-accounts", tags=["bank-accounts"])
+app.include_router(settlement_identifier_routes.router, prefix="/api/bank-accounts", tags=["settlement-identifiers"])
 app.include_router(remittance_inbox_routes.router, prefix="/api/remittance-inbox", tags=["remittance-inbox"])

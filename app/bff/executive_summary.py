@@ -37,14 +37,18 @@ exclusive (every posted row is exactly one of the two).
 NON-POSTED OVERVIEW
 --------------------
 Everything that has NOT reached Oracle yet, reusing the exact same
-7-group taxonomy as the main Dashboard / Analysis History page
+group taxonomy as the main Dashboard / Analysis History page
 (see app.bff.metrics._category_for_row — the single source of truth for
 "which bucket does this row belong in" everywhere else in the app):
-    unidentified | needs_remittance | conflict_exception | rejected | post_failed
-("ready_for_oracle" and "processed" are deliberately excluded here —
-ready_for_oracle rows haven't failed or stalled, they're just pending an
-action, and processed rows are by definition posted, so they live in the
-Posted view instead.)
+    unidentified | needs_remittance | needs_distribution | short_payment |
+    conflict_exception | rejected | post_failed
+("ready_for_oracle" (exact match only, as of the short-payment split) and
+"processed" are deliberately excluded here — ready_for_oracle rows haven't
+failed or stalled, they're just pending an action, and processed rows are
+by definition posted, so they live in the Posted view instead.
+needs_distribution and short_payment ARE included, on request, for their
+own exec-level visibility even though they're also technically "pending
+an action" — see NON_POSTED_GROUPS's own comment.)
 Plus a separate Cross-OU tag (`is_cross_ou_currency`), since that's a
 flag that can co-occur with any of the above states, not a state itself.
 """
@@ -65,7 +69,8 @@ from ..deps import get_db
 from ..auth import require_permission
 from .metrics import (
     GROUP_CONFLICT_EXCEPTION, GROUP_NEEDS_REMITTANCE, GROUP_POST_FAILED,
-    GROUP_REJECTED, GROUP_UNIDENTIFIED, GROUP_LABELS, _category_for_row,
+    GROUP_REJECTED, GROUP_UNIDENTIFIED, GROUP_NEEDS_DISTRIBUTION, GROUP_SHORT_PAYMENT,
+    GROUP_DISCARDED, GROUP_LABELS, _category_for_row,
 )
 from .date_range import parse_date_from, parse_date_to
 
@@ -365,7 +370,25 @@ def export_executive_csv(
 # never disagree with what the operational worklist shows, plus a
 # stand-alone Cross-OU tag since that's a flag, not a state.
 
-NON_POSTED_GROUPS = [GROUP_UNIDENTIFIED, GROUP_NEEDS_REMITTANCE, GROUP_CONFLICT_EXCEPTION, GROUP_REJECTED, GROUP_POST_FAILED]
+# NON_POSTED_GROUPS previously excluded ready_for_oracle (merged R9a+R9b)
+# on the grounds that "these rows haven't failed or stalled, they're just
+# pending an action" — same logic would argue against including
+# short_payment too, since operationally it's still just pending Approve.
+# Added anyway, on request: these two are worth exec-level visibility in
+# their own right — needs_distribution is real, unposted exposure sitting
+# in consolidated bank lines (credit card / cheque / third-party) with NO
+# receipt yet, and short_payment is an open shortfall against an invoice
+# that finance may want visibility into even though the row itself isn't
+# "stuck". GROUP_READY_FOR_ORACLE (now exact-match only) and GROUP_PROCESSED
+# remain excluded for the original reason. GROUP_DISCARDED is included on
+# the same basis as GROUP_REJECTED already was — a discarded row never got
+# a receipt / never reached Oracle, so it belongs in "not posted" even
+# though the decision on it is final.
+NON_POSTED_GROUPS = [
+    GROUP_UNIDENTIFIED, GROUP_NEEDS_REMITTANCE, GROUP_NEEDS_DISTRIBUTION,
+    GROUP_SHORT_PAYMENT, GROUP_CONFLICT_EXCEPTION, GROUP_REJECTED, GROUP_POST_FAILED,
+    GROUP_DISCARDED,
+]
 
 # NOTE: no standalone "Cross OU" pill here. is_cross_ou_currency is only ever
 # set on rows that already matched and reached ready_to_post /

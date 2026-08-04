@@ -7,6 +7,9 @@ from .service import (
     retry_receipt_creation_bulk_for_run,
     check_receipt_retry_eligibility_for_run,
     serialize_line_item,
+    mark_eligible_for_receipt,
+    discard_row,
+    edit_gl_rate,
 )
 from .manual_mapping import (
     get_mapping_options,
@@ -24,6 +27,9 @@ __all__ = [
     "retry_receipt_creation_bulk_for_run",
     "check_receipt_retry_eligibility_for_run",
     "serialize_line_item",
+    "mark_eligible_for_receipt",
+    "discard_row",
+    "edit_gl_rate",
     "get_mapping_options",
     "get_invoices_for_customer",
     "preview_manual_mapping",

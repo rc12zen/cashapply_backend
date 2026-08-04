@@ -60,6 +60,13 @@ class RuleEngineInputSchema(BaseModel):
     duplicate_invoice_across_customers: bool = False
     duplicate_ambiguous: bool = False
     already_processed_match: bool = False
+    settlement_type: Optional[str] = Field(
+        default=None,
+        description="'card_narrative' | 'cheque_narrative' | 'third_party_provider' | None — see R16/R17/R18",
+    )
+    settlement_provider: Optional[str] = Field(
+        default=None, description="Matched provider_name — only set when settlement_type == 'third_party_provider'",
+    )
 
     class Config:
         arbitrary_types_allowed = True   # allows the aging_lookup callable
@@ -84,10 +91,12 @@ class RuleResultSchema(BaseModel):
     reason_code: str = Field(..., description="EXACT_MATCH | OVERPAYMENT_UNEXPLAINED | NO_SIGNAL …")
     category: str = Field(
         ...,
-        description="Maps to RowState: unidentified | needs_remittance | conflict_exception | acceptable_short_payment | ready_to_post",
+        description="Maps to RowState: unidentified | needs_remittance | conflict_exception | acceptable_short_payment | ready_to_post | needs_distribution",
     )
     matched_invoices: list[MatchedInvoiceSchema] = Field(default_factory=list)
     target_total: Optional[float] = None
     received_total: Optional[float] = None
     shortfall_pct: Optional[float] = None
     notes: str = ""
+    settlement_type: Optional[str] = None
+    settlement_provider: Optional[str] = None

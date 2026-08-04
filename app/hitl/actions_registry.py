@@ -45,6 +45,23 @@ def _cond_not_already_mapped_terminal(r: LineItem) -> bool:
     return r.current_state != "processed"
 
 
+def _cond_receipt_eligibility_undecided(r: LineItem) -> bool:
+    # Mark Eligible / Discard — only offered once, on a genuinely
+    # undecided Unidentified row. See hitl/service.py's
+    # _guard_unidentified_undecided (same check, enforced server-side
+    # again at the actual endpoint — this is just what makes the button
+    # appear/disappear on the frontend).
+    return r.receipt_eligibility is None
+
+
+def _cond_gl_rate_editable(r: LineItem) -> bool:
+    # Edit GL Rate — only offered on a cross-ledger-currency row that
+    # already has a bare Oracle receipt, and only before invoice mapping
+    # exists on it. See hitl/service.py's edit_gl_rate() docstring for why
+    # the reference_status guard matters.
+    return bool(r.is_cross_ledger) and bool(r.standard_receipt_id) and r.reference_status != "success"
+
+
 # Fixed, known set of extra eligibility checks an ActionDefinition row can
 # reference by name (condition_key). Deliberately not free-form/evaluated
 # code — see db/models.py's ActionDefinition docstring for why.
@@ -52,6 +69,8 @@ CONDITION_CHECKS = {
     "not_rejected": _cond_not_rejected,
     "reference_status_failed": _cond_reference_status_failed,
     "not_processed": _cond_not_already_mapped_terminal,
+    "receipt_eligibility_undecided": _cond_receipt_eligibility_undecided,
+    "gl_rate_editable": _cond_gl_rate_editable,
 }
 
 

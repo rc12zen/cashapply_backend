@@ -76,6 +76,41 @@ class RowState(str, enum.Enum):
     PROCESSED                = "processed"
     REJECTED                 = "rejected"
     POST_FAILED              = "post_failed"
+    # NEW: identity-only state for the three consolidated-settlement types
+    # (credit card batch, cheque batch, third-party/broker payment). A row
+    # lands here the instant detection tags it — BEFORE any invoice mapping
+    # exists — and stays here until a SPOC fills in the breakdown/distribution
+    # and confirms it. See bank_statement/settlement_identifier.py and
+    # rule_engine/evaluator.py's R16/R17/R18.
+    NEEDS_DISTRIBUTION       = "needs_distribution"
+    # NEW: a SPOC-decided terminal state for unidentified rows that were
+    # reviewed and judged NOT eligible for a receipt at all (garbage
+    # narration, internal transfer, etc.) — distinct from "rejected", which
+    # implies a receipt/mapping decision existed and was reversed. See
+    # LineItem.receipt_eligibility and hitl/service.py's discard_row().
+    DISCARDED                = "discarded"
+
+
+class SettlementIdentifierType(str, enum.Enum):
+    """The three row-identity types this file adds, configured on the
+    Accounts & OU's page (see bff/settlement_identifier_routes.py).
+
+    THIRD_PARTY_PROVIDER : a broker/aggregator that pays on behalf of several
+                            of ITS OWN customers (e.g. Accurant -> SITA, Kig,
+                            Lament). provider_name + sub_customers are set;
+                            pattern is unused.
+    CARD_NARRATIVE        : a fixed bank-narration fingerprint that identifies
+                            a consolidated credit-card settlement line
+                            (PRD: reference ending 526221017886).
+                            pattern is set; provider_name/sub_customers unused.
+    CHEQUE_NARRATIVE       : a fixed bank-narration fingerprint that identifies
+                            a consolidated cheque deposit line
+                            (PRD: "Cash Letter Pre-Encoded Dep CR").
+                            pattern is set; provider_name/sub_customers unused.
+    """
+    THIRD_PARTY_PROVIDER = "third_party_provider"
+    CARD_NARRATIVE       = "card_narrative"
+    CHEQUE_NARRATIVE     = "cheque_narrative"
 
 
 class RunStatus(str, enum.Enum):
@@ -219,6 +254,22 @@ class LineItem(Base):
     fx_invoice_to_functional        = Column(Float, nullable=True)       # = Oracle ConversionRate
     fx_invoice_to_functional_source = Column(String, nullable=True)
 
+    # ── GL rate manual edit (post-receipt-creation correction) ────────────────
+    # PATCH standard rate (fx_invoice_to_functional above) with a SPOC-typed
+    # override, via OracleFusionClient.patch_standard_receipt -- see
+    # hitl/service.py's edit_gl_rate(). Only permitted while standard_receipt_id
+    # exists AND no remittanceReferences have been posted yet (reference_status
+    # is not "success") -- editing after invoice mapping would desync the
+    # applied amounts from the receipt's own stated rate. fx_invoice_to_functional
+    # itself is overwritten with the new value on a successful edit; these
+    # fields keep the ORIGINAL Oracle-resolved rate and a full audit trail,
+    # since fx_invoice_to_functional_source flipping to "spoc_manual" only
+    # tells you THAT it was overridden, not what it was overridden FROM.
+    gl_rate_original       = Column(Float, nullable=True)
+    gl_rate_edited_at      = Column(DateTime, nullable=True)
+    gl_rate_edited_by      = Column(String, nullable=True)   # SPOC email
+    gl_rate_edit_reason    = Column(Text, nullable=True)
+
     # ── Problem 2: cross-OU business flag ────────────────────────────────────
     # True when the row reaches ready_to_post / acceptable_short_payment AND
     # the customer's aging invoices are in a different OU than the bank account.
@@ -264,6 +315,27 @@ class LineItem(Base):
     current_state = Column(Enum(RowState), default=RowState.UNIDENTIFIED, index=True)
     reason_code   = Column(String, nullable=True)
     rule_id       = Column(String, nullable=True)
+
+    # ── Settlement identity (credit card / cheque / third-party) ─────────────
+    # Set by rule_engine/evaluator.py's R16/R17/R18 the moment detection
+    # matches a configured SettlementIdentifier -- BEFORE any invoice mapping
+    # happens. settlement_provider is only meaningful when settlement_type ==
+    # "third_party_provider" (holds the matched provider_name, e.g.
+    # "Accurant") -- None for card/cheque rows, whose identity is the
+    # narration pattern alone, not a named payer.
+    settlement_type     = Column(String, nullable=True)   # "card_narrative" | "cheque_narrative" | "third_party_provider"
+    settlement_provider = Column(String, nullable=True)   # e.g. "Accurant" -- third-party rows only
+
+    # ── Receipt eligibility (unidentified rows only) ──────────────────────────
+    # Step 4.5 (rule_engine/orchestrator.py) used to create a bare Oracle
+    # receipt for EVERY credit row unconditionally, including rows with zero
+    # signal (R8/NO_SIGNAL) that may not be a real receivable transaction at
+    # all. This gate holds receipt creation for unidentified rows specifically
+    # until a SPOC decides -- see hitl/service.py's mark_eligible_for_receipt()
+    # / discard_row(). None = undecided (receipt NOT yet created for this row).
+    receipt_eligibility          = Column(String, nullable=True)  # None | "eligible" | "discarded"
+    receipt_eligibility_at       = Column(DateTime, nullable=True)
+    receipt_eligibility_by       = Column(String, nullable=True)  # SPOC email
 
     # ── Manual invoice mapping tracking ───────────────────────────────────────
     # Set by hitl/manual_mapping.py's confirm_manual_mapping() — the only
@@ -432,6 +504,62 @@ class RowStatusHistory(Base):
     line_item = relationship("LineItem", back_populates="status_history")
 
 
+# ── Invoice application ledger (duplicate-mapping protection) ────────────────
+
+class InvoiceApplication(Base):
+    """
+    One row per (line_item, invoice) mapping — the real, persistent record
+    of "this much of this invoice has been claimed by this bank row",
+    replacing what used to be nothing at all: rule_engine/evaluator.py's
+    already_processed_match was a permanent stub (always False, never
+    actually computed — see its own comment history), and the aging
+    snapshot (aging_store) carries no concept of "this invoice was just
+    consumed by another row this cycle." Two different bank rows could
+    both map to the same invoice with no warning.
+
+    status lifecycle:
+      "pending"   — set the moment a row is matched to this invoice, either
+                    automatically (rule_engine/state_machine.py's
+                    apply_transition, R9a/R9b/R9d) or manually
+                    (hitl/manual_mapping.py's confirm_manual_mapping).
+                    Counts toward the invoice's consumed total immediately —
+                    duplicate protection has to work BEFORE approval, not
+                    just after, since the SPOC's actual worry is two rows
+                    both getting mapped to the same invoice before either
+                    is approved.
+      "confirmed" — set by hitl/service.py's approve_row once the Oracle
+                    invoice-mapping call actually succeeds.
+      "released"  — set by hitl/service.py's reject_row (or by a
+                    remittance-recheck re-evaluation that moves a row OFF
+                    this invoice) — frees the invoice for a different
+                    mapping. Only "pending"/"confirmed" rows count as
+                    consumed; see rule_engine/invoice_ledger.py.
+
+    Deliberately NOT a UNIQUE(invoice_number) constraint — the same invoice
+    legitimately gets MULTIPLE rows over time (a short payment now, a
+    second payment covering the remainder later). What must never happen
+    is the SUM of active (pending/confirmed) applied_amount exceeding the
+    invoice's outstanding_amount — that check lives in invoice_ledger.py,
+    not the schema.
+    """
+    __tablename__ = "invoice_applications"
+
+    id              = Column(BigInteger, primary_key=True, autoincrement=True)
+    line_item_id    = Column(BigInteger, ForeignKey("line_items.id"), index=True, nullable=False)
+    invoice_number  = Column(String, index=True, nullable=False)
+    ou_number       = Column(String, nullable=True, index=True)
+    customer_name   = Column(String, nullable=True)
+    applied_amount  = Column(Numeric(18, 2), nullable=False)   # in invoice currency
+    invoice_currency = Column(String(10), nullable=True)
+    status          = Column(String, nullable=False, default="pending")  # "pending" | "confirmed" | "released"
+    created_at      = Column(DateTime, default=dt.datetime.utcnow)
+    updated_at      = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("line_item_id", "invoice_number", name="uq_invoice_application_line_invoice"),
+    )
+
+
 # ── App1: Rule definitions ────────────────────────────────────────────────────
 
 class AiUsageLog(Base):
@@ -509,6 +637,16 @@ class RemittanceExtraction(Base):
     # (cashapply-remittance-agent). Row-detail's remittance panel "Raw" tab
     # reads this as raw_body — see bff/row_detail.py.
     raw_text              = Column(Text, nullable=True)
+    # NEW — shared column, MUST stay identical in agent/db/models.py (see
+    # that file's module docstring: App1 and App2 point at the SAME
+    # physical table, no FK/schema enforcement keeps them in sync).
+    # Distinguishes an ordinary single-payer remittance from the two
+    # multi-customer batch document types this row now recognizes:
+    #   "customer_remittance" (default) | "card_breakdown" | "cheque_scan"
+    # Set by App2's claude_extractor.py; consumed here by
+    # rule_engine/remittance_lookup.py to decide whether a match's
+    # invoice_lines belong to one customer or several.
+    document_type         = Column(String(30), nullable=True, default="customer_remittance")
 
     invoice_lines = relationship("RemittanceInvoiceLine", back_populates="extraction")
 
@@ -526,8 +664,51 @@ class RemittanceInvoiceLine(Base):
     discount_taken   = Column(Numeric(18, 2), nullable=True)
     amount_paid      = Column(Numeric(18, 2), nullable=True)
     line_confidence  = Column(Float, nullable=True)
+    # NEW — shared column, MUST stay identical in agent/db/models.py.
+    # Only ever populated when the parent RemittanceExtraction.document_type
+    # is "card_breakdown" or "cheque_scan" — that's the whole reason this
+    # column exists: those two documents cover SEVERAL customers in one
+    # email/attachment, so "which customer does this invoice line belong
+    # to" can no longer be answered by the extraction's single
+    # raw_customer_text field the way an ordinary remittance can. Null for
+    # every ordinary single-payer remittance line.
+    customer_name    = Column(String, nullable=True)
 
     extraction = relationship("RemittanceExtraction", back_populates="invoice_lines")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Settlement identifiers (credit card / cheque / third-party provider)
+# Configured on the Accounts & OU's page — see bff/settlement_identifier_routes.py
+# and bank_statement/settlement_identifier.py, which is the only reader.
+# Additive table -- nothing above this line changes behavior.
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SettlementIdentifier(Base):
+    __tablename__ = "settlement_identifiers"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    identifier_type = Column(Enum(SettlementIdentifierType), nullable=False, index=True)
+
+    # -- CARD_NARRATIVE / CHEQUE_NARRATIVE rows --
+    # A substring/regex checked against the bank narration column. Kept as
+    # plain substring matching by default (see settlement_identifier.py) --
+    # a leading/trailing "/" marks it as a regex, same convention the bank
+    # statement account_locator already uses elsewhere in this codebase.
+    pattern = Column(String, nullable=True)
+
+    # -- THIRD_PARTY_PROVIDER rows --
+    # provider_name is matched against the extracted/remittance payer name.
+    # sub_customers is the roster shown in the Row Detail Payment Distribution
+    # table once a row is tagged for this provider (e.g. ["SITA", "Kig", "Lament"]).
+    provider_name  = Column(String, nullable=True)
+    sub_customers  = Column(JSON, nullable=True)
+
+    active     = Column(Boolean, default=True, index=True)
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+    created_by = Column(String, nullable=True)   # SPOC email
+    updated_at = Column(DateTime, nullable=True)
+    updated_by = Column(String, nullable=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

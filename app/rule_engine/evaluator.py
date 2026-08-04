@@ -28,6 +28,9 @@ RuleEngineInput = {
     customer_ou_numbers: list[str]   — OUs where customer has open invoices (for audit)
     duplicate_invoice_across_customers: bool
     already_processed_match: bool   # bank_reference/amount/customer hits an existing Processed row
+    settlement_type: str | None     # "card_narrative" | "cheque_narrative" | "third_party_provider" | None
+                                     # set by bank_statement/settlement_identifier.py -- see R16/R17/R18
+    settlement_provider: str | None # matched provider_name -- only set when settlement_type == "third_party_provider"
 }
 
 OUTPUT
@@ -111,6 +114,13 @@ class RuleResult:
     # db/models.py's LineItem.ou_evidence. None when there was no customer
     # signal to evaluate (ou_mismatch was never computed).
     ou_evidence: Optional[dict] = None
+    # Set only by R16/R17/R18 -- see settlement_type in the input contract
+    # above. Carried on RuleResult (not just derived from reason_code) so
+    # state_machine.py can persist it onto LineItem without string-parsing
+    # reason_code, and settlement_provider (third-party rows only) has
+    # nowhere else to travel from evaluate_row() back to the DB row.
+    settlement_type: Optional[str] = None
+    settlement_provider: Optional[str] = None
 
 
 def _resolve_matched_invoices(input_: dict) -> list[MatchedInvoice]:
@@ -252,6 +262,28 @@ def evaluate_row(
 
     customer_found = (extraction.get("customer_match_pct") or 0) >= customer_fuzzy_min_pct
     invoice_found = bool(extraction.get("extracted_invoices")) or bool(remittance.get("invoices"))
+
+    # R16/R17/R18 — settlement identity (credit card / cheque / third-party
+    # provider) MUST be checked before everything else. These three types
+    # are consolidated bank lines by design (one credit = many customers),
+    # so the normal customer/invoice-matching rules below would either
+    # misfire (R6 CROSS_CUSTOMER_SPLIT treats this as a problem, when for
+    # these three it's expected) or just never find a single matching
+    # invoice. A settlement-identity match means "do not run the R0-R15
+    # table at all" -- the row needs a human to fill in the Split & Map
+    # breakdown before anything else is decided, and per the broker PRD
+    # requirement, no receipt gets created automatically for these.
+    settlement_type = input_.get("settlement_type")
+    if settlement_type == "card_narrative":
+        return RuleResult("R16", "CARD_SETTLEMENT_DETECTED", "needs_distribution",
+                           settlement_type=settlement_type)
+    if settlement_type == "cheque_narrative":
+        return RuleResult("R17", "CHEQUE_SETTLEMENT_DETECTED", "needs_distribution",
+                           settlement_type=settlement_type)
+    if settlement_type == "third_party_provider":
+        return RuleResult("R18", "THIRD_PARTY_PROVIDER_DETECTED", "needs_distribution",
+                           settlement_type=settlement_type,
+                           settlement_provider=input_.get("settlement_provider"))
 
     # R0 — duplicate invoice number across customers, ambiguous
     if input_.get("duplicate_invoice_across_customers") and input_.get("duplicate_ambiguous", False):
