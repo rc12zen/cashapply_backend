@@ -49,6 +49,16 @@ ALTER TABLE line_items ADD COLUMN IF NOT EXISTS gl_rate_edited_by    VARCHAR;
 ALTER TABLE line_items ADD COLUMN IF NOT EXISTS gl_rate_edit_reason  TEXT;
 
 
+-- ── 3b. line_items: settlement override (bucket choice) ───────────────────
+-- A settlement identifier match (card/cheque/third-party) is a pattern
+-- match, not always a fact -- see hitl/service.py's
+-- override_settlement_as_customer_payment() for the full rationale
+-- (e.g. "Assurant Inc" can be a broker on one payment and a direct
+-- customer on another).
+ALTER TABLE line_items ADD COLUMN IF NOT EXISTS settlement_override_at TIMESTAMP;
+ALTER TABLE line_items ADD COLUMN IF NOT EXISTS settlement_override_by VARCHAR;
+
+
 -- ── 4. action_definitions: new seed rows ───────────────────────────────────
 -- Only inserted if a row with that `code` doesn't already exist — safe to
 -- re-run. applicable_categories/condition_key match hitl/actions_registry.py
@@ -74,6 +84,13 @@ INSERT INTO action_definitions
 SELECT 'edit_gl_rate', 'Edit GL Rate', 'edit-3', 'oracle:post',
        NULL, 'gl_rate_editable', FALSE, FALSE, 60, TRUE
 WHERE NOT EXISTS (SELECT 1 FROM action_definitions WHERE code = 'edit_gl_rate');
+
+INSERT INTO action_definitions
+    (code, label, icon, permission_code, applicable_categories, condition_key,
+     confirm_required, is_danger, sort_order, is_active)
+SELECT 'settlement_override', 'Treat as Customer Payment', 'arrow-right-left', 'hitl:map',
+       '["needs_distribution"]'::json, 'settlement_override_eligible', TRUE, FALSE, 45, TRUE
+WHERE NOT EXISTS (SELECT 1 FROM action_definitions WHERE code = 'settlement_override');
 
 
 -- ============================================================================

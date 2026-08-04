@@ -167,6 +167,17 @@ def _category_for_row(r: LineItem) -> str:
     # forever instead of moving to its own resolved bucket.
     if r.receipt_eligibility == "discarded":
         return GROUP_DISCARDED
+    # NEW — see LineItem.settlement_override_at and hitl/service.py's
+    # override_settlement_as_customer_payment(). A settlement identifier
+    # match is a pattern match, not always a fact (the same payer name can
+    # legitimately be a broker on one payment and a direct customer on
+    # another) — once a SPOC overrides it, the row must stop showing as
+    # Needs Distribution even though rule_id is still R16/R17/R18 (kept for
+    # audit, not re-evaluated). It falls back to Unidentified so the
+    # standard Manual Invoice Mapping card takes over — same treatment as
+    # a genuinely unmatched row, since nothing else was extracted for it either.
+    if r.settlement_override_at is not None and RULE_ID_TO_GROUP.get(r.rule_id) == GROUP_NEEDS_DISTRIBUTION:
+        return GROUP_UNIDENTIFIED
     return RULE_ID_TO_GROUP.get(r.rule_id, GROUP_CONFLICT_EXCEPTION)
 
 

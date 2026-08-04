@@ -62,6 +62,13 @@ def _cond_gl_rate_editable(r: LineItem) -> bool:
     return bool(r.is_cross_ledger) and bool(r.standard_receipt_id) and r.reference_status != "success"
 
 
+def _cond_settlement_override_eligible(r: LineItem) -> bool:
+    # Settlement Override ("treat as customer payment") — only offered
+    # once, on a Needs Distribution row not already overridden. See
+    # hitl/service.py's override_settlement_as_customer_payment().
+    return r.settlement_type is not None and r.settlement_override_at is None
+
+
 # Fixed, known set of extra eligibility checks an ActionDefinition row can
 # reference by name (condition_key). Deliberately not free-form/evaluated
 # code — see db/models.py's ActionDefinition docstring for why.
@@ -71,6 +78,7 @@ CONDITION_CHECKS = {
     "not_processed": _cond_not_already_mapped_terminal,
     "receipt_eligibility_undecided": _cond_receipt_eligibility_undecided,
     "gl_rate_editable": _cond_gl_rate_editable,
+    "settlement_override_eligible": _cond_settlement_override_eligible,
 }
 
 

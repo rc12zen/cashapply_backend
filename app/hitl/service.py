@@ -37,7 +37,7 @@ from sqlalchemy.orm import Session
 from ..db.models import LineItem, RowStatusHistory
 from ..oracle.fusion_client import OracleFusionClient, build_remittance_reference_payloads
 from ..oracle.receipt_creation import create_receipt_for_line_item
-from ..bff.metrics import _category_for_row, GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_UNIDENTIFIED, GROUP_LABELS
+from ..bff.metrics import _category_for_row, GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_UNIDENTIFIED, GROUP_NEEDS_DISTRIBUTION, GROUP_LABELS
 from ..rule_engine.invoice_ledger import confirm_applications, release_applications
 
 logger = logging.getLogger(__name__)
@@ -450,6 +450,66 @@ def discard_row(db: Session, line_item_id: int, comment: str | None, triggered_b
     db.commit()
 
     return {"id": r.id, "status": "Discarded"}
+
+
+def override_settlement_as_customer_payment(db: Session, line_item_id: int, triggered_by: str) -> dict:
+    """
+    A settlement identifier match (R16/R17/R18 — card/cheque/third-party) is
+    a PATTERN match, not always an unambiguous fact. The clearest example:
+    a registered third-party provider like "Assurant Inc" usually pays on
+    behalf of OTHER customers, but can occasionally pay its OWN invoice
+    directly — same payer name, two entirely different real-world
+    situations. This lets a SPOC say "no, for THIS payment, treat it as a
+    normal direct customer payment" instead of a broker split.
+
+    settlement_type/settlement_provider are deliberately left untouched —
+    the pattern match itself was still correct, this only records which
+    bucket a SPOC chose for this specific payment (see
+    LineItem.settlement_override_at's comment). The row falls back to the
+    Unidentified bucket (see bff/metrics.py's _category_for_row) so the
+    standard Manual Invoice Mapping card takes over — customer_name is
+    pre-filled with the matched provider name (third-party rows only) as a
+    starting point for that search, since it's very often the right
+    customer name too, just not always.
+    """
+    r = db.query(LineItem).get(line_item_id)
+    if not r:
+        return {"error": "not found"}
+
+    if _category_for_row(r) != GROUP_NEEDS_DISTRIBUTION:
+        return {
+            "error": "not_needs_distribution",
+            "message": f"Row {r.id} is not currently in Needs Distribution — nothing to override.",
+        }
+    if r.settlement_override_at is not None:
+        return {
+            "error": "already_overridden",
+            "message": f"Row {r.id} was already moved to the customer-payment bucket.",
+        }
+
+    r.settlement_override_at = dt.datetime.utcnow()
+    r.settlement_override_by = triggered_by
+    if r.settlement_type == "third_party_provider" and not r.customer_name:
+        r.customer_name = r.settlement_provider
+
+    db.add(RowStatusHistory(
+        line_item_id=r.id, from_state="needs_distribution", to_state="unidentified",
+        trigger="spoc_settlement_override", rule_id=r.rule_id,
+        triggered_by=triggered_by,
+        comment=(
+            f"Moved from Needs Distribution ({r.settlement_type}"
+            f"{' — ' + r.settlement_provider if r.settlement_provider else ''}) "
+            f"to direct customer payment — Manual Invoice Mapping applies now."
+        ),
+    ))
+    db.commit()
+
+    return {
+        "id": r.id,
+        "settlement_override": True,
+        "customer_name_prefilled": r.customer_name,
+        "message": "Moved to the customer-payment bucket. Use Manual Invoice Mapping to complete it.",
+    }
 
 
 def edit_gl_rate(

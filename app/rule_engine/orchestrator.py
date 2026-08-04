@@ -618,6 +618,7 @@ def _process_unknown_payment(run_id: int, unknown) -> dict:
     """
     from ..db.session import session_scope
     from .evaluator import RuleResult
+    from ..bank_statement.settlement_identifier import classify_settlement
 
     orig = unknown.original
     try:
@@ -632,11 +633,37 @@ def _process_unknown_payment(run_id: int, unknown) -> dict:
                 credited_currency=(orig.currency or "").upper().strip(),
                 functional_currency=get_functional_currency(orig.ou_number),
             )
-            apply_transition(
-                db, line_item,
-                RuleResult("R8", "NO_SIGNAL", "unidentified"),
-                trigger="rule_engine",
-            )
+
+            # PATCH (bug fix): a row lands here whenever extraction found NO
+            # customer AND NO invoice — which is EXACTLY the common case for
+            # credit card / cheque / third-party settlement narrations, since
+            # those narrations don't name a normal customer at all (see the
+            # PRDs). R16/R17/R18 live inside evaluate_row(), which this path
+            # never called — so a row like "CREDIT CARD PAYMENT RECEIVED -
+            # ADIDAS SPORTS (CHINA) CO." was hardcoded straight to R8/
+            # Unidentified regardless of any configured SettlementIdentifier
+            # pattern matching it. Settlement classification must run here
+            # too, BEFORE the R8 fallback, not only in the identified-payment
+            # path. No customer was extracted for an "unknown" row by
+            # definition, so orig.narrative is passed as the payer-name
+            # candidate too (third-party provider names are often present
+            # directly in the narration even when no customer match fired).
+            settlement_match = classify_settlement(db, orig.narrative, orig.narrative)
+
+            if settlement_match is not None:
+                rule_result = {
+                    "card_narrative":       RuleResult("R16", "CARD_SETTLEMENT_DETECTED", "needs_distribution",
+                                                        settlement_type=settlement_match.settlement_type),
+                    "cheque_narrative":      RuleResult("R17", "CHEQUE_SETTLEMENT_DETECTED", "needs_distribution",
+                                                        settlement_type=settlement_match.settlement_type),
+                    "third_party_provider":  RuleResult("R18", "THIRD_PARTY_PROVIDER_DETECTED", "needs_distribution",
+                                                        settlement_type=settlement_match.settlement_type,
+                                                        settlement_provider=settlement_match.settlement_provider),
+                }[settlement_match.settlement_type]
+            else:
+                rule_result = RuleResult("R8", "NO_SIGNAL", "unidentified")
+
+            apply_transition(db, line_item, rule_result, trigger="rule_engine")
             _mark_row_consumed(db, orig, run_id)
 
         return {"success": True, "bank_reference": orig.bank_reference, "error": None}

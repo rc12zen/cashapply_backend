@@ -337,6 +337,19 @@ class LineItem(Base):
     receipt_eligibility_at       = Column(DateTime, nullable=True)
     receipt_eligibility_by       = Column(String, nullable=True)  # SPOC email
 
+    # ── Settlement override (bucket choice) ───────────────────────────────────
+    # A settlement identifier match is a PATTERN match, not always an
+    # unambiguous fact — the same payer name can legitimately be a
+    # registered third-party provider on some payments and a normal direct
+    # customer on others (e.g. "Assurant Inc" pays on behalf of other
+    # customers most of the time, but occasionally pays its OWN invoice
+    # directly). See hitl/service.py's override_settlement_as_customer_payment().
+    # settlement_type/settlement_provider above are left untouched when this
+    # fires — the match itself is still true and kept for audit — this only
+    # records that a SPOC chose the OTHER bucket for THIS specific payment.
+    settlement_override_at  = Column(DateTime, nullable=True)
+    settlement_override_by  = Column(String, nullable=True)  # SPOC email
+
     # ── Manual invoice mapping tracking ───────────────────────────────────────
     # Set by hitl/manual_mapping.py's confirm_manual_mapping() — the only
     # persistent record of "this row's CURRENT matched_invoices/rule_id came

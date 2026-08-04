@@ -238,6 +238,21 @@ class AgingMap:
     def customer_count(self) -> int:
         return len(self._name_to_rows)
 
+    def all_customer_names(self, limit: int = 5000) -> list[str]:
+        """Every unique display-case customer name across the WHOLE aging
+        report, any OU — unlike customers_for_ou() above, not scoped to one
+        row's OU. Used by the Accounts & OU's page's Third-Party Provider
+        picker (see bff/settlement_identifier_routes.py): a provider like
+        Accurant isn't tied to a single OU the way one bank row's manual
+        mapping is, so the picker needs the global list, sorted for a
+        search box rather than ranked by outstanding amount."""
+        seen: dict[str, str] = {}
+        for rows in self._name_to_rows.values():
+            for v in rows:
+                if v.customer_name and v.customer_name.upper() not in seen:
+                    seen[v.customer_name.upper()] = v.customer_name
+        return sorted(seen.values())[:limit]
+
     @property
     def ou_numbers(self) -> list[str]:
         """All distinct OU numbers present in the aging data."""

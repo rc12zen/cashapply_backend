@@ -50,6 +50,7 @@ from ..hitl import (
     get_mapping_options, get_invoices_for_customer,
     preview_manual_mapping, confirm_manual_mapping,
     mark_eligible_for_receipt, discard_row, edit_gl_rate,
+    override_settlement_as_customer_payment,
 )
 from ..rule_engine.remittance_recheck import recheck_needs_remittance_rows
 from ..rule_engine.customer_name_correction import correct_customer_name, get_customer_name_options
@@ -171,6 +172,30 @@ def discard(id: int, payload: dict, request: Request, db: Session = Depends(get_
 
     log_activity(db, user, action="hitl.discard", entity_type="LineItem", entity_id=id,
                  ip_address=_client_ip(request), metadata={"comment": payload.get("comment")})
+    db.commit()
+    return result
+
+
+@router.post("/settlement-override/{id}")
+def settlement_override(id: int, request: Request, db: Session = Depends(get_db),
+                         user: User = Depends(require_permission("hitl:map"))):
+    """
+    Needs Distribution rows only — see hitl/service.py's
+    override_settlement_as_customer_payment(). The same payer name (e.g. a
+    registered third-party provider) can legitimately be a broker payment
+    on some rows and a direct customer payment on others — this moves THIS
+    row out of Needs Distribution into the standard Manual Invoice Mapping
+    flow instead.
+    """
+    result = override_settlement_as_customer_payment(db, id, triggered_by=user.email)
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") in ("not_needs_distribution", "already_overridden"):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
+
+    log_activity(db, user, action="hitl.settlement_override", entity_type="LineItem", entity_id=id,
+                 ip_address=_client_ip(request),
+                 metadata={"customer_name_prefilled": result.get("customer_name_prefilled")})
     db.commit()
     return result
 

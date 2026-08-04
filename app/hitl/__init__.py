@@ -9,6 +9,7 @@ from .service import (
     serialize_line_item,
     mark_eligible_for_receipt,
     discard_row,
+    override_settlement_as_customer_payment,
     edit_gl_rate,
 )
 from .manual_mapping import (
@@ -29,6 +30,7 @@ __all__ = [
     "serialize_line_item",
     "mark_eligible_for_receipt",
     "discard_row",
+    "override_settlement_as_customer_payment",
     "edit_gl_rate",
     "get_mapping_options",
     "get_invoices_for_customer",
