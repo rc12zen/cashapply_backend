@@ -216,7 +216,7 @@ def update_gl_rate(id: int, payload: dict, request: Request, db: Session = Depen
     result = edit_gl_rate(db, id, float(new_rate), payload.get("reason"), triggered_by=user.email)
     if result.get("error") == "not found":
         raise AppError(ErrorCode.ROW_NOT_FOUND)
-    if result.get("error") in ("not_cross_ledger", "no_receipt", "already_mapped", "oracle_patch_failed"):
+    if result.get("error") in ("not_cross_ledger", "no_receipt", "already_mapped", "oracle_patch_failed", "retry_failed"):
         raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
 
     log_activity(db, user, action="hitl.edit_gl_rate", entity_type="LineItem", entity_id=id,

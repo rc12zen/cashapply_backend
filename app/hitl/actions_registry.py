@@ -55,11 +55,21 @@ def _cond_receipt_eligibility_undecided(r: LineItem) -> bool:
 
 
 def _cond_gl_rate_editable(r: LineItem) -> bool:
-    # Edit GL Rate — only offered on a cross-ledger-currency row that
-    # already has a bare Oracle receipt, and only before invoice mapping
-    # exists on it. See hitl/service.py's edit_gl_rate() docstring for why
-    # the reference_status guard matters.
-    return bool(r.is_cross_ledger) and bool(r.standard_receipt_id) and r.reference_status != "success"
+    # Edit GL Rate — two eligible situations, both handled by
+    # hitl/service.py's edit_gl_rate():
+    #   Case A: receipt already exists, not yet invoice-mapped (the
+    #           original case — PATCH the existing receipt).
+    #   Case B: receipt creation itself FAILED (no standard_receipt_id
+    #           yet) — a real gap the original version of this condition
+    #           missed entirely, since it required standard_receipt_id to
+    #           be set. The wrong rate can very plausibly be WHY creation
+    #           failed, so there needs to be a way to fix it and retry
+    #           BEFORE any receipt exists, not only after.
+    if not r.is_cross_ledger:
+        return False
+    if r.standard_receipt_id:
+        return r.reference_status != "success"
+    return r.oracle_post_status == "failed"
 
 
 def _cond_settlement_override_eligible(r: LineItem) -> bool:
