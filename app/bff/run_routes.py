@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from sqlalchemy import desc, func, or_
 from sqlalchemy.orm import Session
 
@@ -224,6 +224,477 @@ def _finalize_pending_groups(db: Session, groups: dict) -> dict:
             group["last_consumed_run_id"] = None
 
     return {"accounts": list(groups.values())}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Run preflight — the data behind the Confirm Analysis Run dialog
+# ═══════════════════════════════════════════════════════════════════════════
+# An analysis run is IRREVERSIBLE: the orchestrator stamps
+# consumed_by_run_id on every row it processes, and /start refuses to run
+# against an account with no unconsumed rows left (see the guard in
+# start_run below). There is deliberately no "undo" and no "re-run" — a
+# mistake has to be corrected row-by-row through HITL instead. That makes
+# the confirmation dialog the last, and only, place a wrong run can be
+# caught, so it gets the FULL picture rather than just accounts + Business
+# Units: the settings that will actually shape the results (functional
+# currency, credit rule, aging report, AI availability, settlement
+# identifiers, tolerances) are all resolved live here and returned
+# together, alongside a computed blockers/warnings split.
+#
+# Blockers vs warnings
+# --------------------
+# blockers  = the run cannot or must not proceed.
+#             NO_FILES_SELECTED / NO_ANALYZABLE_ROWS / ALREADY_ANALYSED /
+#             RUN_IN_PROGRESS each mirror a guard start_run() itself
+#             enforces, so those are a preview of a real rejection rather
+#             than a second opinion that could disagree with it.
+#             NO_FUNCTIONAL_CURRENCY is the one exception — it is advisory
+#             only, with no counterpart in start_run(), so a direct API
+#             call can still bypass it. It's near-unreachable in practice
+#             (OrganizationUnit.functional_currency is NOT NULL and
+#             BankAccount.ou_id is NOT NULL, so it takes a blank string to
+#             trigger); add the matching guard to start_run() if that ever
+#             needs to be a hard server-side stop.
+# warnings  = the run WILL proceed but produce degraded results (e.g. no
+#             aging report loaded -> nothing to match invoices against).
+#             Surfaced loudly, but the person decides.
+#
+# Read-only: nothing here mutates, and it never touches aging_store's
+# in-memory map beyond reading its status.
+
+
+def _describe_credit_rule(recipe: dict) -> dict | None:
+    """Human-readable summary of a recipe's `credit_rule`.
+
+    The credit rule decides which statement rows are even TREATED as
+    incoming money — get it wrong and a run either silently skips real
+    receipts or ingests debits as credits, and neither is undoable once
+    the rows are consumed. See bank_statement/credit_rules.py for the
+    evaluator these three types map to.
+    """
+    from ..bank_statement.credit_rules import _column_for_logical
+
+    rule = (recipe or {}).get("credit_rule")
+    if not isinstance(rule, dict) or not rule.get("type"):
+        return None
+
+    rule_type = rule.get("type")
+    field = rule.get("field") or ""
+    fields = (recipe or {}).get("fields") or []
+    # amount_positive / column_not_blank name a LOGICAL field, which maps to
+    # a physical spreadsheet column; flag_matches names the raw column
+    # directly (same split as eval_credit_rule).
+    column = field
+    if rule_type in ("amount_positive", "column_not_blank"):
+        column = _column_for_logical(fields, field) or field
+
+    if rule_type == "amount_positive":
+        description = f'A positive value in "{column}" counts as a credit'
+    elif rule_type == "column_not_blank":
+        description = f'A non-blank positive value in "{column}" counts as a credit'
+    elif rule_type == "flag_matches":
+        description = f'"{column}" matching {rule.get("pattern")!r} counts as a credit'
+    else:
+        description = f'Unknown credit rule type "{rule_type}"'
+
+    return {
+        "type": rule_type,
+        "column": column,
+        "pattern": rule.get("pattern"),
+        "description": description,
+    }
+
+
+def _credit_rules_for_account(db: Session, bank_account_id: int, filenames: list[str]) -> list[dict]:
+    """Latest recipe per file FORMAT the selected statements actually use.
+
+    Recipes are versioned per (bank_account_id, format) and append-only
+    (see AccountConfigRecipe) — only the highest version of each format is
+    ever applied, so that's the only one worth showing. Scoped to the
+    formats present in this run's files: an account may also carry, say, a
+    pdf recipe that this run will never touch.
+    """
+    from ..db.models import AccountConfigRecipe
+
+    formats = {f.rsplit(".", 1)[-1].lower() for f in filenames if "." in f}
+    recipes = (
+        db.query(AccountConfigRecipe)
+        .filter(AccountConfigRecipe.bank_account_id == bank_account_id)
+        .order_by(AccountConfigRecipe.format, AccountConfigRecipe.version.desc())
+        .all()
+    )
+    latest_by_format: dict[str, AccountConfigRecipe] = {}
+    for r in recipes:
+        fmt = (r.format or "").lower()
+        if formats and fmt not in formats:
+            continue
+        if fmt not in latest_by_format:      # ordered version DESC -> first wins
+            latest_by_format[fmt] = r
+
+    out = []
+    for fmt, rec in sorted(latest_by_format.items()):
+        out.append({
+            "format": fmt,
+            "recipe_version": rec.version,
+            "credit_rule": _describe_credit_rule(rec.recipe or {}),
+        })
+    return out
+
+
+def _settlement_identifier_context(db: Session) -> dict:
+    """The ACTIVE settlement identifiers a run will classify against.
+
+    Global, not per-account (the table has no bank_account_id) — so these
+    apply to every row in the run. Inactive rows are filtered out here:
+    settlement_identifier.load_identifiers() only ever matches active
+    ones, and listing dormant patterns as if they were in force would be
+    worse than not showing them.
+    """
+    from ..db.models import SettlementIdentifier, SettlementIdentifierType
+
+    rows = (
+        db.query(SettlementIdentifier)
+        .filter(SettlementIdentifier.active.is_(True))
+        .all()
+    )
+    by_type: dict[str, list[dict]] = {t.value: [] for t in SettlementIdentifierType}
+    for r in rows:
+        key = r.identifier_type.value if hasattr(r.identifier_type, "value") else str(r.identifier_type)
+        by_type.setdefault(key, []).append({
+            "id": r.id,
+            "pattern": r.pattern,
+            "provider_name": r.provider_name,
+            "sub_customer_count": len(r.sub_customers or []),
+        })
+    return by_type
+
+
+@router.get("/preflight")
+def get_run_preflight(
+    selected_files: list[str] = Query(default=[]),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("run:view")),
+):
+    """Everything a person needs to review before starting an irreversible run.
+
+    Backs ConfirmRunDialog. See the module-level block above this function
+    for the blockers-vs-warnings contract.
+    """
+    from ..aging import aging_store
+    from ..db.settings import get_settings
+    from ..extraction.ai_providers import get_ai_status
+
+    blockers: list[dict] = []
+    warnings: list[dict] = []
+
+    # ── Accounts in scope ────────────────────────────────────────────────
+    # Same grouping as /pending-by-account (a statement whose account
+    # locator is a COLUMN spans several accounts, and a run can't take a
+    # subset of one file), narrowed to the selected filenames.
+    files = (
+        db.query(SourceFile)
+        .filter(
+            SourceFile.kind == "bank_statement",
+            SourceFile.archived.is_(False),
+            SourceFile.filename.in_(selected_files),
+        )
+        .filter(_visible_to(user))
+        .all()
+        if selected_files else []
+    )
+
+    accounts_by_file: dict[int, set[int]] = {}
+    if files:
+        for fid, aid in (
+            db.query(StatementTransactionRow.source_file_id, StatementTransactionRow.bank_account_id)
+            .filter(StatementTransactionRow.source_file_id.in_([f.id for f in files]))
+            .distinct().all()
+        ):
+            if aid is not None:
+                accounts_by_file.setdefault(fid, set()).add(aid)
+
+    groups: dict[int | None, dict] = {}
+    for f in files:
+        for key in sorted(accounts_by_file.get(f.id) or {f.bank_account_id},
+                          key=lambda k: (k is None, k)):
+            _add_file_to_group(db, groups, key, f)
+    accounts = _finalize_pending_groups(db, groups)["accounts"]
+
+    # Scale + period of the rows THIS run will actually consume, per account:
+    # the total incoming money and the statement-date span of the unconsumed
+    # rows. One grouped pass over the accounts in scope rather than a query
+    # per account. Purely descriptive — it doesn't gate anything, it just
+    # lets the person see "$X across dates A–B" before committing to an
+    # irreversible run. credit_amount is in the ACCOUNT'S OWN statement
+    # currency (group["account_currency"]), so these are never summed across
+    # accounts — a cross-currency total would be meaningless.
+    account_keys = [g["bank_account_id"] for g in accounts if g["bank_account_id"] is not None]
+    pending_agg: dict[int, dict] = {}
+    if account_keys:
+        for aid, total, dfrom, dto in (
+            db.query(
+                StatementTransactionRow.bank_account_id,
+                func.sum(StatementTransactionRow.credit_amount),
+                func.min(StatementTransactionRow.statement_date),
+                func.max(StatementTransactionRow.statement_date),
+            )
+            .filter(
+                StatementTransactionRow.bank_account_id.in_(account_keys),
+                StatementTransactionRow.consumed_by_run_id.is_(None),
+            )
+            .group_by(StatementTransactionRow.bank_account_id)
+            .all()
+        ):
+            pending_agg[aid] = {
+                "pending_credit_total": float(total) if total is not None else None,
+                "pending_date_from": dfrom.isoformat() if dfrom else None,
+                "pending_date_to": dto.isoformat() if dto else None,
+            }
+
+    # Most recent run that consumed ANY row of each account (over all rows,
+    # not just the unconsumed ones) — context for whether this is a fresh
+    # account or a follow-up statement on one already analysed before. Two
+    # small grouped queries rather than one per account.
+    last_run_by_acct: dict[int, dict] = {}
+    if account_keys:
+        max_runs = (
+            db.query(
+                StatementTransactionRow.bank_account_id,
+                func.max(StatementTransactionRow.consumed_by_run_id),
+            )
+            .filter(
+                StatementTransactionRow.bank_account_id.in_(account_keys),
+                StatementTransactionRow.consumed_by_run_id.isnot(None),
+            )
+            .group_by(StatementTransactionRow.bank_account_id)
+            .all()
+        )
+        run_ids = {rid for _, rid in max_runs if rid is not None}
+        run_when: dict[int, object] = {}
+        if run_ids:
+            for rid, started, completed in (
+                db.query(AnalysisRun.run_id, AnalysisRun.started_at, AnalysisRun.completed_at)
+                .filter(AnalysisRun.run_id.in_(run_ids))
+                .all()
+            ):
+                # completed_at is the meaningful "when it finished"; fall back
+                # to started_at for a run still in flight or missing a stamp.
+                run_when[rid] = completed or started
+        for aid, rid in max_runs:
+            when = run_when.get(rid)
+            last_run_by_acct[aid] = {
+                "last_run_id": rid,
+                "last_run_at": when.isoformat() if when else None,
+            }
+
+    # ── Per-account enrichment: functional currency + credit rule ───────
+    for group in accounts:
+        key = group["bank_account_id"]
+        # Same key the frontend derives for selection (see page.tsx's
+        # accountGroups) — returned here so the dialog doesn't recompute it.
+        group["key"] = str(key) if key is not None else "unresolved"
+        group["additional_business_units"] = []
+        group["functional_currency"] = None
+        group["account_currency"] = None
+        group["credit_rules"] = []
+        group.update(pending_agg.get(key) or {
+            "pending_credit_total": None, "pending_date_from": None, "pending_date_to": None,
+        })
+        group.update(last_run_by_acct.get(key) or {"last_run_id": None, "last_run_at": None})
+        group["runnable"] = key is not None and group["pending_row_count"] > 0
+        if key is None:
+            continue
+        account = db.query(BankAccount).get(key)
+        if account is None:
+            continue
+        group["account_currency"] = account.currency
+        ou = account.organization_unit
+        # The currency every amount on this account is converted INTO (see
+        # rule_engine/fx_service.get_functional_currency) and snapshotted
+        # onto each row. Column is NOT NULL, so a missing one means the OU
+        # link itself is broken — hence a blocker, not a warning.
+        group["functional_currency"] = (ou.functional_currency or None) if ou else None
+        # Additional Business Units for a multi-BU account — the run
+        # resolves against the FULL set (rule_engine/ou_resolver.py), so
+        # showing only the primary would understate the run's reach.
+        group["additional_business_units"] = [
+            {"ou_name": o.ou_name, "ou_number": o.ou_number, "functional_currency": o.functional_currency}
+            for o in (account.all_organization_units or [])[1:]
+        ]
+        group["credit_rules"] = _credit_rules_for_account(
+            db, key, [fi["filename"] for fi in group["files"]]
+        )
+
+    runnable = [g for g in accounts if g["runnable"]]
+    total_pending_rows = sum(g["pending_row_count"] for g in runnable)
+
+    # Run-level rollups (over runnable accounts only):
+    #  - credit grouped BY currency, never a single cross-currency sum, so a
+    #    mixed-currency run reads as "USD 4.0M · INR 5.1M", not one wrong
+    #    number;
+    #  - the widest statement-date span across all accounts.
+    credit_by_currency: dict[str, float] = {}
+    for g in runnable:
+        if g["pending_credit_total"] is None:
+            continue
+        cur = g["account_currency"] or "—"
+        credit_by_currency[cur] = credit_by_currency.get(cur, 0.0) + g["pending_credit_total"]
+    date_froms = [g["pending_date_from"] for g in runnable if g["pending_date_from"]]
+    date_tos = [g["pending_date_to"] for g in runnable if g["pending_date_to"]]
+
+    # Rows skipped as already-ingested duplicates on THIS upload — deduped by
+    # source file (a multi-account file appears under several accounts, but
+    # its duplicate_row_count is a single per-file snapshot), so it's read
+    # straight off the SourceFile rows rather than summed from the groups.
+    total_duplicates = sum((f.duplicate_row_count or 0) for f in files)
+
+    # ── Blockers (mirror what /start actually enforces) ──────────────────
+    if not selected_files:
+        blockers.append({
+            "code": "NO_FILES_SELECTED",
+            "message": "No statements are selected for this run.",
+        })
+    elif not runnable:
+        # Same condition as start_run's RUN_NO_ANALYZABLE_FILES guard.
+        already_consumed = [g for g in accounts if g.get("last_consumed_run_id")]
+        if already_consumed:
+            runs = sorted({g["last_consumed_run_id"] for g in already_consumed})
+            blockers.append({
+                "code": "ALREADY_ANALYSED",
+                "message": (
+                    "Every row in the selected statement(s) has already been analysed by "
+                    + ("run " if len(runs) == 1 else "runs ")
+                    + ", ".join(f"#{r}" for r in runs)
+                    + ". An analysis cannot be re-run — open that run to review or correct its rows."
+                ),
+            })
+        else:
+            blockers.append({
+                "code": "NO_ANALYZABLE_ROWS",
+                "message": (
+                    "None of the selected statements have rows left to analyse. A statement is "
+                    "analysable only when its account is recognised and it still has unprocessed rows."
+                ),
+            })
+
+    running = db.query(AnalysisRun).filter(AnalysisRun.status == RunStatus.RUNNING).first()
+    if running:
+        blockers.append({
+            "code": "RUN_IN_PROGRESS",
+            "message": f"Analysis run #{running.run_id} is still running. Only one run can be in progress at a time.",
+        })
+
+    missing_currency = [g for g in runnable if not g["functional_currency"]]
+    if missing_currency:
+        blockers.append({
+            "code": "NO_FUNCTIONAL_CURRENCY",
+            "message": (
+                f"{len(missing_currency)} account(s) have no functional currency on their Organization "
+                "Unit, so their amounts cannot be converted. Fix this on the Accounts & OU's page first."
+            ),
+            "accounts": [g["key"] for g in missing_currency],
+        })
+
+    # ── Global run context ───────────────────────────────────────────────
+    aging = aging_store.get_status()
+    if not aging.get("loaded"):
+        warnings.append({
+            "code": "NO_AGING_REPORT",
+            "message": (
+                "No aging report is loaded. Invoice matching has nothing to match against, so most "
+                "rows will finish as Unidentified — and this run cannot be repeated once it completes."
+            ),
+        })
+
+    ai = get_ai_status()
+    # `enabled` is the AI_EXTRACTION_ENABLED master switch. It only exists on
+    # branches that carry that feature — absent here means "no master switch,
+    # so AI is not switched off", NOT "off". Normalising to True keeps the
+    # payload's contract stable either way, so the dialog never reports AI as
+    # off just because the field is missing.
+    ai_enabled = True if ai.get("enabled") is None else bool(ai.get("enabled"))
+    if not ai_enabled:
+        warnings.append({
+            "code": "AI_DISABLED",
+            "message": (
+                "AI extraction is turned off. Rows will be matched with pattern/regex rules only — "
+                "anything they can't resolve stays Unidentified instead of getting the AI second pass."
+            ),
+        })
+    elif not ai.get("active"):
+        warnings.append({
+            "code": "AI_UNAVAILABLE",
+            "message": ai.get("message") or "The AI provider is not reachable — Layer 2B will be skipped.",
+        })
+
+    identifiers = _settlement_identifier_context(db)
+    if not identifiers.get("third_party_provider"):
+        warnings.append({
+            "code": "NO_THIRD_PARTY_PROVIDERS",
+            "message": (
+                "No third-party providers are configured. Payments received via a broker/distributor "
+                "will not be flagged for distribution and will be treated as direct customer payments."
+            ),
+        })
+
+    missing_bu = [g for g in runnable if not g["business_unit"] or not g["ou_number"]]
+    if missing_bu:
+        warnings.append({
+            "code": "NO_BUSINESS_UNIT",
+            "message": (
+                f"{len(missing_bu)} account(s) have no Business Unit resolved. Their rows will still be "
+                "analysed, but won't be postable to Oracle until that's fixed on the Accounts & OU's page."
+            ),
+        })
+
+    # Statements whose rows span several accounts — a run can't take a
+    # subset of one file, so every account in such a statement goes
+    # together whether or not that was intended.
+    file_account_count: dict[str, int] = {}
+    for g in accounts:
+        for fi in g["files"]:
+            file_account_count[fi["filename"]] = file_account_count.get(fi["filename"], 0) + 1
+    multi_account_files = sorted(fn for fn, n in file_account_count.items() if n > 1)
+
+    s = get_settings()
+    return {
+        "accounts": accounts,
+        "totals": {
+            "accounts": len(accounts),
+            "runnable_accounts": len(runnable),
+            "statements": len(file_account_count),
+            "pending_rows": total_pending_rows,
+            "duplicate_rows_ignored": total_duplicates,
+            "credit_by_currency": credit_by_currency,
+            "date_from": min(date_froms) if date_froms else None,
+            "date_to": max(date_tos) if date_tos else None,
+        },
+        "context": {
+            "aging": aging,
+            "ai": {
+                "provider": ai.get("provider"),
+                "model": ai.get("model"),
+                "enabled": ai_enabled,
+                "configured": ai.get("configured"),
+                "active": ai.get("active"),
+                "message": ai.get("message"),
+            },
+            "settlement_identifiers": identifiers,
+            # Read straight from settings — env-driven, with no DB override
+            # and no other endpoint serving them (see db/settings.py). Only
+            # the short-payment tolerance is surfaced: it directly explains a
+            # run outcome the person will see (R9b acceptable vs R9c conflict).
+            # The fuzzy-match minimum was dropped from this summary — it's an
+            # internal matcher knob, not a decision the reviewer acts on.
+            "tolerances": {
+                "short_payment_tolerance_pct": s.SHORT_PAYMENT_TOLERANCE_PCT,
+            },
+        },
+        "multi_account_files": multi_account_files,
+        "blockers": blockers,
+        "warnings": warnings,
+        "can_start": not blockers,
+    }
 
 
 @router.post("/upload")
