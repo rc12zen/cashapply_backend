@@ -101,7 +101,6 @@ def _build_transient_line_item(r: LineItem, entry: dict) -> LineItem:
         rule_id=entry["rule_id"],
         reason_code=entry["reason_code"],
         created_at=r.created_at,
-        statement_date=r.statement_date,
     )
     t.id = _pseudo_line_item_id(r.id, entry["entry_id"])
     if entry.get("standard_receipt_id"):
