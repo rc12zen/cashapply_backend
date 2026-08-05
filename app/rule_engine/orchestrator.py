@@ -976,14 +976,34 @@ def _run_analysis(run_id: int, selected_files: list[str]) -> None:
                     LineItem.receipt_eligibility.is_(None),
                 ).all()
             }
+            # PATCH (bug fix): needs_distribution rows (R16/R17/R18 -- credit
+            # card / cheque / third-party provider) were NEVER excluded here,
+            # contradicting the original requirement that no receipt should
+            # exist until the multi-customer split is actually resolved (see
+            # the broker-payment PRD discussion this whole feature came
+            # from). A bare receipt was being created automatically for
+            # these the same as any ordinary row, meaning Oracle already had
+            # a receipt sitting there before anyone had decided how the
+            # amount splits across customers. Held back the same way
+            # unidentified rows already are, until the (not-yet-built)
+            # Split & Map screen resolves the row and creates the real
+            # per-customer receipts itself.
+            needs_distribution_ids: set[int] = {
+                li.id for li in db.query(LineItem.id).filter(
+                    LineItem.run_id == run_id,
+                    LineItem.rule_id.in_(["R16", "R17", "R18"]),
+                ).all()
+            }
+            held_back_ids = unidentified_undecided_ids | needs_distribution_ids
             all_line_item_ids_this_run = [
                 li.id for li in db.query(LineItem.id).filter(LineItem.run_id == run_id).all()
-                if li.id not in unidentified_undecided_ids
+                if li.id not in held_back_ids
             ]
-            if unidentified_undecided_ids:
+            if held_back_ids:
                 dbg(run_id, "ORACLE", "batch",
                     f"Step 4.5: holding receipt creation for {len(unidentified_undecided_ids)} "
-                    f"unidentified row(s) pending SPOC eligibility decision.")
+                    f"unidentified row(s) pending SPOC eligibility decision, and {len(needs_distribution_ids)} "
+                    f"needs_distribution row(s) pending Split & Map.")
             total_receipt_rows = len(all_line_item_ids_this_run)
             max_workers = max(1, get_settings().ORACLE_RECEIPT_MAX_WORKERS)
             dbg(run_id, "ORACLE", "batch",

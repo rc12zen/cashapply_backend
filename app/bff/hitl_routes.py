@@ -52,6 +52,7 @@ from ..hitl import (
     mark_eligible_for_receipt, discard_row, edit_gl_rate,
     override_settlement_as_customer_payment,
 )
+from ..hitl.split_and_map import get_distribution_context, preview_distribution, confirm_distribution, get_active_invoices_for_customer
 from ..rule_engine.remittance_recheck import recheck_needs_remittance_rows
 from ..rule_engine.customer_name_correction import correct_customer_name, get_customer_name_options
 
@@ -432,6 +433,65 @@ def correct_customer_name_route(id: int, payload: dict, request: Request, db: Se
             "to_rule_id": result.get("to_rule_id"),
             "to_category": result.get("to_category"),
         },
+    )
+    db.commit()
+    return result
+
+
+@router.get("/distribution-context/{id}")
+def distribution_context(id: int, db: Session = Depends(get_db),
+                          user: User = Depends(require_permission("run:view"))):
+    """Everything the Payment Distribution screen needs to render for this
+    needs_distribution row -- see hitl/split_and_map.py's
+    get_distribution_context()."""
+    result = get_distribution_context(db, id)
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") == "already_distributed":
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
+    return result
+
+
+@router.get("/distribution-customer-invoices/{id}")
+def distribution_customer_invoices(id: int, customer_name: str, db: Session = Depends(get_db),
+                                    user: User = Depends(require_permission("run:view"))):
+    """ACTIVE invoices for one customer in the distribution table's invoice
+    picker -- see hitl/split_and_map.py's get_active_invoices_for_customer()."""
+    result = get_active_invoices_for_customer(db, id, customer_name)
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    return result
+
+
+@router.post("/distribution-preview/{id}")
+def distribution_preview(id: int, payload: dict, db: Session = Depends(get_db),
+                          user: User = Depends(require_permission("run:view"))):
+    """Validates a breakup WITHOUT persisting anything -- see hitl/
+    split_and_map.py's preview_distribution()."""
+    entries = payload.get("entries", [])
+    result = preview_distribution(db, id, entries)
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    return result
+
+
+@router.post("/distribution-confirm/{id}")
+def distribution_confirm(id: int, payload: dict, request: Request, db: Session = Depends(get_db),
+                          user: User = Depends(require_permission("hitl:map"))):
+    """Creates one child receipt per customer in the breakup and marks the
+    parent `distributed` -- see hitl/split_and_map.py's
+    confirm_distribution() for the full mechanics and validation."""
+    entries = payload.get("entries", [])
+    result = confirm_distribution(db, id, entries, triggered_by=user.email)
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error"):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
+
+    log_activity(
+        db, user, action="hitl.confirm_distribution", entity_type="LineItem", entity_id=id,
+        ip_address=_client_ip(request),
+        metadata={"children": [c["id"] for c in result.get("children", [])]},
     )
     db.commit()
     return result

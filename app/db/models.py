@@ -89,6 +89,12 @@ class RowState(str, enum.Enum):
     # implies a receipt/mapping decision existed and was reversed. See
     # LineItem.receipt_eligibility and hitl/service.py's discard_row().
     DISCARDED                = "discarded"
+    # NEW: terminal state for a needs_distribution PARENT row once its
+    # Split & Map breakup is confirmed. The parent itself never posts to
+    # Oracle (see rule_engine/orchestrator.py's Step 4.5 -- receipts are
+    # created for the CHILD rows only, one per customer in the breakup).
+    # See hitl/split_and_map.py's confirm_distribution().
+    DISTRIBUTED              = "distributed"
 
 
 class SettlementIdentifierType(str, enum.Enum):
@@ -212,6 +218,15 @@ class LineItem(Base):
 
     id     = Column(BigInteger, primary_key=True, autoincrement=True)
     run_id = Column(Integer, ForeignKey("analysis_runs.run_id"), index=True)
+
+    # ── Split & Map (payment distribution) ────────────────────────────────────
+    # Set ONLY on a CHILD row created by hitl/split_and_map.py's
+    # confirm_distribution() -- one child per customer in a needs_distribution
+    # PARENT row's breakup. The parent's own credit_amount/narrative/bank
+    # fields are copied onto each child (same underlying bank line), but
+    # customer_name, matched_invoices, and current_state are the child's own.
+    # NULL on every ordinary row, including the parent itself.
+    parent_line_item_id = Column(BigInteger, ForeignKey("line_items.id"), nullable=True, index=True)
 
     # ── Raw bank statement fields ─────────────────────────────────────────────
     bank_name                 = Column(String)
@@ -574,6 +589,55 @@ class InvoiceApplication(Base):
 
 
 # ── App1: Rule definitions ────────────────────────────────────────────────────
+
+class AiExtractionPattern(Base):
+    """
+    The learned-pattern cache behind extraction/pattern_cache.py — sits
+    between Layer 2A (regex) and Layer 2B (AI) in the extraction pipeline.
+
+    DESIGN (per direct correction -- this is deliberately NOT a
+    generalized template learner across different customers): strip every
+    digit, punctuation character, and space out of a narration -- what's
+    left is the fingerprint. That collapses the SAME customer's recurring
+    payments (different date/amount/reference each time) down to one
+    fingerprint, while keeping DIFFERENT customers as different
+    fingerprints, since the customer's own name is part of what survives
+    the stripping. One fingerprint maps to exactly ONE customer_name --
+    whatever AI resolved the first time that fingerprint appeared -- and
+    is trusted immediately (confirmed choice; no promotion/consistency
+    streak needed the way a cross-customer template would have required).
+
+    Every application still re-validates customer_name against the aging
+    report before being trusted (see pattern_cache.py's try_apply_pattern)
+    -- this table only ever supplies a candidate answer, never bypasses
+    that fact-check.
+    """
+    __tablename__ = "ai_extraction_patterns"
+
+    id                   = Column(BigInteger, primary_key=True, autoincrement=True)
+    template_fingerprint = Column(String, nullable=False, unique=True, index=True)
+
+    # The actual cached answer -- customer_name is the whole point now;
+    # regex_pattern is kept (nullable) only so a DB already running the
+    # earlier positional-regex design doesn't need a destructive column
+    # drop -- new rows never populate it.
+    customer_name    = Column(String, nullable=True)
+    confidence_score = Column(Float, nullable=True)   # carried over from the AI call that first resolved this fingerprint
+    regex_pattern     = Column(Text, nullable=True)    # unused by the current design -- see note above
+    sample_narrative  = Column(Text, nullable=True)     # one real example, for the admin view / debugging
+
+    hit_count       = Column(Integer, nullable=False, default=1)
+    applied_count   = Column(Integer, nullable=False, default=0)   # times actually used to skip an AI call
+    active          = Column(Boolean, nullable=False, default=False)
+    last_used_at    = Column(DateTime, nullable=True)
+    created_at      = Column(DateTime, default=dt.datetime.utcnow)
+
+    # Soft-retire only, same convention as SettlementIdentifier — a mapping
+    # that turns out wrong should be deactivated with a record of who/when,
+    # not silently edited or hard-deleted out from under an audit trail.
+    deactivated_at  = Column(DateTime, nullable=True)
+    deactivated_by  = Column(String, nullable=True)
+
 
 class AiUsageLog(Base):
     """

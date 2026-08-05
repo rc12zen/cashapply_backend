@@ -75,6 +75,11 @@ GROUP_POST_FAILED         = "post_failed"          # terminal — overrides rule
 # (which implies a receipt/mapping decision existed and was reversed): a
 # discarded row never had a receipt created for it in the first place.
 GROUP_DISCARDED           = "discarded"
+# NEW — see LineItem.parent_line_item_id and hitl/split_and_map.py. The
+# PARENT row of a resolved needs_distribution breakup — terminal, like
+# discarded/rejected, but distinct: this row never gets an Oracle receipt
+# itself (its CHILD rows do, one per customer).
+GROUP_DISTRIBUTED         = "distributed"
 
 # Every group that _category_for_row() can ever return — the single list
 # every aggregation dict below is initialized from, so adding a new group
@@ -85,6 +90,7 @@ ALL_GROUPS: tuple[str, ...] = (
     GROUP_UNIDENTIFIED, GROUP_NEEDS_REMITTANCE, GROUP_NEEDS_DISTRIBUTION,
     GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_CONFLICT_EXCEPTION,
     GROUP_PROCESSED, GROUP_REJECTED, GROUP_POST_FAILED, GROUP_DISCARDED,
+    GROUP_DISTRIBUTED,
 )
 
 RULE_ID_TO_GROUP: dict[str, str] = {
@@ -134,6 +140,7 @@ GROUP_LABELS: dict[str, str] = {
     GROUP_REJECTED:           "Rejected",
     GROUP_POST_FAILED:        "Post Failed",
     GROUP_DISCARDED:          "Discarded",
+    GROUP_DISTRIBUTED:        "Distributed",
 }
 
 
@@ -167,6 +174,13 @@ def _category_for_row(r: LineItem) -> str:
     # forever instead of moving to its own resolved bucket.
     if r.receipt_eligibility == "discarded":
         return GROUP_DISCARDED
+    # NEW — see hitl/split_and_map.py's confirm_distribution(). Checked
+    # before the settlement-override check below since a distributed
+    # parent's rule_id is STILL R16/R17/R18 (kept for audit) -- without
+    # this check first, it would otherwise fall through and keep showing
+    # as Needs Distribution forever, or get caught by the override check.
+    if r.current_state and r.current_state.value == "distributed":
+        return GROUP_DISTRIBUTED
     # NEW — see LineItem.settlement_override_at and hitl/service.py's
     # override_settlement_as_customer_payment(). A settlement identifier
     # match is a pattern match, not always a fact (the same payer name can
@@ -422,6 +436,7 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
     total_short_payment = 0
     total_needs_distribution = 0
     total_discarded = 0
+    total_distributed = 0
     for r in rows:
         cat = _category_for_row(r)
         if cat == GROUP_UNIDENTIFIED:
@@ -434,6 +449,8 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
             total_needs_distribution += 1
         if cat == GROUP_DISCARDED:
             total_discarded += 1
+        if cat == GROUP_DISTRIBUTED:
+            total_distributed += 1
     total_identified = len(rows) - total_unidentified
 
     # PATCH: the aging report snapshot this run actually matched against —
@@ -466,6 +483,7 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
         "total_short_payment": total_short_payment,
         "total_needs_distribution": total_needs_distribution,
         "total_discarded":          total_discarded,
+        "total_distributed":        total_distributed,
         # ── Legacy fields — kept for backward compatibility ──────────────────
         "total_matched": matched,
         "total_not_found": not_found,
