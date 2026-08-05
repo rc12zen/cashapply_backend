@@ -34,6 +34,7 @@ import datetime as dt
 import logging
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from ..db.models import LineItem, RowStatusHistory
 from ..oracle.fusion_client import OracleFusionClient, build_receipt_creation_payload, build_remittance_reference_payloads
@@ -41,6 +42,23 @@ from ..rule_engine.invoice_ledger import confirm_application_for_entry, release_
 from .split_and_map import _COPIED_FIELDS
 
 logger = logging.getLogger(__name__)
+
+
+def _persist_breakdown(r: LineItem, breakdown: list[dict]) -> None:
+    """ALWAYS use this instead of `r.distribution_breakdown = breakdown`
+    directly. Every entry dict inside `breakdown` is the SAME object
+    already referenced by r.distribution_breakdown's currently-loaded
+    value (since _find_entry() returns a reference into the existing
+    list, not a copy) -- so by the time this reassignment happens, the
+    "new" list and the "old" list already contain identical (indeed
+    identical-by-reference) dicts. A plain `=` reassignment can be judged
+    equal-to-old by SQLAlchemy's default dirty check for a Column(JSON)
+    with no Mutable tracking configured, and the UPDATE gets silently
+    skipped -- the request runs clean end-to-end, commits with no error,
+    and NOTHING was actually written. flag_modified() forces the UPDATE
+    unconditionally, regardless of any equality comparison."""
+    r.distribution_breakdown = breakdown
+    flag_modified(r, "distribution_breakdown")
 
 
 def _pseudo_line_item_id(parent_id: int, entry_id: str) -> int:
@@ -148,7 +166,7 @@ def approve_distribution_entry(
     except ValueError as exc:
         entry["oracle_post_status"] = "failed"
         entry["post_message"] = str(exc)
-        r.distribution_breakdown = breakdown
+        _persist_breakdown(r, breakdown)
         db.commit()
         return {"id": parent_id, "entry_id": entry_id, "error": "payload_error", "message": str(exc)}
 
@@ -167,7 +185,7 @@ def approve_distribution_entry(
     entry["oracle_response_raw"] = result.get("raw")
 
     if not result["success"]:
-        r.distribution_breakdown = breakdown
+        _persist_breakdown(r, breakdown)
         db.add(RowStatusHistory(
             line_item_id=r.id, from_state="distributed", to_state="distributed",
             trigger="spoc_distribution_entry_approve", rule_id=entry["rule_id"],
@@ -212,7 +230,7 @@ def approve_distribution_entry(
         # the receipt DOES exist, only the invoice-mapping step failed, so
         # the invoice claim stays reserved rather than released.
 
-    r.distribution_breakdown = breakdown
+    _persist_breakdown(r, breakdown)
     db.add(RowStatusHistory(
         line_item_id=r.id, from_state="distributed", to_state="distributed",
         trigger="spoc_distribution_entry_approve", rule_id=entry["rule_id"],
@@ -264,7 +282,7 @@ def reject_distribution_entry(
 
     release_application_for_entry(db, parent_id, entry_id)
 
-    r.distribution_breakdown = breakdown
+    _persist_breakdown(r, breakdown)
     db.add(RowStatusHistory(
         line_item_id=r.id, from_state="distributed", to_state="distributed",
         trigger="spoc_distribution_entry_reject", rule_id=entry["rule_id"],
@@ -326,7 +344,7 @@ def edit_gl_rate_for_distribution_entry(
         try:
             payload = build_receipt_creation_payload(t)
         except ValueError as exc:
-            r.distribution_breakdown = breakdown
+            _persist_breakdown(r, breakdown)
             db.commit()
             return {"error": "payload_error", "message": str(exc)}
 
@@ -340,7 +358,7 @@ def edit_gl_rate_for_distribution_entry(
         entry["oracle_posted_at"]    = dt.datetime.utcnow().isoformat()
         entry["oracle_response_raw"] = result.get("raw")
 
-        r.distribution_breakdown = breakdown
+        _persist_breakdown(r, breakdown)
         db.add(RowStatusHistory(
             line_item_id=r.id, from_state="distributed", to_state="distributed",
             trigger="spoc_distribution_entry_edit_gl_rate_retry", rule_id=entry["rule_id"],
@@ -389,7 +407,7 @@ def edit_gl_rate_for_distribution_entry(
     entry["gl_rate_edited_by"]               = triggered_by
     entry["gl_rate_edit_reason"]             = reason
 
-    r.distribution_breakdown = breakdown
+    _persist_breakdown(r, breakdown)
     db.add(RowStatusHistory(
         line_item_id=r.id, from_state="distributed", to_state="distributed",
         trigger="spoc_distribution_entry_edit_gl_rate", rule_id=entry["rule_id"],

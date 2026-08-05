@@ -106,11 +106,21 @@ def get_available_actions(
     """Returns the actions this user can take on this row RIGHT NOW --
     already filtered by both row state and permission, ready to render
     directly (see components/row-detail/ActionBar.tsx on the frontend)."""
-    from ..bff.metrics import _category_for_row  # local import: avoids a
+    from ..bff.metrics import _category_for_row, GROUP_DISTRIBUTED  # local import: avoids a
     # circular import at module load time (bff.metrics imports from this
     # package's siblings elsewhere in the app).
 
     category = _category_for_row(line_item)
+
+    # A "distributed" parent has no row-level actions of its own anymore --
+    # every Approve & Post / Reject / Edit GL Rate happens per-entry inside
+    # DistributedSummaryCard (see hitl/distribution_actions.py), not at the
+    # header. Short-circuiting here (rather than relying on every
+    # ActionDefinition row's applicable_categories being configured
+    # correctly) guarantees the header never shows a stale row-level
+    # action for this category, regardless of DB seed data.
+    if category == GROUP_DISTRIBUTED:
+        return []
 
     defs = (
         db.query(ActionDefinition)

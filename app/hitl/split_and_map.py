@@ -51,6 +51,7 @@ from __future__ import annotations
 import datetime as dt
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from ..db.models import LineItem, RowStatusHistory, SettlementIdentifier, SettlementIdentifierType
 from ..aging import aging_store
@@ -479,6 +480,7 @@ def confirm_distribution(db: Session, line_item_id: int, entries: list[dict], tr
             )
 
     r.distribution_breakdown = breakdown
+    flag_modified(r, "distribution_breakdown")
     r.current_state = "distributed"
     r.status = "Distributed"
     r.version = (r.version or 0) + 1
