@@ -592,6 +592,7 @@ def compute_run_summary(db: Session, run_id: int) -> dict:
         "unidentified":             len(rows_by_group[GROUP_UNIDENTIFIED]),
         "needs_remittance":         len(rows_by_group[GROUP_NEEDS_REMITTANCE]),
         "needs_distribution":       len(rows_by_group[GROUP_NEEDS_DISTRIBUTION]),
+        "distributed":              len(rows_by_group[GROUP_DISTRIBUTED]),
         "ready_for_oracle":         len(rows_by_group[GROUP_READY_FOR_ORACLE]),
         "short_payment":            len(rows_by_group[GROUP_SHORT_PAYMENT]),
         "conflict_exception":       len(rows_by_group[GROUP_CONFLICT_EXCEPTION]),

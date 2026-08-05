@@ -10,7 +10,7 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from ..db.models import LineItem, RemittanceExtraction, RemittanceInvoiceLine
-from ..bff.metrics import _category_for_row, GROUP_LABELS, GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT
+from ..bff.metrics import _category_for_row, GROUP_LABELS, GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_DISTRIBUTED
 from ..oracle.fusion_client import build_receipt_creation_payload, build_remittance_reference_payloads
 from ..rule_engine.fx_service import get_ou_display_name
 from ..hitl.actions_registry import get_available_actions
@@ -148,19 +148,27 @@ def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str
     # is hit, it should already be populated for virtually every row. The
     # fallback preview below only matters if that step somehow never ran
     # for this row (e.g. data from before this flow existed).
-    oracle_payload = r.oracle_payload
+    # A distributed PARENT never gets a receipt of its own (see
+    # hitl/split_and_map.py's confirm_distribution() docstring) -- only its
+    # children do. Building/showing a payload preview here was misleading:
+    # it reflects the ORIGINAL pre-split extraction and can't ever actually
+    # post, so it was surfacing confusing "Receipt Failed / Not Yet Mapped"
+    # language for a row that was never meant to post at all.
+    oracle_payload = None
     is_preview = False
-    if not oracle_payload:
-        try:
-            oracle_payload = build_receipt_creation_payload(r)
-            is_preview = True
-        except Exception as exc:
-            # Never let a broken preview take down the row-detail page —
-            # surface it as an audit-style warning instead, same shape as the
-            # _receipt_method_unresolved / _fx_leg2_missing fields the builder
-            # itself emits.
-            oracle_payload = {"_preview_error": f"Could not build payload preview: {exc}"}
-            is_preview = True
+    if _cat != GROUP_DISTRIBUTED:
+        oracle_payload = r.oracle_payload
+        if not oracle_payload:
+            try:
+                oracle_payload = build_receipt_creation_payload(r)
+                is_preview = True
+            except Exception as exc:
+                # Never let a broken preview take down the row-detail page —
+                # surface it as an audit-style warning instead, same shape as the
+                # _receipt_method_unresolved / _fx_leg2_missing fields the builder
+                # itself emits.
+                oracle_payload = {"_preview_error": f"Could not build payload preview: {exc}"}
+                is_preview = True
 
     # ── Invoice-mapping (reference) payload preview ──────────────────────────
     # r.reference_payload is only set once a SPOC actually approves a
@@ -178,10 +186,20 @@ def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str
             reference_payload = [{"_preview_error": f"Could not build reference preview: {exc}"}]
             reference_is_preview = True
 
+    # ── Distribution breakdown (no child rows) ────────────────────────────
+    # A "distributed" row is the ORIGINAL consolidated bank line -- its
+    # per-invoice breakdown lives directly on it now (see
+    # hitl/split_and_map.py's confirm_distribution() and
+    # hitl/distribution_actions.py for the per-entry Approve & Post/Reject/
+    # Edit GL Rate actions that mutate this same column). No separate
+    # LineItem rows are queried or created for this at all.
+    distribution_breakdown = r.distribution_breakdown if _cat == GROUP_DISTRIBUTED else None
+
     return {
         "id":                r.id,
         "category":          _cat,
         "category_label":    GROUP_LABELS.get(_cat, ""),
+        "distribution_breakdown": distribution_breakdown,
         # Data-driven action list (see hitl/actions_registry.py /
         # db/models.py's ActionDefinition) -- already filtered by both
         # this row's current state AND the caller's permissions, so the

@@ -326,6 +326,25 @@ class LineItem(Base):
     target_total     = Column(Numeric(18, 2), nullable=True)   # sum of outstanding (invoice ccy)
     shortfall_pct    = Column(Float, nullable=True)
 
+    # ── Distribution breakdown (Split & Map, no child rows) ──────────────────
+    # Only ever set on a "distributed" PARENT row -- see hitl/split_and_map.py's
+    # confirm_distribution() and hitl/distribution_actions.py. Each element:
+    #   entry_id, customer_name, customer_match_pct, invoice_number, currency,
+    #   amount, invoice_currency, is_cross_currency, fx_credit_to_invoice(+_source),
+    #   is_cross_ledger, fx_invoice_to_functional(+_source), is_cross_ou_currency,
+    #   ou_evidence, target_total, shortfall_pct, rule_id, reason_code,
+    #   hitl_status ("pending"|"approved"|"rejected"),
+    #   oracle_post_status, oracle_ref_no, standard_receipt_id, oracle_status_code,
+    #   post_message, oracle_posted_at, oracle_response_raw, oracle_payload,
+    #   reference_status, reference_payload, reference_response_raw, reference_message,
+    #   gl_rate_original, gl_rate_edited_at, gl_rate_edited_by, gl_rate_edit_reason,
+    #   rejected_at, rejected_by, rejected_reason.
+    # Each entry gets its own InvoiceApplication row too (see
+    # InvoiceApplication.distribution_entry_id below) -- the ledger's
+    # duplicate-invoice protection works identically whether the claim
+    # comes from a normal row or a distribution entry.
+    distribution_breakdown = Column(JSON, nullable=True)
+
     # ── State machine ─────────────────────────────────────────────────────────
     current_state = Column(Enum(RowState), default=RowState.UNIDENTIFIED, index=True)
     reason_code   = Column(String, nullable=True)
@@ -580,6 +599,14 @@ class InvoiceApplication(Base):
     applied_amount  = Column(Numeric(18, 2), nullable=False)   # in invoice currency
     invoice_currency = Column(String(10), nullable=True)
     status          = Column(String, nullable=False, default="pending")  # "pending" | "confirmed" | "released"
+    # NULL for a normal row's own claim. Set to the owning distribution-
+    # breakdown entry's entry_id when this claim was made by one invoice
+    # inside a "distributed" parent's breakdown (multiple entries can share
+    # the same line_item_id -- the parent's -- so this is what lets
+    # confirm/release target just ONE entry instead of every entry under
+    # that parent). See LineItem.distribution_breakdown and
+    # hitl/distribution_actions.py.
+    distribution_entry_id = Column(String, nullable=True, index=True)
     created_at      = Column(DateTime, default=dt.datetime.utcnow)
     updated_at      = Column(DateTime, nullable=True)
 

@@ -53,6 +53,9 @@ from ..hitl import (
     override_settlement_as_customer_payment,
 )
 from ..hitl.split_and_map import get_distribution_context, preview_distribution, confirm_distribution, get_active_invoices_for_customer
+from ..hitl.distribution_actions import (
+    approve_distribution_entry, reject_distribution_entry, edit_gl_rate_for_distribution_entry,
+)
 from ..rule_engine.remittance_recheck import recheck_needs_remittance_rows
 from ..rule_engine.customer_name_correction import correct_customer_name, get_customer_name_options
 
@@ -478,9 +481,11 @@ def distribution_preview(id: int, payload: dict, db: Session = Depends(get_db),
 @router.post("/distribution-confirm/{id}")
 def distribution_confirm(id: int, payload: dict, request: Request, db: Session = Depends(get_db),
                           user: User = Depends(require_permission("hitl:map"))):
-    """Creates one child receipt per customer in the breakup and marks the
-    parent `distributed` -- see hitl/split_and_map.py's
-    confirm_distribution() for the full mechanics and validation."""
+    """Writes the full per-invoice breakdown onto the parent row (NO child
+    rows created) and marks it `distributed` -- see hitl/split_and_map.py's
+    confirm_distribution() for the full mechanics and validation. Each
+    entry still needs its own Approve & Post via
+    /distribution-entry-approve below."""
     entries = payload.get("entries", [])
     result = confirm_distribution(db, id, entries, triggered_by=user.email)
     if result.get("error") == "not found":
@@ -491,7 +496,81 @@ def distribution_confirm(id: int, payload: dict, request: Request, db: Session =
     log_activity(
         db, user, action="hitl.confirm_distribution", entity_type="LineItem", entity_id=id,
         ip_address=_client_ip(request),
-        metadata={"children": [c["id"] for c in result.get("children", [])]},
+        metadata={"entry_ids": [e["entry_id"] for e in result.get("breakdown", [])]},
+    )
+    db.commit()
+    return result
+
+
+@router.post("/distribution-entry-approve/{id}/{entry_id}")
+def distribution_entry_approve(id: int, entry_id: str, payload: dict, request: Request,
+                                db: Session = Depends(get_db),
+                                user: User = Depends(require_permission("oracle:post"))):
+    """Approve & Post ONE entry inside a distributed parent's
+    distribution_breakdown -- see hitl/distribution_actions.py's
+    approve_distribution_entry(). Same permission tier as the normal
+    single-row /approve, since this directly posts to Oracle."""
+    result = approve_distribution_entry(db, id, entry_id, payload.get("comment"), triggered_by=user.email)
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") in ("entry_not_found", "already_approved", "already_rejected", "not_approvable", "payload_error"):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
+
+    log_activity(
+        db, user, action="hitl.distribution_entry_approve", entity_type="LineItem", entity_id=id,
+        ip_address=_client_ip(request),
+        metadata={"entry_id": entry_id, "oracle_ref_no": result.get("oracle_ref_no"),
+                  "reference_status": result.get("reference_status")},
+    )
+    db.commit()
+    return result
+
+
+@router.post("/distribution-entry-reject/{id}/{entry_id}")
+def distribution_entry_reject(id: int, entry_id: str, payload: dict, request: Request,
+                               db: Session = Depends(get_db),
+                               user: User = Depends(require_permission("hitl:reject"))):
+    """Reject ONE entry inside a distributed parent's distribution_breakdown
+    -- see hitl/distribution_actions.py's reject_distribution_entry()."""
+    result = reject_distribution_entry(db, id, entry_id, payload.get("comment"), triggered_by=user.email)
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") in ("entry_not_found", "already_approved"):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
+
+    log_activity(
+        db, user, action="hitl.distribution_entry_reject", entity_type="LineItem", entity_id=id,
+        ip_address=_client_ip(request), metadata={"entry_id": entry_id, "comment": payload.get("comment")},
+    )
+    db.commit()
+    return result
+
+
+@router.put("/distribution-entry-gl-rate/{id}/{entry_id}")
+def distribution_entry_gl_rate(id: int, entry_id: str, payload: dict, request: Request,
+                                db: Session = Depends(get_db),
+                                user: User = Depends(require_permission("oracle:post"))):
+    """Edit the GL conversion rate for ONE entry inside a distributed
+    parent's distribution_breakdown -- see hitl/distribution_actions.py's
+    edit_gl_rate_for_distribution_entry()."""
+    new_rate = payload.get("new_rate")
+    if new_rate is None:
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail="new_rate is required.")
+
+    result = edit_gl_rate_for_distribution_entry(
+        db, id, entry_id, float(new_rate), payload.get("reason"), triggered_by=user.email,
+    )
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") in ("entry_not_found", "not_cross_ledger", "no_receipt", "already_mapped",
+                                "oracle_patch_failed", "retry_failed", "payload_error"):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
+
+    log_activity(
+        db, user, action="hitl.distribution_entry_edit_gl_rate", entity_type="LineItem", entity_id=id,
+        ip_address=_client_ip(request),
+        metadata={"entry_id": entry_id, "old_rate": result.get("old_rate"),
+                  "new_rate": result.get("new_rate"), "reason": payload.get("reason")},
     )
     db.commit()
     return result
