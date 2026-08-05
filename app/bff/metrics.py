@@ -40,6 +40,7 @@ import datetime as dt
 from sqlalchemy.orm import Session
 
 from ..db.models import AnalysisRun, LineItem, RowStatusHistory, SourceFile
+from ..db.settings import get_settings
 from ..aging import aging_store
 from ..rule_engine.fx_service import _STATIC_RATE_MAP
 from .date_range import parse_date_from, parse_date_to
@@ -144,6 +145,28 @@ GROUP_LABELS: dict[str, str] = {
 }
 
 
+def _settlement_override_category(r: LineItem) -> str:
+    """
+    What category a needs_distribution row falls to once a SPOC overrides
+    its settlement-identity match -- see hitl/service.py's
+    override_settlement_as_customer_payment(), which also calls this (to
+    persist current_state/status via CATEGORY_TO_STATE) so the raw fields
+    and the computed category below never disagree.
+
+    Mirrors R7 (CUSTOMER_ONLY_NO_REMIT) vs R8 (NO_SIGNAL): a customer
+    match with real confidence (the SAME bar R7 uses -- not just a
+    non-empty extracted_customer_name string, which for a third-party row
+    is only the settlement_provider/broker name backfilled by the
+    override itself, not an actual aging-report match) means "know who,
+    don't know which invoice" -> Needs Remittance. Otherwise -> Unidentified,
+    same treatment as a genuinely unmatched row.
+    """
+    customer_fuzzy_min_pct = get_settings().CUSTOMER_FUZZY_MATCH_MIN_PCT
+    if r.extracted_customer_name and (r.customer_match_pct or 0) >= customer_fuzzy_min_pct:
+        return GROUP_NEEDS_REMITTANCE
+    return GROUP_UNIDENTIFIED
+
+
 def _category_for_row(r: LineItem) -> str:
     """
     The single function that decides which of the 7 display groups a row
@@ -187,11 +210,20 @@ def _category_for_row(r: LineItem) -> str:
     # legitimately be a broker on one payment and a direct customer on
     # another) — once a SPOC overrides it, the row must stop showing as
     # Needs Distribution even though rule_id is still R16/R17/R18 (kept for
-    # audit, not re-evaluated). It falls back to Unidentified so the
-    # standard Manual Invoice Mapping card takes over — same treatment as
-    # a genuinely unmatched row, since nothing else was extracted for it either.
+    # audit, not re-evaluated). Falls back to the standard Manual Invoice
+    # Mapping card either way -- but WHICH bucket it lands in depends on
+    # whether a customer was actually extracted with real confidence,
+    # mirroring R7 (CUSTOMER_ONLY_NO_REMIT) vs R8 (NO_SIGNAL) below:
+    #   - a confirmed customer_match_pct (same bar R7 uses -- NOT just a
+    #     non-empty extracted_customer_name string, which for a third-party
+    #     row is only the settlement_provider/broker name backfilled by the
+    #     override itself, not an actual aging-report match) -> Needs
+    #     Remittance, same as any other "know who, don't know which
+    #     invoice" row.
+    #   - otherwise -> Unidentified, same treatment as a genuinely
+    #     unmatched row, since nothing else was extracted for it either.
     if r.settlement_override_at is not None and RULE_ID_TO_GROUP.get(r.rule_id) == GROUP_NEEDS_DISTRIBUTION:
-        return GROUP_UNIDENTIFIED
+        return _settlement_override_category(r)
     return RULE_ID_TO_GROUP.get(r.rule_id, GROUP_CONFLICT_EXCEPTION)
 
 
