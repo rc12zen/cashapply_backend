@@ -489,8 +489,8 @@ def override_settlement_as_customer_payment(db: Session, line_item_id: int, trig
 
     r.settlement_override_at = dt.datetime.utcnow()
     r.settlement_override_by = triggered_by
-    if r.settlement_type == "third_party_provider" and not r.customer_name:
-        r.customer_name = r.settlement_provider
+    if r.settlement_type == "third_party_provider" and not r.extracted_customer_name:
+        r.extracted_customer_name = r.settlement_provider
 
     db.add(RowStatusHistory(
         line_item_id=r.id, from_state="needs_distribution", to_state="unidentified",
@@ -507,7 +507,7 @@ def override_settlement_as_customer_payment(db: Session, line_item_id: int, trig
     return {
         "id": r.id,
         "settlement_override": True,
-        "customer_name_prefilled": r.customer_name,
+        "customer_name_prefilled": r.extracted_customer_name,
         "message": "Moved to the customer-payment bucket. Use Manual Invoice Mapping to complete it.",
     }
 
