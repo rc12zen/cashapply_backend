@@ -26,6 +26,7 @@ from ..db.models import SettlementIdentifier, SettlementIdentifierType, User
 from ..deps import get_db
 from ..auth import require_permission
 from ..audit.service import log_activity
+from ..aging import aging_store
 
 router = APIRouter()
 
@@ -62,6 +63,23 @@ def list_settlement_identifiers(db: Session = Depends(get_db),
     for r in rows:
         grouped[r.identifier_type.value].append(_dict(r))
     return {"identifiers": grouped}
+
+
+@router.get("/settlement-identifiers/aging-customers")
+def list_aging_customers_for_providers(user: User = Depends(require_permission("run:view"))):
+    """
+    The customer list for the Third-Party Provider picker on the Accounts &
+    OU's page (see SettlementIdentifiersCard.tsx) — sourced from the SAME
+    loaded aging report every other customer picker in this app uses (see
+    aging/aging_map.py's all_customer_names()), not hand-typed. Previously
+    a SPOC free-typed customer names into a comma-separated field, which
+    meant any typo produced a name that would never actually match a real
+    aging customer at classification/mapping time later.
+    """
+    aging_map = aging_store.get_aging_map()
+    if aging_map is None:
+        return {"customers": [], "error": "No aging report is currently loaded."}
+    return {"customers": aging_map.all_customer_names()}
 
 
 class CreateNarrativeIdentifierRequest(BaseModel):

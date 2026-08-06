@@ -40,6 +40,7 @@ import datetime as dt
 from sqlalchemy.orm import Session
 
 from ..db.models import AnalysisRun, LineItem, RowStatusHistory, SourceFile
+from ..db.settings import get_settings
 from ..aging import aging_store
 from ..rule_engine.fx_service import _STATIC_RATE_MAP
 from .date_range import parse_date_from, parse_date_to
@@ -75,6 +76,11 @@ GROUP_POST_FAILED         = "post_failed"          # terminal — overrides rule
 # (which implies a receipt/mapping decision existed and was reversed): a
 # discarded row never had a receipt created for it in the first place.
 GROUP_DISCARDED           = "discarded"
+# NEW — see LineItem.parent_line_item_id and hitl/split_and_map.py. The
+# PARENT row of a resolved needs_distribution breakup — terminal, like
+# discarded/rejected, but distinct: this row never gets an Oracle receipt
+# itself (its CHILD rows do, one per customer).
+GROUP_DISTRIBUTED         = "distributed"
 
 # Every group that _category_for_row() can ever return — the single list
 # every aggregation dict below is initialized from, so adding a new group
@@ -85,6 +91,7 @@ ALL_GROUPS: tuple[str, ...] = (
     GROUP_UNIDENTIFIED, GROUP_NEEDS_REMITTANCE, GROUP_NEEDS_DISTRIBUTION,
     GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_CONFLICT_EXCEPTION,
     GROUP_PROCESSED, GROUP_REJECTED, GROUP_POST_FAILED, GROUP_DISCARDED,
+    GROUP_DISTRIBUTED,
 )
 
 RULE_ID_TO_GROUP: dict[str, str] = {
@@ -134,7 +141,30 @@ GROUP_LABELS: dict[str, str] = {
     GROUP_REJECTED:           "Rejected",
     GROUP_POST_FAILED:        "Post Failed",
     GROUP_DISCARDED:          "Discarded",
+    GROUP_DISTRIBUTED:        "Distributed",
 }
+
+
+def _settlement_override_category(r: LineItem) -> str:
+    """
+    What category a needs_distribution row falls to once a SPOC overrides
+    its settlement-identity match -- see hitl/service.py's
+    override_settlement_as_customer_payment(), which also calls this (to
+    persist current_state/status via CATEGORY_TO_STATE) so the raw fields
+    and the computed category below never disagree.
+
+    Mirrors R7 (CUSTOMER_ONLY_NO_REMIT) vs R8 (NO_SIGNAL): a customer
+    match with real confidence (the SAME bar R7 uses -- not just a
+    non-empty extracted_customer_name string, which for a third-party row
+    is only the settlement_provider/broker name backfilled by the
+    override itself, not an actual aging-report match) means "know who,
+    don't know which invoice" -> Needs Remittance. Otherwise -> Unidentified,
+    same treatment as a genuinely unmatched row.
+    """
+    customer_fuzzy_min_pct = get_settings().CUSTOMER_FUZZY_MATCH_MIN_PCT
+    if r.extracted_customer_name and (r.customer_match_pct or 0) >= customer_fuzzy_min_pct:
+        return GROUP_NEEDS_REMITTANCE
+    return GROUP_UNIDENTIFIED
 
 
 def _category_for_row(r: LineItem) -> str:
@@ -167,6 +197,33 @@ def _category_for_row(r: LineItem) -> str:
     # forever instead of moving to its own resolved bucket.
     if r.receipt_eligibility == "discarded":
         return GROUP_DISCARDED
+    # NEW — see hitl/split_and_map.py's confirm_distribution(). Checked
+    # before the settlement-override check below since a distributed
+    # parent's rule_id is STILL R16/R17/R18 (kept for audit) -- without
+    # this check first, it would otherwise fall through and keep showing
+    # as Needs Distribution forever, or get caught by the override check.
+    if r.current_state and r.current_state.value == "distributed":
+        return GROUP_DISTRIBUTED
+    # NEW — see LineItem.settlement_override_at and hitl/service.py's
+    # override_settlement_as_customer_payment(). A settlement identifier
+    # match is a pattern match, not always a fact (the same payer name can
+    # legitimately be a broker on one payment and a direct customer on
+    # another) — once a SPOC overrides it, the row must stop showing as
+    # Needs Distribution even though rule_id is still R16/R17/R18 (kept for
+    # audit, not re-evaluated). Falls back to the standard Manual Invoice
+    # Mapping card either way -- but WHICH bucket it lands in depends on
+    # whether a customer was actually extracted with real confidence,
+    # mirroring R7 (CUSTOMER_ONLY_NO_REMIT) vs R8 (NO_SIGNAL) below:
+    #   - a confirmed customer_match_pct (same bar R7 uses -- NOT just a
+    #     non-empty extracted_customer_name string, which for a third-party
+    #     row is only the settlement_provider/broker name backfilled by the
+    #     override itself, not an actual aging-report match) -> Needs
+    #     Remittance, same as any other "know who, don't know which
+    #     invoice" row.
+    #   - otherwise -> Unidentified, same treatment as a genuinely
+    #     unmatched row, since nothing else was extracted for it either.
+    if r.settlement_override_at is not None and RULE_ID_TO_GROUP.get(r.rule_id) == GROUP_NEEDS_DISTRIBUTION:
+        return _settlement_override_category(r)
     return RULE_ID_TO_GROUP.get(r.rule_id, GROUP_CONFLICT_EXCEPTION)
 
 
@@ -411,6 +468,7 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
     total_short_payment = 0
     total_needs_distribution = 0
     total_discarded = 0
+    total_distributed = 0
     for r in rows:
         cat = _category_for_row(r)
         if cat == GROUP_UNIDENTIFIED:
@@ -423,6 +481,8 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
             total_needs_distribution += 1
         if cat == GROUP_DISCARDED:
             total_discarded += 1
+        if cat == GROUP_DISTRIBUTED:
+            total_distributed += 1
     total_identified = len(rows) - total_unidentified
 
     # PATCH: the aging report snapshot this run actually matched against —
@@ -455,6 +515,7 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
         "total_short_payment": total_short_payment,
         "total_needs_distribution": total_needs_distribution,
         "total_discarded":          total_discarded,
+        "total_distributed":        total_distributed,
         # ── Legacy fields — kept for backward compatibility ──────────────────
         "total_matched": matched,
         "total_not_found": not_found,
@@ -531,6 +592,7 @@ def compute_run_summary(db: Session, run_id: int) -> dict:
         "unidentified":             len(rows_by_group[GROUP_UNIDENTIFIED]),
         "needs_remittance":         len(rows_by_group[GROUP_NEEDS_REMITTANCE]),
         "needs_distribution":       len(rows_by_group[GROUP_NEEDS_DISTRIBUTION]),
+        "distributed":              len(rows_by_group[GROUP_DISTRIBUTED]),
         "ready_for_oracle":         len(rows_by_group[GROUP_READY_FOR_ORACLE]),
         "short_payment":            len(rows_by_group[GROUP_SHORT_PAYMENT]),
         "conflict_exception":       len(rows_by_group[GROUP_CONFLICT_EXCEPTION]),

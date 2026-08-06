@@ -618,6 +618,7 @@ def _process_unknown_payment(run_id: int, unknown) -> dict:
     """
     from ..db.session import session_scope
     from .evaluator import RuleResult
+    from ..bank_statement.settlement_identifier import classify_settlement
 
     orig = unknown.original
     try:
@@ -632,11 +633,37 @@ def _process_unknown_payment(run_id: int, unknown) -> dict:
                 credited_currency=(orig.currency or "").upper().strip(),
                 functional_currency=get_functional_currency(orig.ou_number),
             )
-            apply_transition(
-                db, line_item,
-                RuleResult("R8", "NO_SIGNAL", "unidentified"),
-                trigger="rule_engine",
-            )
+
+            # PATCH (bug fix): a row lands here whenever extraction found NO
+            # customer AND NO invoice — which is EXACTLY the common case for
+            # credit card / cheque / third-party settlement narrations, since
+            # those narrations don't name a normal customer at all (see the
+            # PRDs). R16/R17/R18 live inside evaluate_row(), which this path
+            # never called — so a row like "CREDIT CARD PAYMENT RECEIVED -
+            # ADIDAS SPORTS (CHINA) CO." was hardcoded straight to R8/
+            # Unidentified regardless of any configured SettlementIdentifier
+            # pattern matching it. Settlement classification must run here
+            # too, BEFORE the R8 fallback, not only in the identified-payment
+            # path. No customer was extracted for an "unknown" row by
+            # definition, so orig.narrative is passed as the payer-name
+            # candidate too (third-party provider names are often present
+            # directly in the narration even when no customer match fired).
+            settlement_match = classify_settlement(db, orig.narrative, orig.narrative)
+
+            if settlement_match is not None:
+                rule_result = {
+                    "card_narrative":       RuleResult("R16", "CARD_SETTLEMENT_DETECTED", "needs_distribution",
+                                                        settlement_type=settlement_match.settlement_type),
+                    "cheque_narrative":      RuleResult("R17", "CHEQUE_SETTLEMENT_DETECTED", "needs_distribution",
+                                                        settlement_type=settlement_match.settlement_type),
+                    "third_party_provider":  RuleResult("R18", "THIRD_PARTY_PROVIDER_DETECTED", "needs_distribution",
+                                                        settlement_type=settlement_match.settlement_type,
+                                                        settlement_provider=settlement_match.settlement_provider),
+                }[settlement_match.settlement_type]
+            else:
+                rule_result = RuleResult("R8", "NO_SIGNAL", "unidentified")
+
+            apply_transition(db, line_item, rule_result, trigger="rule_engine")
             _mark_row_consumed(db, orig, run_id)
 
         return {"success": True, "bank_reference": orig.bank_reference, "error": None}
@@ -949,14 +976,34 @@ def _run_analysis(run_id: int, selected_files: list[str]) -> None:
                     LineItem.receipt_eligibility.is_(None),
                 ).all()
             }
+            # PATCH (bug fix): needs_distribution rows (R16/R17/R18 -- credit
+            # card / cheque / third-party provider) were NEVER excluded here,
+            # contradicting the original requirement that no receipt should
+            # exist until the multi-customer split is actually resolved (see
+            # the broker-payment PRD discussion this whole feature came
+            # from). A bare receipt was being created automatically for
+            # these the same as any ordinary row, meaning Oracle already had
+            # a receipt sitting there before anyone had decided how the
+            # amount splits across customers. Held back the same way
+            # unidentified rows already are, until the (not-yet-built)
+            # Split & Map screen resolves the row and creates the real
+            # per-customer receipts itself.
+            needs_distribution_ids: set[int] = {
+                li.id for li in db.query(LineItem.id).filter(
+                    LineItem.run_id == run_id,
+                    LineItem.rule_id.in_(["R16", "R17", "R18"]),
+                ).all()
+            }
+            held_back_ids = unidentified_undecided_ids | needs_distribution_ids
             all_line_item_ids_this_run = [
                 li.id for li in db.query(LineItem.id).filter(LineItem.run_id == run_id).all()
-                if li.id not in unidentified_undecided_ids
+                if li.id not in held_back_ids
             ]
-            if unidentified_undecided_ids:
+            if held_back_ids:
                 dbg(run_id, "ORACLE", "batch",
                     f"Step 4.5: holding receipt creation for {len(unidentified_undecided_ids)} "
-                    f"unidentified row(s) pending SPOC eligibility decision.")
+                    f"unidentified row(s) pending SPOC eligibility decision, and {len(needs_distribution_ids)} "
+                    f"needs_distribution row(s) pending Split & Map.")
             total_receipt_rows = len(all_line_item_ids_this_run)
             max_workers = max(1, get_settings().ORACLE_RECEIPT_MAX_WORKERS)
             dbg(run_id, "ORACLE", "batch",

@@ -55,11 +55,28 @@ def _cond_receipt_eligibility_undecided(r: LineItem) -> bool:
 
 
 def _cond_gl_rate_editable(r: LineItem) -> bool:
-    # Edit GL Rate — only offered on a cross-ledger-currency row that
-    # already has a bare Oracle receipt, and only before invoice mapping
-    # exists on it. See hitl/service.py's edit_gl_rate() docstring for why
-    # the reference_status guard matters.
-    return bool(r.is_cross_ledger) and bool(r.standard_receipt_id) and r.reference_status != "success"
+    # Edit GL Rate — two eligible situations, both handled by
+    # hitl/service.py's edit_gl_rate():
+    #   Case A: receipt already exists, not yet invoice-mapped (the
+    #           original case — PATCH the existing receipt).
+    #   Case B: receipt creation itself FAILED (no standard_receipt_id
+    #           yet) — a real gap the original version of this condition
+    #           missed entirely, since it required standard_receipt_id to
+    #           be set. The wrong rate can very plausibly be WHY creation
+    #           failed, so there needs to be a way to fix it and retry
+    #           BEFORE any receipt exists, not only after.
+    if not r.is_cross_ledger:
+        return False
+    if r.standard_receipt_id:
+        return r.reference_status != "success"
+    return r.oracle_post_status == "failed"
+
+
+def _cond_settlement_override_eligible(r: LineItem) -> bool:
+    # Settlement Override ("treat as customer payment") — only offered
+    # once, on a Needs Distribution row not already overridden. See
+    # hitl/service.py's override_settlement_as_customer_payment().
+    return r.settlement_type is not None and r.settlement_override_at is None
 
 
 # Fixed, known set of extra eligibility checks an ActionDefinition row can
@@ -71,6 +88,7 @@ CONDITION_CHECKS = {
     "not_processed": _cond_not_already_mapped_terminal,
     "receipt_eligibility_undecided": _cond_receipt_eligibility_undecided,
     "gl_rate_editable": _cond_gl_rate_editable,
+    "settlement_override_eligible": _cond_settlement_override_eligible,
 }
 
 
@@ -88,11 +106,21 @@ def get_available_actions(
     """Returns the actions this user can take on this row RIGHT NOW --
     already filtered by both row state and permission, ready to render
     directly (see components/row-detail/ActionBar.tsx on the frontend)."""
-    from ..bff.metrics import _category_for_row  # local import: avoids a
+    from ..bff.metrics import _category_for_row, GROUP_DISTRIBUTED  # local import: avoids a
     # circular import at module load time (bff.metrics imports from this
     # package's siblings elsewhere in the app).
 
     category = _category_for_row(line_item)
+
+    # A "distributed" parent has no row-level actions of its own anymore --
+    # every Approve & Post / Reject / Edit GL Rate happens per-entry inside
+    # DistributedSummaryCard (see hitl/distribution_actions.py), not at the
+    # header. Short-circuiting here (rather than relying on every
+    # ActionDefinition row's applicable_categories being configured
+    # correctly) guarantees the header never shows a stale row-level
+    # action for this category, regardless of DB seed data.
+    if category == GROUP_DISTRIBUTED:
+        return []
 
     defs = (
         db.query(ActionDefinition)

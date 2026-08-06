@@ -37,7 +37,12 @@ from sqlalchemy.orm import Session
 from ..db.models import LineItem, RowStatusHistory
 from ..oracle.fusion_client import OracleFusionClient, build_remittance_reference_payloads
 from ..oracle.receipt_creation import create_receipt_for_line_item
-from ..bff.metrics import _category_for_row, GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_UNIDENTIFIED, GROUP_LABELS
+from ..bff.metrics import (
+    _category_for_row, _settlement_override_category, GROUP_READY_FOR_ORACLE,
+    GROUP_SHORT_PAYMENT, GROUP_UNIDENTIFIED, GROUP_NEEDS_DISTRIBUTION,
+    GROUP_NEEDS_REMITTANCE, GROUP_LABELS,
+)
+from ..rule_engine.state_machine import CATEGORY_TO_STATE
 from ..rule_engine.invoice_ledger import confirm_applications, release_applications
 
 logger = logging.getLogger(__name__)
@@ -452,27 +457,111 @@ def discard_row(db: Session, line_item_id: int, comment: str | None, triggered_b
     return {"id": r.id, "status": "Discarded"}
 
 
+def override_settlement_as_customer_payment(db: Session, line_item_id: int, triggered_by: str) -> dict:
+    """
+    A settlement identifier match (R16/R17/R18 — card/cheque/third-party) is
+    a PATTERN match, not always an unambiguous fact. The clearest example:
+    a registered third-party provider like "Assurant Inc" usually pays on
+    behalf of OTHER customers, but can occasionally pay its OWN invoice
+    directly — same payer name, two entirely different real-world
+    situations. This lets a SPOC say "no, for THIS payment, treat it as a
+    normal direct customer payment" instead of a broker split.
+
+    settlement_type/settlement_provider are deliberately left untouched —
+    the pattern match itself was still correct, this only records which
+    bucket a SPOC chose for this specific payment (see
+    LineItem.settlement_override_at's comment). The row falls back to the
+    Unidentified bucket (see bff/metrics.py's _category_for_row) so the
+    standard Manual Invoice Mapping card takes over — customer_name is
+    pre-filled with the matched provider name (third-party rows only) as a
+    starting point for that search, since it's very often the right
+    customer name too, just not always.
+    """
+    r = db.query(LineItem).get(line_item_id)
+    if not r:
+        return {"error": "not found"}
+
+    if _category_for_row(r) != GROUP_NEEDS_DISTRIBUTION:
+        return {
+            "error": "not_needs_distribution",
+            "message": f"Row {r.id} is not currently in Needs Distribution — nothing to override.",
+        }
+    if r.settlement_override_at is not None:
+        return {
+            "error": "already_overridden",
+            "message": f"Row {r.id} was already moved to the customer-payment bucket.",
+        }
+
+    r.settlement_override_at = dt.datetime.utcnow()
+    r.settlement_override_by = triggered_by
+    if r.settlement_type == "third_party_provider" and not r.extracted_customer_name:
+        r.extracted_customer_name = r.settlement_provider
+
+    # Persist the resolved bucket onto the row itself -- NOT just leave it
+    # to be recomputed on read by _category_for_row(). Without this,
+    # current_state/status (both still returned by serialize_line_item())
+    # would keep reading "needs_distribution"/"Needs Distribution" forever,
+    # disagreeing with the `category` field the dashboard actually shows.
+    target_category = _settlement_override_category(r)
+    state_value, legacy_status = CATEGORY_TO_STATE.get(target_category, ("unidentified", "Not Found"))
+    r.current_state = state_value
+    r.status = legacy_status
+
+    db.add(RowStatusHistory(
+        line_item_id=r.id, from_state="needs_distribution", to_state=state_value,
+        trigger="spoc_settlement_override", rule_id=r.rule_id,
+        triggered_by=triggered_by,
+        comment=(
+            f"Moved from Needs Distribution ({r.settlement_type}"
+            f"{' — ' + r.settlement_provider if r.settlement_provider else ''}) "
+            f"to direct customer payment — "
+            + (
+                "customer matched, awaiting remittance advice for invoice details."
+                if target_category == GROUP_NEEDS_REMITTANCE
+                else "no confirmed customer match — Manual Invoice Mapping applies now."
+            )
+        ),
+    ))
+    db.commit()
+
+    return {
+        "id": r.id,
+        "settlement_override": True,
+        "customer_name_prefilled": r.extracted_customer_name,
+        "category": target_category,
+        "message": "Moved to the customer-payment bucket. Use Manual Invoice Mapping to complete it.",
+    }
+
+
 def edit_gl_rate(
     db: Session, line_item_id: int, new_rate: float, reason: str | None, triggered_by: str,
 ) -> dict:
     """
-    Overrides the Leg 2 (invoice -> functional) GL conversion rate on a
-    receipt that's ALREADY been created in Oracle — e.g. Oracle resolved
-    83.67 at receipt-creation time, but finance wants 83.98 applied
-    instead. PATCHes Oracle directly (OracleFusionClient.
-    patch_standard_receipt); see that method's docstring for the exact
-    request shape (mirrors the ConversionRateType: "User" / ConversionRate
-    case fusion_client.build_receipt_creation_payload already builds for
-    the ORIGINAL rate — this just overrides it after the fact).
+    Overrides the Leg 2 (invoice -> functional) GL conversion rate for a
+    cross-ledger-currency row. Branches on whether a receipt already
+    exists in Oracle:
 
-    GUARD (business decision, confirmed): only allowed BEFORE invoice
-    mapping exists on this receipt (reference_status != "success"). Once
-    remittanceReferences are posted, Oracle has already applied this
-    receipt against specific invoice amounts using the ORIGINAL rate —
-    changing it afterward would desync the applied amounts from what the
-    receipt now claims its rate was. A correction needed after that point
-    is a reverse-and-recreate action, not a field edit, and isn't handled
-    here.
+      CASE A -- receipt already created (standard_receipt_id is set):
+        PATCHes it directly (OracleFusionClient.patch_standard_receipt).
+        GUARD (business decision, confirmed): only allowed BEFORE invoice
+        mapping exists on this receipt (reference_status != "success") --
+        once remittanceReferences are posted, changing the rate afterward
+        would desync the applied amounts from what the receipt now claims
+        its rate was. That case needs a reverse-and-recreate correction,
+        not a field edit, and isn't handled here.
+
+      CASE B -- receipt creation itself FAILED (standard_receipt_id is
+        still None, oracle_post_status == "failed"):
+        A PATCH requires an existing StandardReceiptId -- there's nothing
+        to patch, since Oracle never returned one. See
+        oracle/receipt_creation.py's create_receipt_for_line_item(): the
+        exact same wrong rate showing in the failed payload could well be
+        WHY creation failed in the first place. So instead: set
+        fx_invoice_to_functional to the corrected rate (which
+        build_receipt_creation_payload reads directly -- see
+        fusion_client.py), then RE-ATTEMPT receipt creation with a fresh
+        POST using the corrected payload. This is a real gap the original
+        version of this function had -- it only ever covered Case A.
     """
     r = db.query(LineItem).get(line_item_id)
     if not r:
@@ -481,19 +570,74 @@ def edit_gl_rate(
     if not r.is_cross_ledger:
         return {
             "error": "not_cross_ledger",
-            "message": f"Row {r.id} is not a cross-ledger-currency row — there is no GL rate to edit.",
+            "message": f"Row {r.id} is not a cross-ledger-currency row -- there is no GL rate to edit.",
         }
+
+    old_rate = r.fx_invoice_to_functional
+    # Keep the ORIGINAL Oracle-resolved rate exactly once -- a second edit
+    # must not overwrite gl_rate_original with the first edit's value, or
+    # the audit trail loses what the original calculation actually
+    # produced.
+    if r.gl_rate_original is None:
+        r.gl_rate_original = old_rate
+
     if not r.standard_receipt_id:
+        # -- CASE B: no receipt exists yet -- correct the rate and RETRY creation --
+        if r.oracle_post_status != "failed":
+            return {
+                "error": "no_receipt",
+                "message": (
+                    f"Row {r.id} has no Oracle receipt yet, and receipt creation hasn't "
+                    f"actually been attempted (or hasn't failed) -- nothing to retry."
+                ),
+            }
+
+        r.fx_invoice_to_functional        = new_rate
+        r.fx_invoice_to_functional_source = "spoc_manual"
+        r.gl_rate_edited_at               = dt.datetime.utcnow()
+        r.gl_rate_edited_by               = triggered_by
+        r.gl_rate_edit_reason             = reason
+
+        from ..oracle.receipt_creation import create_receipt_for_line_item
+        result = create_receipt_for_line_item(db, r)   # rebuilds the payload fresh -- picks up the new rate
+
+        db.add(RowStatusHistory(
+            line_item_id=r.id, from_state="post_failed", to_state=r.current_state.value if r.current_state else None,
+            trigger="spoc_edit_gl_rate_retry", rule_id=r.rule_id,
+            triggered_by=triggered_by,
+            comment=(
+                f"GL rate changed from {old_rate} to {new_rate} and receipt creation retried "
+                f"({'succeeded' if result.get('success') else 'failed again: ' + str(result.get('message'))})"
+                + (f" -- {reason}" if reason else "")
+            ),
+        ))
+        db.commit()
+
+        if not result.get("success"):
+            return {
+                "error": "retry_failed",
+                "old_rate": old_rate,
+                "new_rate": new_rate,
+                "message": f"Rate updated, but retrying receipt creation failed again: {result.get('message')}",
+            }
+
         return {
-            "error": "no_receipt",
-            "message": f"Row {r.id} has no Oracle receipt yet — nothing to PATCH.",
+            "id": r.id,
+            "success": True,
+            "old_rate": old_rate,
+            "new_rate": new_rate,
+            "gl_rate_original": r.gl_rate_original,
+            "standard_receipt_id": r.standard_receipt_id,
+            "message": f"GL rate updated to {new_rate} and receipt created successfully ({r.standard_receipt_id}).",
         }
+
+    # -- CASE A: receipt already exists -- PATCH it directly --------------------
     if r.reference_status == "success":
         return {
             "error": "already_mapped",
             "message": (
                 f"Row {r.id} already has invoice mapping (remittanceReferences) posted "
-                f"against this receipt — the GL rate can no longer be edited here. "
+                f"against this receipt -- the GL rate can no longer be edited here. "
                 f"This needs a reverse-and-recreate correction instead."
             ),
         }
@@ -510,13 +654,6 @@ def edit_gl_rate(
             "message": f"Oracle rejected the rate change: {result.get('message')}",
         }
 
-    # Keep the ORIGINAL Oracle-resolved rate exactly once — a second edit
-    # must not overwrite gl_rate_original with the first edit's value,
-    # or the audit trail loses what Oracle actually calculated on its own.
-    if r.gl_rate_original is None:
-        r.gl_rate_original = r.fx_invoice_to_functional
-
-    old_rate = r.fx_invoice_to_functional
     r.fx_invoice_to_functional        = new_rate
     r.fx_invoice_to_functional_source = "spoc_manual"
     r.gl_rate_edited_at               = dt.datetime.utcnow()
@@ -528,7 +665,7 @@ def edit_gl_rate(
         to_state=r.current_state.value if r.current_state else None,
         trigger="spoc_edit_gl_rate", rule_id=r.rule_id,
         triggered_by=triggered_by,
-        comment=f"GL rate changed from {old_rate} to {new_rate}" + (f" — {reason}" if reason else ""),
+        comment=f"GL rate changed from {old_rate} to {new_rate}" + (f" -- {reason}" if reason else ""),
     ))
     db.commit()
 

@@ -8,9 +8,11 @@ Run once per environment, alongside seed_rbac.py:
 
     python -m scripts.seed_actions
 
-Adding a NEW action in the future (per the "future we may get actions as
-well" plan) means adding one entry here — not touching frontend
-conditionals or scattering a new permission check across route handlers.
+PATCH: folded in the 4 rows that previously existed ONLY as raw INSERTs in
+Apply_schema_changes_round2.sql (mark_eligible, discard, edit_gl_rate,
+settlement_override) — those were data, not schema, and had no Python seed
+path at all. Keeping them here means one seed script covers every action
+row instead of splitting "most actions" (this file) from "4 actions" (SQL).
 """
 from __future__ import annotations
 
@@ -40,6 +42,23 @@ ACTIONS: dict[str, tuple] = {
     "retry_oracle": (
         "Retry Oracle Post", "rotate-cw", "oracle:post",
         ["post_failed"], "reference_status_failed", True, False, 50,
+    ),
+    # ── PATCH: previously SQL-only rows (round2.sql), now seeded here ──────
+    "settlement_override": (
+        "Treat as Customer Payment", "arrow-right-left", "hitl:map",
+        ["needs_distribution"], "settlement_override_eligible", True, False, 45,
+    ),
+    "mark_eligible": (
+        "Mark Eligible for Receipt", "check-circle", "hitl:map",
+        ["unidentified"], "receipt_eligibility_undecided", False, False, 50,
+    ),
+    "discard": (
+        "Discard", "trash-2", "hitl:reject",
+        ["unidentified"], "receipt_eligibility_undecided", True, True, 51,
+    ),
+    "edit_gl_rate": (
+        "Edit GL Rate", "edit-3", "oracle:post",
+        None, "gl_rate_editable", False, False, 60,
     ),
 }
 
