@@ -37,7 +37,12 @@ from sqlalchemy.orm import Session
 from ..db.models import LineItem, RowStatusHistory
 from ..oracle.fusion_client import OracleFusionClient, build_remittance_reference_payloads
 from ..oracle.receipt_creation import create_receipt_for_line_item
-from ..bff.metrics import _category_for_row, GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_UNIDENTIFIED, GROUP_NEEDS_DISTRIBUTION, GROUP_LABELS
+from ..bff.metrics import (
+    _category_for_row, _settlement_override_category, GROUP_READY_FOR_ORACLE,
+    GROUP_SHORT_PAYMENT, GROUP_UNIDENTIFIED, GROUP_NEEDS_DISTRIBUTION,
+    GROUP_NEEDS_REMITTANCE, GROUP_LABELS,
+)
+from ..rule_engine.state_machine import CATEGORY_TO_STATE
 from ..rule_engine.invoice_ledger import confirm_applications, release_applications
 
 logger = logging.getLogger(__name__)
@@ -489,17 +494,32 @@ def override_settlement_as_customer_payment(db: Session, line_item_id: int, trig
 
     r.settlement_override_at = dt.datetime.utcnow()
     r.settlement_override_by = triggered_by
-    if r.settlement_type == "third_party_provider" and not r.customer_name:
-        r.customer_name = r.settlement_provider
+    if r.settlement_type == "third_party_provider" and not r.extracted_customer_name:
+        r.extracted_customer_name = r.settlement_provider
+
+    # Persist the resolved bucket onto the row itself -- NOT just leave it
+    # to be recomputed on read by _category_for_row(). Without this,
+    # current_state/status (both still returned by serialize_line_item())
+    # would keep reading "needs_distribution"/"Needs Distribution" forever,
+    # disagreeing with the `category` field the dashboard actually shows.
+    target_category = _settlement_override_category(r)
+    state_value, legacy_status = CATEGORY_TO_STATE.get(target_category, ("unidentified", "Not Found"))
+    r.current_state = state_value
+    r.status = legacy_status
 
     db.add(RowStatusHistory(
-        line_item_id=r.id, from_state="needs_distribution", to_state="unidentified",
+        line_item_id=r.id, from_state="needs_distribution", to_state=state_value,
         trigger="spoc_settlement_override", rule_id=r.rule_id,
         triggered_by=triggered_by,
         comment=(
             f"Moved from Needs Distribution ({r.settlement_type}"
             f"{' — ' + r.settlement_provider if r.settlement_provider else ''}) "
-            f"to direct customer payment — Manual Invoice Mapping applies now."
+            f"to direct customer payment — "
+            + (
+                "customer matched, awaiting remittance advice for invoice details."
+                if target_category == GROUP_NEEDS_REMITTANCE
+                else "no confirmed customer match — Manual Invoice Mapping applies now."
+            )
         ),
     ))
     db.commit()
@@ -507,7 +527,8 @@ def override_settlement_as_customer_payment(db: Session, line_item_id: int, trig
     return {
         "id": r.id,
         "settlement_override": True,
-        "customer_name_prefilled": r.customer_name,
+        "customer_name_prefilled": r.extracted_customer_name,
+        "category": target_category,
         "message": "Moved to the customer-payment bucket. Use Manual Invoice Mapping to complete it.",
     }
 

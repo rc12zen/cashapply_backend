@@ -130,6 +130,77 @@ def record_application(db: Session, line_item, status: str = "pending") -> None:
     db.flush()
 
 
+def record_application_for_entry(
+    db: Session, parent_line_item_id: int, entry_id: str,
+    invoice_number: str, ou_number: str | None, customer_name: str | None,
+    applied_amount: float, invoice_currency: str | None, status: str = "pending",
+) -> None:
+    """Same idea as record_application(), for ONE entry inside a
+    'distributed' parent's distribution_breakdown -- see
+    LineItem.distribution_breakdown / InvoiceApplication.distribution_entry_id.
+    Multiple entries share the same parent_line_item_id, so lookups here
+    are keyed on (line_item_id, invoice_number, distribution_entry_id), not
+    just (line_item_id, invoice_number) -- otherwise a second entry
+    referencing a different invoice under the same parent would be fine,
+    but two entries that happened to reference the SAME invoice_number
+    (rare -- would mean the aging report itself has that number attached
+    to more than one customer) could overwrite each other's row. Documented
+    as a known edge case, not silently corrected."""
+    if not invoice_number:
+        return
+    existing = (
+        db.query(InvoiceApplication)
+        .filter(
+            InvoiceApplication.line_item_id == parent_line_item_id,
+            InvoiceApplication.invoice_number == invoice_number,
+            InvoiceApplication.distribution_entry_id == entry_id,
+        )
+        .first()
+    )
+    if existing:
+        existing.applied_amount = applied_amount
+        existing.status = status
+        existing.customer_name = customer_name
+        existing.ou_number = ou_number
+        existing.invoice_currency = invoice_currency
+        existing.updated_at = dt.datetime.utcnow()
+    else:
+        db.add(InvoiceApplication(
+            line_item_id=parent_line_item_id,
+            invoice_number=invoice_number,
+            ou_number=ou_number,
+            customer_name=customer_name,
+            applied_amount=applied_amount,
+            invoice_currency=invoice_currency,
+            status=status,
+            distribution_entry_id=entry_id,
+        ))
+    db.flush()
+
+
+def confirm_application_for_entry(db: Session, parent_line_item_id: int, entry_id: str) -> None:
+    """Called once THIS entry's Oracle invoice-mapping call actually
+    succeeds -- upgrades only its own InvoiceApplication row(s), leaving
+    every sibling entry under the same parent untouched."""
+    db.query(InvoiceApplication).filter(
+        InvoiceApplication.line_item_id == parent_line_item_id,
+        InvoiceApplication.distribution_entry_id == entry_id,
+    ).update({"status": "confirmed", "updated_at": dt.datetime.utcnow()})
+    db.flush()
+
+
+def release_application_for_entry(db: Session, parent_line_item_id: int, entry_id: str) -> None:
+    """Called when ONE entry is rejected -- frees just that entry's
+    invoice claim, leaving every sibling entry under the same parent
+    untouched (unlike release_applications(), which releases every
+    InvoiceApplication row for a given line_item_id)."""
+    db.query(InvoiceApplication).filter(
+        InvoiceApplication.line_item_id == parent_line_item_id,
+        InvoiceApplication.distribution_entry_id == entry_id,
+    ).update({"status": "released", "updated_at": dt.datetime.utcnow()})
+    db.flush()
+
+
 def confirm_applications(db: Session, line_item) -> None:
     """Called by hitl/service.py's approve_row once the Oracle
     invoice-mapping call actually succeeds."""
