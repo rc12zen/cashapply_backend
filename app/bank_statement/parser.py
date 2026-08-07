@@ -81,6 +81,40 @@ _FORMAT_MAP = {
     "DD-MM-YYYY":  "%d-%m-%Y",
     "DD-Mon-YYYY": "%d-%b-%Y",
     "DD-MMM-YYYY": "%d-%b-%Y",
+    # Month-name with a 2-DIGIT year (e.g. "4-Aug-26"). %Y needs a 4-digit
+    # year, so the *-YYYY forms above FAIL on a 2-digit year — these %y forms
+    # are what actually parse it. %d/%b are lenient about a single-digit day
+    # ("4") and 3-letter month ("Aug"), so no separate single-digit variant is
+    # needed. Month-name formats never match a purely numeric date, so adding
+    # them can't cannibalise the numeric formats above.
+    "DD-Mon-YY":   "%d-%b-%y",
+    "DD-MMM-YY":   "%d-%b-%y",
+    # 2-digit-year numeric variants — appended so the 4-digit forms above are
+    # always tried first (a 4-digit year only matches %Y, a 2-digit only %y,
+    # so the two never collide). Same day-first order as the 4-digit forms
+    # (see ConfigBuilderWizard.tsx DEFAULT_DATE_FORMATS — numeric ordering
+    # deliberately left day-first for now).
+    "DD/MM/YY":    "%d/%m/%y",
+    "MM/DD/YY":    "%m/%d/%y",
+    "DD-MM-YY":    "%d-%m-%y",
+    # ── Extra keys the config-builder date-format DETECTOR can resolve to (see
+    # bank_statement/date_inference.py). Kept here so a resolved format is
+    # stored as a readable key and parsed by the SAME map at runtime. Month-
+    # first (MM-DD) and dot-separated and space/comma month-name variants live
+    # here rather than in the wizard's blind default list — detection picks the
+    # exact one from the sample, so they never widen runtime ambiguity.
+    "YYYY/MM/DD":   "%Y/%m/%d",
+    "MM-DD-YYYY":   "%m-%d-%Y",
+    "MM-DD-YY":     "%m-%d-%y",
+    "DD.MM.YYYY":   "%d.%m.%Y",
+    "MM.DD.YYYY":   "%m.%d.%Y",
+    "DD.MM.YY":     "%d.%m.%y",
+    "MM.DD.YY":     "%m.%d.%y",
+    "DD Mon YYYY":  "%d %b %Y",
+    "DD Mon YY":    "%d %b %y",
+    "Mon DD YYYY":  "%b %d %Y",
+    "Mon DD, YYYY": "%b %d, %Y",
+    "Mon-DD-YYYY":  "%b-%d-%Y",
 }
 
 
