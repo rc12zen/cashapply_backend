@@ -58,6 +58,7 @@ from ..aging import aging_store
 from ..rule_engine.invoice_ledger import get_applied_total, record_application_for_entry
 from ..rule_engine.ou_resolver import resolve_ou_status
 from ..rule_engine.fx_service import FxService
+from ..rule_engine.evaluator import DEFAULT_SHORT_PAYMENT_TOLERANCE_PCT
 from .manual_mapping import _classify
 
 DUPLICATE_TOLERANCE = 0.01
@@ -114,6 +115,7 @@ def get_distribution_context(db: Session, line_item_id: int) -> dict:
         "settlement_provider": r.settlement_provider,
         "roster": roster,
         "all_customers": all_customers,
+        "short_payment_tolerance_pct": DEFAULT_SHORT_PAYMENT_TOLERANCE_PCT,
     }
 
 
@@ -139,19 +141,43 @@ def get_active_invoices_for_customer(db: Session, line_item_id: int, customer_na
     if not customer_row:
         return {"error": "unknown_customer", "message": f"'{customer_name}' does not match a customer in the aging report."}
 
+    credited_currency = (r.statement_currency or "").upper().strip()
+    fx_service = FxService()
+    rate_cache: dict[str, tuple] = {}   # one lookup per distinct invoice currency, not per invoice
+
     active = []
     for iv in aging_map.invoices_for_customer(customer_row.customer_name):
         outstanding = float(iv.outstanding_amount)
-        already_applied = get_applied_total(db, iv.invoice_number, iv.ou_number)
+        # PATCH (real bug, caught by direct question): must filter by the
+        # BANK ROW's ou_number (r.ou_number), not the aging invoice's own
+        # ou_number (iv.ou_number) -- InvoiceApplication.ou_number is always
+        # written from the bank row (see record_application_for_entry() /
+        # _resolve_entry()'s exclude-my-own-claim query at line ~228), and
+        # those two OUs are legitimately different values for the same
+        # invoice. Filtering by iv.ou_number here meant an existing claim
+        # NEVER matched, so this picker always showed the full un-clawed-
+        # back outstanding no matter what was already applied elsewhere.
+        already_applied = get_applied_total(db, iv.invoice_number, r.ou_number)
         remaining = round(outstanding - already_applied, 2)
         if remaining > DUPLICATE_TOLERANCE:
+            invoice_currency = (iv.invoice_currency or "").upper().strip()
+            is_cross_currency = bool(invoice_currency) and bool(credited_currency) and invoice_currency != credited_currency
+            fx_rate = None
+            if is_cross_currency:
+                if invoice_currency not in rate_cache:
+                    rate_cache[invoice_currency] = fx_service.get_rate_with_source(
+                        from_ccy=credited_currency, to_ccy=invoice_currency, rate_date=r.statement_date,
+                    )
+                fx_rate, _source = rate_cache[invoice_currency]
             active.append({
                 "invoice_number": iv.invoice_number,
                 "outstanding_amount": remaining,   # what's actually left to claim, not the raw aging figure
                 "currency": iv.invoice_currency,
+                "is_cross_currency": is_cross_currency,
+                "fx_rate": fx_rate,   # credited_currency -> invoice currency; same lookup _resolve_entry() uses
             })
 
-    return {"customer_name": customer_row.customer_name, "invoices": active}
+    return {"customer_name": customer_row.customer_name, "credited_currency": credited_currency, "invoices": active}
 
 
 def _resolve_entry(db: Session, aging_map, r: LineItem, entry: dict) -> dict:
