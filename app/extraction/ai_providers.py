@@ -222,6 +222,19 @@ _STATUS_CACHE_TTL_SECONDS = 60
 _status_cache: dict | None = None
 _status_cache_at: float = 0.0
 
+# Human-facing names for the raw AI_PROVIDER tokens, so status messages read
+# "Azure OpenAI" rather than "azure_openai" (the frontend mirrors this map in
+# app/home/page.tsx's prettyProvider()).
+_PROVIDER_LABELS = {
+    "azure_openai": "Azure OpenAI",
+    "openai": "OpenAI",
+    "anthropic": "Anthropic (Claude)",
+}
+
+
+def _pretty_provider(provider: str | None) -> str:
+    return _PROVIDER_LABELS.get(provider or "", provider or "the AI provider")
+
 
 def _check_anthropic_reachable() -> tuple[bool, str | None]:
     from ..db.settings import get_settings
@@ -294,12 +307,33 @@ def get_ai_status(force_refresh: bool = False) -> dict:
     import time as _time
     global _status_cache, _status_cache_at
 
-    if not force_refresh and _status_cache is not None and (_time.monotonic() - _status_cache_at) < _STATUS_CACHE_TTL_SECONDS:
-        return {**_status_cache, "cached": True}
-
     from ..db.settings import get_settings
     s = get_settings()
     provider = (s.AI_PROVIDER or "anthropic").strip().lower()
+
+    # Master switch OFF (.env: AI_EXTRACTION_ENABLED=false) -- report a neutral
+    # "disabled" state WITHOUT pinging the provider (local dev needs no valid
+    # key). enabled=false tells the frontend the gate should stay OPEN
+    # (upload/analyse proceed regex-only), NOT that there's an outage. The
+    # matching skip is in layer_2b_ai.py's run_layer_2b().
+    if not s.AI_EXTRACTION_ENABLED:
+        return {
+            "provider": provider,
+            "model": None,
+            "enabled": False,
+            "configured": False,
+            "active": False,
+            "checked_at": _dt.datetime.utcnow().isoformat(),
+            "message": (
+                "AI extraction is turned OFF (AI_EXTRACTION_ENABLED=false). "
+                "Analysis runs with pattern/regex matching only -- unresolved rows "
+                "won't get the AI second pass. Upload and analysis are still allowed."
+            ),
+            "cached": False,
+        }
+
+    if not force_refresh and _status_cache is not None and (_time.monotonic() - _status_cache_at) < _STATUS_CACHE_TTL_SECONDS:
+        return {**_status_cache, "cached": True}
 
     if provider == "azure_openai":
         model = s.AZURE_OPENAI_DEPLOYMENT
@@ -317,20 +351,25 @@ def get_ai_status(force_refresh: bool = False) -> dict:
         model = None
         active, error, configured = False, f"Unknown AI_PROVIDER '{provider}'", False
 
+    label = _pretty_provider(provider)
     if active:
-        message = f"AI extraction is active ({provider} {model})."
+        message = f"AI extraction is active ({label}, model {model})."
     elif not configured:
         message = (
-            f"No API key configured for {provider} -- AI extraction fallback will not run. "
-            f"Analysis can still proceed using pattern/regex matching only, but unresolved rows "
-            f"won't get the AI second pass."
+            f"No API key is configured for {label}. "
+            f"AI extraction can't run until an administrator adds a valid key."
         )
     else:
-        message = f"{provider} is configured but not reachable right now ({error}). Contact an administrator."
+        # `error` is the provider's own failure text (expired/invalid key,
+        # service outage, wrong deployment name, ...) -- surfaced as the
+        # specific reason, trimmed of surrounding whitespace/newlines.
+        detail = " ".join(str(error).split()) if error else "the service could not be reached"
+        message = f"{label} is configured but isn't reachable right now: {detail}. Contact an administrator."
 
     result = {
         "provider": provider,
         "model": model,
+        "enabled": True,
         "configured": configured,
         "active": active,
         "checked_at": _dt.datetime.utcnow().isoformat(),
