@@ -350,6 +350,18 @@ class LineItem(Base):
     reason_code   = Column(String, nullable=True)
     rule_id       = Column(String, nullable=True)
 
+    # ── Reopen support ────────────────────────────────────────────────────────
+    # Captured by hitl/service.py's reject_row() the instant a row is rejected:
+    # the current_state the row held RIGHT BEFORE it became "rejected", so
+    # reopen_row() can restore it to exactly where it was rather than guessing.
+    # The display category always recomputes from rule_id, but current_state
+    # itself is not otherwise recoverable once overwritten to "rejected".
+    # Stored as the plain enum value string (e.g. "review_approve"). Nullable:
+    # None for rows never rejected, cleared again on reopen, and None for
+    # legacy rows rejected before this column existed (reopen falls back to a
+    # safe default in that case).
+    pre_reject_state = Column(String, nullable=True)
+
     # ── Settlement identity (credit card / cheque / third-party) ─────────────
     # Set by rule_engine/evaluator.py's R16/R17/R18 the moment detection
     # matches a configured SettlementIdentifier -- BEFORE any invoice mapping

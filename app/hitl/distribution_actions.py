@@ -38,8 +38,35 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from ..db.models import LineItem, RowStatusHistory
 from ..oracle.fusion_client import OracleFusionClient, build_receipt_creation_payload, build_remittance_reference_payloads
-from ..rule_engine.invoice_ledger import confirm_application_for_entry, release_application_for_entry
+from ..rule_engine.invoice_ledger import (
+    confirm_application_for_entry, release_application_for_entry,
+    record_application_for_entry, check_duplicate,
+)
+from ..aging.aging_store import get_aging_map
 from .split_and_map import _COPIED_FIELDS
+
+
+def _version_conflict(r: LineItem, expected_version: int | None) -> dict | None:
+    """Optimistic-locking guard for distribution-entry actions. Every entry
+    action mutates the SAME distribution_breakdown JSON blob on the parent
+    row, so two SPOCs acting on different entries of one parent at once can
+    silently clobber each other (last write wins on the blob). Bumping and
+    checking the parent's version on every entry write turns that into a
+    detectable conflict, exactly as the single-row actions already do.
+    Returns an error dict if the caller's expected_version is stale, else
+    None."""
+    if expected_version is not None and r.version != expected_version:
+        return {
+            "id": r.id,
+            "error": "version_conflict",
+            "message": (
+                f"This distributed row was modified by another user since you loaded it "
+                f"(expected version {expected_version}, current version {r.version}). "
+                f"Refresh and try again."
+            ),
+            "current_version": r.version,
+        }
+    return None
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +155,7 @@ def _build_transient_line_item(r: LineItem, entry: dict) -> LineItem:
 
 def approve_distribution_entry(
     db: Session, parent_id: int, entry_id: str, comment: str | None, triggered_by: str,
+    expected_version: int | None = None,
 ) -> dict:
     """Per-entry counterpart of hitl/service.py's approve_row() -- same
     two-step Oracle flow (bare receipt, then remittanceReference), same
@@ -136,6 +164,10 @@ def approve_distribution_entry(
     r = db.query(LineItem).get(parent_id)
     if not r:
         return {"error": "not found"}
+
+    conflict = _version_conflict(r, expected_version)
+    if conflict:
+        return conflict
 
     breakdown = list(r.distribution_breakdown or [])
     entry = _find_entry(breakdown, entry_id)
@@ -154,6 +186,11 @@ def approve_distribution_entry(
                 f"can be approved."
             ),
         }
+
+    # Past the pre-flight guards — every remaining path mutates the breakdown
+    # and commits, so bump the parent version once here for optimistic locking
+    # (see _version_conflict). Early non-mutating returns above are unaffected.
+    r.version = (r.version or 0) + 1
 
     t = _build_transient_line_item(r, entry)
     client = OracleFusionClient()
@@ -257,6 +294,7 @@ def approve_distribution_entry(
 
 def reject_distribution_entry(
     db: Session, parent_id: int, entry_id: str, comment: str | None, triggered_by: str,
+    expected_version: int | None = None,
 ) -> dict:
     """Per-entry counterpart of hitl/service.py's reject_row() -- frees
     this entry's invoice claim, leaving every sibling entry under the
@@ -264,6 +302,10 @@ def reject_distribution_entry(
     r = db.query(LineItem).get(parent_id)
     if not r:
         return {"error": "not found"}
+
+    conflict = _version_conflict(r, expected_version)
+    if conflict:
+        return conflict
 
     breakdown = list(r.distribution_breakdown or [])
     entry = _find_entry(breakdown, entry_id)
@@ -275,6 +317,11 @@ def reject_distribution_entry(
             "message": f"Entry {entry_id} was already approved and posted — cannot reject a posted entry here.",
         }
 
+    # Capture where the entry was before rejection so reopen_distribution_entry()
+    # can restore it (entries are only ever rejectable from "pending" — approved
+    # is blocked above — so this is "pending" today, but recording it keeps the
+    # reopen symmetric with the row-level pre_reject_state and future-proof.
+    entry["pre_reject_status"] = entry.get("hitl_status") or "pending"
     entry["hitl_status"]      = "rejected"
     entry["rejected_at"]      = dt.datetime.utcnow().isoformat()
     entry["rejected_by"]      = triggered_by
@@ -282,6 +329,7 @@ def reject_distribution_entry(
 
     release_application_for_entry(db, parent_id, entry_id)
 
+    r.version = (r.version or 0) + 1
     _persist_breakdown(r, breakdown)
     db.add(RowStatusHistory(
         line_item_id=r.id, from_state="distributed", to_state="distributed",
@@ -295,6 +343,111 @@ def reject_distribution_entry(
     db.commit()
 
     return {"id": parent_id, "entry_id": entry_id, "status": "Rejected"}
+
+
+def reopen_distribution_entry(
+    db: Session, parent_id: int, entry_id: str, comment: str | None, triggered_by: str,
+    expected_version: int | None = None,
+) -> dict:
+    """Undo a rejected distribution entry -- per-entry counterpart of
+    hitl/service.py's reopen_row(). Sets the entry back to pending, clears its
+    rejection metadata, re-stakes its invoice claim (released on reject), and
+    reuses any existing Oracle receipt untouched. Same three guards as the
+    row-level reopen: parent version, invoice still in current aging, invoice
+    not claimed elsewhere."""
+    r = db.query(LineItem).get(parent_id)
+    if not r:
+        return {"error": "not found"}
+
+    conflict = _version_conflict(r, expected_version)
+    if conflict:
+        return conflict
+
+    breakdown = list(r.distribution_breakdown or [])
+    entry = _find_entry(breakdown, entry_id)
+    if entry is None:
+        return {"error": "entry_not_found", "message": f"No entry '{entry_id}' on row {parent_id}."}
+    if entry["hitl_status"] != "rejected":
+        return {
+            "error": "not_rejected",
+            "message": f"Entry {entry_id} is not rejected — only a rejected entry can be reopened.",
+        }
+
+    # ── Guard: invoice must still be in the CURRENT aging report ──────────────
+    inv_no = entry.get("invoice_number")
+    ou = r.ou_number
+    aging = get_aging_map()
+    if aging is None:
+        return {
+            "error": "aging_unavailable",
+            "message": (
+                "Can't reopen — no aging report is currently loaded, so this entry's "
+                "invoice can't be re-validated. Load the aging report and try again."
+            ),
+        }
+    view = aging.lookup_invoice(inv_no, ou)
+    if view is None:
+        return {
+            "error": "invoice_not_in_aging",
+            "message": (
+                f"Can't reopen — invoice {inv_no} is no longer in the current aging "
+                f"report (it may have been paid, closed, or removed since this entry "
+                f"was rejected)."
+            ),
+        }
+
+    # ── Guard: invoice not over-claimed elsewhere ─────────────────────────────
+    # Reuses check_duplicate, which excludes by parent line_item_id — that also
+    # excludes SIBLING entries under this same parent. In the common case an
+    # invoice lives in exactly one entry, so that's exact; the only blind spot
+    # is the rare (documented) case of the same invoice appearing across two
+    # sibling entries — the ledger itself flags that as a known edge, not
+    # silently corrected here either.
+    claim = entry.get("amount") or 0
+    dup = check_duplicate(
+        db, inv_no, ou,
+        outstanding_amount=view.outstanding_amount,
+        new_amount=claim,
+        exclude_line_item_id=parent_id,
+    )
+    if dup["blocked"]:
+        return {
+            "error": "invoice_claimed_elsewhere",
+            "message": (
+                f"Can't reopen — invoice {inv_no} is now applied to another payment "
+                f"({dup['already_applied']:,.2f} claimed, only "
+                f"{max(dup['remaining_before'], 0):,.2f} left), so re-claiming it here "
+                f"would double it up. Resolve the other claim first."
+            ),
+        }
+
+    # ── All guards passed — restore the entry to pending ──────────────────────
+    entry["hitl_status"]     = entry.get("pre_reject_status") or "pending"
+    entry["rejected_at"]     = None
+    entry["rejected_by"]     = None
+    entry["rejected_reason"] = None
+    entry["pre_reject_status"] = None
+
+    record_application_for_entry(
+        db, parent_line_item_id=parent_id, entry_id=entry_id,
+        invoice_number=inv_no, ou_number=ou, customer_name=entry.get("customer_name"),
+        applied_amount=claim, invoice_currency=entry.get("currency"), status="pending",
+    )
+
+    r.version = (r.version or 0) + 1
+    _persist_breakdown(r, breakdown)
+    db.add(RowStatusHistory(
+        line_item_id=r.id, from_state="distributed", to_state="distributed",
+        trigger="spoc_distribution_entry_reopen", rule_id=entry["rule_id"],
+        triggered_by=triggered_by,
+        comment=(
+            f"Entry {entry_id} ({entry['customer_name']} / {entry['invoice_number']}) reopened"
+            + (f" — {comment}" if comment else "")
+        ),
+    ))
+    db.commit()
+
+    return {"id": parent_id, "entry_id": entry_id, "status": "Reopened"}
 
 
 def edit_gl_rate_for_distribution_entry(

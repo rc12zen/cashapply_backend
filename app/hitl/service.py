@@ -43,7 +43,10 @@ from ..bff.metrics import (
     GROUP_NEEDS_REMITTANCE, GROUP_LABELS,
 )
 from ..rule_engine.state_machine import CATEGORY_TO_STATE
-from ..rule_engine.invoice_ledger import confirm_applications, release_applications
+from ..rule_engine.invoice_ledger import (
+    confirm_applications, release_applications, record_application, check_duplicate,
+)
+from ..aging.aging_store import get_aging_map
 
 logger = logging.getLogger(__name__)
 
@@ -328,6 +331,14 @@ def reject_row(
             "current_version": r.version,
         }
 
+    # Capture where this row was RIGHT BEFORE rejection so reopen_row() can put
+    # it back there (see LineItem.pre_reject_state). current_state is an Enum;
+    # store its plain value string. Doubles as the accurate history from_state
+    # below (previously hard-coded "review_approve", which was wrong for any
+    # row rejected from a non-review category).
+    prior_state = r.current_state.value if r.current_state else None
+    r.pre_reject_state = prior_state
+
     r.hitl_status   = "rejected"
     r.current_state = "rejected"
     r.status        = "Rejected"
@@ -340,12 +351,142 @@ def reject_row(
     release_applications(db, r)
 
     db.add(RowStatusHistory(
-        line_item_id=r.id, from_state="review_approve", to_state="rejected",
+        line_item_id=r.id, from_state=prior_state or "review_approve", to_state="rejected",
         trigger="spoc_reject", rule_id=r.rule_id,
         triggered_by=triggered_by, comment=comment,
     ))
     db.commit()
     return {"id": r.id, "status": "Rejected"}
+
+
+def reopen_row(
+    db: Session,
+    line_item_id: int,
+    comment: str | None,
+    triggered_by: str,
+    expected_version: int | None = None,
+) -> dict:
+    """Undo a rejection — the inverse of reject_row(). Restores the row to the
+    state it was rejected FROM (LineItem.pre_reject_state), re-stakes the
+    invoice claim reject_row() released, and reuses the existing Oracle receipt
+    untouched. This is a pure undo: same invoice(s), same amount, so the Oracle
+    receipt (created during Bank Reconciliation, never voided on reject — Oracle
+    was never told about the rejection at all) is still valid and needs no
+    rebuild.
+
+    Guarded THREE ways before anything is mutated; any failure returns a
+    structured error (the route turns it into a clear "can't reopen — here's
+    why" message) and the row is left exactly as it was:
+      1. optimistic version check — someone else changed the row meanwhile;
+      2. stale-aging re-validation — every claimed invoice must still exist in
+         the CURRENT aging report (it may have been paid/closed/removed while
+         the row sat rejected);
+      3. invoice-conflict — no other row may have claimed the invoice beyond
+         its outstanding while this one was rejected.
+    """
+    r = db.query(LineItem).get(line_item_id)
+    if not r:
+        return {"error": "not found"}
+
+    if r.hitl_status != "rejected":
+        return {
+            "id": r.id,
+            "error": "not_rejected",
+            "message": f"Row {r.id} is not rejected — only a rejected row can be reopened.",
+        }
+
+    # ── Guard 1: optimistic locking (same contract as approve_row/reject_row)
+    if expected_version is not None and r.version != expected_version:
+        return {
+            "id": r.id,
+            "error": "version_conflict",
+            "message": (
+                f"Row {r.id} was modified by another user since you loaded it "
+                f"(expected version {expected_version}, current version {r.version}). "
+                f"Refresh and try again."
+            ),
+            "current_version": r.version,
+        }
+
+    # Where to put it back. pre_reject_state was captured at reject time; legacy
+    # rows rejected before that column existed fall back to review_approve (the
+    # state every approvable row sits in) — safe, because the display category
+    # itself always recomputes from rule_id regardless of current_state.
+    restore_state = r.pre_reject_state or "review_approve"
+
+    # ── Guards 2 + 3: only rows that actually CLAIM invoices need re-validating
+    # and re-claiming (a matched, post-ready row). Rows with no matched invoices
+    # (e.g. unidentified) had no claim to release and have nothing to re-check —
+    # they pass straight through.
+    matched = r.matched_invoices or []
+    if matched:
+        aging = get_aging_map()
+        if aging is None:
+            return {
+                "id": r.id,
+                "error": "aging_unavailable",
+                "message": (
+                    "Can't reopen — no aging report is currently loaded, so the "
+                    "invoice(s) on this row can't be re-validated. Load the aging "
+                    "report and try again."
+                ),
+            }
+        for m in matched:
+            inv_no = m.get("invoice_number")
+            ou = m.get("ou_number")
+            view = aging.lookup_invoice(inv_no, ou)
+            if view is None:
+                return {
+                    "id": r.id,
+                    "error": "invoice_not_in_aging",
+                    "message": (
+                        f"Can't reopen — invoice {inv_no} is no longer in the current "
+                        f"aging report (it may have been paid, closed, or removed since "
+                        f"this row was rejected)."
+                    ),
+                }
+            claim = m.get("stated_amount")
+            if claim is None:
+                claim = m.get("outstanding_amount") or 0
+            dup = check_duplicate(
+                db, inv_no, ou,
+                outstanding_amount=view.outstanding_amount,
+                new_amount=claim,
+                exclude_line_item_id=r.id,
+            )
+            if dup["blocked"]:
+                return {
+                    "id": r.id,
+                    "error": "invoice_claimed_elsewhere",
+                    "message": (
+                        f"Can't reopen — invoice {inv_no} is now applied to another "
+                        f"payment ({dup['already_applied']:,.2f} claimed, only "
+                        f"{max(dup['remaining_before'], 0):,.2f} left), so re-claiming it "
+                        f"here would double it up. Resolve the other claim first."
+                    ),
+                }
+
+    # ── All guards passed — restore ──────────────────────────────────────────
+    r.hitl_status     = None
+    r.current_state   = restore_state
+    r.status          = "Reopened"
+    r.pre_reject_state = None
+    r.version         = (r.version or 0) + 1
+
+    # Re-stake the ledger claim reject_row() released (idempotent upsert —
+    # flips the previously-"released" row back to "pending"; see
+    # invoice_ledger.record_application). Only for rows that claim invoices,
+    # mirroring the same condition state_machine.py uses.
+    if matched:
+        record_application(db, r, status="pending")
+
+    db.add(RowStatusHistory(
+        line_item_id=r.id, from_state="rejected", to_state=restore_state,
+        trigger="spoc_reopen", rule_id=r.rule_id,
+        triggered_by=triggered_by, comment=comment,
+    ))
+    db.commit()
+    return {"id": r.id, "status": "Reopened", "current_state": restore_state}
 
 
 def _guard_unidentified_undecided(r: LineItem) -> dict | None:
