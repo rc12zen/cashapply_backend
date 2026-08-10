@@ -1,6 +1,7 @@
 from .service import (
     approve_row,
     reject_row,
+    reopen_row,
     build_breakup_analysis,
     get_hitl_history,
     retry_oracle_post,
@@ -22,6 +23,7 @@ from .manual_mapping import (
 __all__ = [
     "approve_row",
     "reject_row",
+    "reopen_row",
     "build_breakup_analysis",
     "get_hitl_history",
     "retry_oracle_post",

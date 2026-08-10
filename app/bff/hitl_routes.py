@@ -44,7 +44,7 @@ from ..common.errors import AppError
 from ..common.error_codes import ErrorCode
 from ..audit.service import log_activity
 from ..hitl import (
-    approve_row, reject_row, build_breakup_analysis,
+    approve_row, reject_row, reopen_row, build_breakup_analysis,
     get_hitl_history, retry_oracle_post, retry_receipt_creation_bulk_for_run,
     check_receipt_retry_eligibility_for_run, serialize_line_item,
     get_mapping_options, get_invoices_for_customer,
@@ -54,7 +54,8 @@ from ..hitl import (
 )
 from ..hitl.split_and_map import get_distribution_context, preview_distribution, confirm_distribution, get_active_invoices_for_customer
 from ..hitl.distribution_actions import (
-    approve_distribution_entry, reject_distribution_entry, edit_gl_rate_for_distribution_entry,
+    approve_distribution_entry, reject_distribution_entry, reopen_distribution_entry,
+    edit_gl_rate_for_distribution_entry,
 )
 from ..rule_engine.remittance_recheck import recheck_needs_remittance_rows
 from ..rule_engine.customer_name_correction import correct_customer_name, get_customer_name_options
@@ -132,6 +133,35 @@ def reject(id: int, payload: dict, request: Request, db: Session = Depends(get_d
 
     log_activity(db, user, action="hitl.reject", entity_type="LineItem", entity_id=id,
                  ip_address=_client_ip(request), metadata={"comment": payload.get("comment")})
+    db.commit()
+    return result
+
+
+@router.post("/reopen/{id}")
+def reopen(id: int, payload: dict, request: Request, db: Session = Depends(get_db),
+           user: User = Depends(require_permission("hitl:reject"))):
+    """Undo a rejection — restore the row to the state it was rejected from and
+    reuse its existing Oracle receipt (see hitl/service.py's reopen_row()).
+    Same permission tier as /reject (hitl:reject). Blocks with a clear reason
+    if the row isn't rejected, was changed concurrently, or its invoice can no
+    longer be safely re-claimed (gone from aging / taken by another payment)."""
+    result = reopen_row(
+        db, id, payload.get("comment"), triggered_by=user.email,
+        expected_version=payload.get("expected_version"),
+    )
+    if result.get("error") == "version_conflict":
+        raise AppError(ErrorCode.ROW_VERSION_CONFLICT, detail=result.get("message"))
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") in (
+        "not_rejected", "aging_unavailable", "invoice_not_in_aging", "invoice_claimed_elsewhere",
+    ):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
+
+    log_activity(db, user, action="hitl.reopen", entity_type="LineItem", entity_id=id,
+                 ip_address=_client_ip(request),
+                 metadata={"comment": payload.get("comment"),
+                           "restored_state": result.get("current_state")})
     db.commit()
     return result
 
@@ -510,9 +540,14 @@ def distribution_entry_approve(id: int, entry_id: str, payload: dict, request: R
     distribution_breakdown -- see hitl/distribution_actions.py's
     approve_distribution_entry(). Same permission tier as the normal
     single-row /approve, since this directly posts to Oracle."""
-    result = approve_distribution_entry(db, id, entry_id, payload.get("comment"), triggered_by=user.email)
+    result = approve_distribution_entry(
+        db, id, entry_id, payload.get("comment"), triggered_by=user.email,
+        expected_version=payload.get("expected_version"),
+    )
     if result.get("error") == "not found":
         raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") == "version_conflict":
+        raise AppError(ErrorCode.ROW_VERSION_CONFLICT, detail=result.get("message"))
     if result.get("error") in ("entry_not_found", "already_approved", "already_rejected", "not_approvable", "payload_error"):
         raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
 
@@ -532,14 +567,48 @@ def distribution_entry_reject(id: int, entry_id: str, payload: dict, request: Re
                                user: User = Depends(require_permission("hitl:reject"))):
     """Reject ONE entry inside a distributed parent's distribution_breakdown
     -- see hitl/distribution_actions.py's reject_distribution_entry()."""
-    result = reject_distribution_entry(db, id, entry_id, payload.get("comment"), triggered_by=user.email)
+    result = reject_distribution_entry(
+        db, id, entry_id, payload.get("comment"), triggered_by=user.email,
+        expected_version=payload.get("expected_version"),
+    )
     if result.get("error") == "not found":
         raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") == "version_conflict":
+        raise AppError(ErrorCode.ROW_VERSION_CONFLICT, detail=result.get("message"))
     if result.get("error") in ("entry_not_found", "already_approved"):
         raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
 
     log_activity(
         db, user, action="hitl.distribution_entry_reject", entity_type="LineItem", entity_id=id,
+        ip_address=_client_ip(request), metadata={"entry_id": entry_id, "comment": payload.get("comment")},
+    )
+    db.commit()
+    return result
+
+
+@router.post("/distribution-entry-reopen/{id}/{entry_id}")
+def distribution_entry_reopen(id: int, entry_id: str, payload: dict, request: Request,
+                               db: Session = Depends(get_db),
+                               user: User = Depends(require_permission("hitl:reject"))):
+    """Undo a rejected entry inside a distributed parent's distribution_breakdown
+    -- see hitl/distribution_actions.py's reopen_distribution_entry(). Same
+    permission tier as the entry reject."""
+    result = reopen_distribution_entry(
+        db, id, entry_id, payload.get("comment"), triggered_by=user.email,
+        expected_version=payload.get("expected_version"),
+    )
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") == "version_conflict":
+        raise AppError(ErrorCode.ROW_VERSION_CONFLICT, detail=result.get("message"))
+    if result.get("error") in (
+        "entry_not_found", "not_rejected", "aging_unavailable",
+        "invoice_not_in_aging", "invoice_claimed_elsewhere",
+    ):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
+
+    log_activity(
+        db, user, action="hitl.distribution_entry_reopen", entity_type="LineItem", entity_id=id,
         ip_address=_client_ip(request), metadata={"entry_id": entry_id, "comment": payload.get("comment")},
     )
     db.commit()

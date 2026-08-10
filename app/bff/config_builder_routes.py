@@ -103,8 +103,13 @@ def _test_recipe(local_path: str, recipe: dict, key: str, filename: str) -> dict
 
         def _ser(r):
             d = dataclasses.asdict(r)
-            if d.get("statement_date") is not None:
-                d["statement_date"] = str(d["statement_date"])
+            sd = d.get("statement_date")
+            if sd is not None:
+                # statement_date is a datetime (bank dates carry no time, so it's
+                # always midnight) — show the date only, so the preview doesn't
+                # display a phantom "00:00:00". Fall back to str() for anything
+                # unexpected that lacks .date().
+                d["statement_date"] = sd.date().isoformat() if hasattr(sd, "date") else str(sd)
             return d
 
         # Value-level sanity checks over the REAL parsed values (account/date/
@@ -360,6 +365,19 @@ def builder_test(body: BuilderTestRequest, db: Session = Depends(get_db),
     """Test a draft recipe against the uploaded file. Returns up to 50 normalized rows."""
     _record, local_path = _local_path_by_key(db, body.storage_key)
     return _test_recipe(local_path, body.config_draft, body.config_draft.get("key", "_DRAFT_"), _record.filename)
+
+
+@router.post("/builder/infer-date-format")
+def builder_infer_date_format(payload: dict,
+                              user: User = Depends(require_permission("config:manage"))):
+    """Detect the date format from a sample of the mapped Date column's raw
+    values (see bank_statement/date_inference.py). Called by the Column Mapping
+    step: resolves automatically when the data proves the order, and returns
+    'ambiguous' with the competing interpretations only when it genuinely can't
+    tell — so the wizard prompts the SPOC. Stateless: takes samples, not a file."""
+    from ..bank_statement.date_inference import infer_date_format
+    samples = payload.get("samples") or []
+    return infer_date_format([str(s) for s in samples])
 
 
 # ── OU/BU picklist for the wizard's OU step ────────────────────────────────────

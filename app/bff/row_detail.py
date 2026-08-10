@@ -142,6 +142,32 @@ def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str
     # Compute category once — drives Approve button + breadcrumb label on frontend
     _cat = _category_for_row(r)
 
+    # ── FX: the credited amount expressed in INVOICE currency ────────────────
+    # Leg 1 (credited → invoice). The rule engine already did this conversion
+    # to decide the shortfall band (see rule_engine/evaluator.py's
+    # received_total = round(credit_amount * fx_credit_to_invoice, 2)); we
+    # reproduce the SAME value here from the persisted columns so every
+    # consumer compares invoice-currency-to-invoice-currency instead of
+    # subtracting a credited-currency number from an invoice-currency one.
+    # Before this block the payload only carried the raw credited amount
+    # (credit_amount / bank_statement.credit_amount), which made the frontend
+    # amount comparisons (WhyStatusCard "Over by …%", AgingSnapshotCard footer,
+    # OraclePayloadTable) mix currencies on any cross-currency row.
+    _credit_credited_ccy = float(r.credit_amount or 0)
+    _rate = float(r.fx_credit_to_invoice) if r.fx_credit_to_invoice else None
+    if r.is_cross_currency and _rate:
+        _credit_invoice_ccy = round(_credit_credited_ccy * _rate, 2)
+    else:
+        # Same currency, or Leg 1 rate unresolved (R13) — the converted amount
+        # is just the credited amount; the frontend uses is_cross_currency +
+        # a null rate to decide whether to render the conversion sub-line.
+        _credit_invoice_ccy = _credit_credited_ccy
+    _invoice_ccy = (
+        r.invoice_currency
+        or (confirmed_invoices[0]["currency"] if confirmed_invoices else None)
+        or r.statement_currency
+    )
+
     # ── Oracle payload preview ────────────────────────────────────────────────
     # r.oracle_payload is set by rule_engine/orchestrator.py's Step 4.5 for
     # EVERY row right after reconciliation — so by the time this endpoint
@@ -263,6 +289,19 @@ def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str
         "confirmed_invoices": confirmed_invoices,
         "sum_outstanding": float(r.target_total or 0),
         "credit_amount": float(r.credit_amount or 0),
+        # Currency-aware view of the credited amount. sum_outstanding above is
+        # in invoice currency; credit_amount above is in credited currency —
+        # comparing them directly is only valid when they're the same currency.
+        # Use fx.credit_amount_invoice_ccy for any amount comparison instead.
+        "fx": {
+            "is_cross_currency": bool(r.is_cross_currency),
+            "credited_currency": r.statement_currency,
+            "invoice_currency": _invoice_ccy,
+            "credit_amount_credited_ccy": _credit_credited_ccy,
+            "credit_amount_invoice_ccy": _credit_invoice_ccy,
+            "fx_credit_to_invoice": _rate,
+            "fx_credit_to_invoice_source": r.fx_credit_to_invoice_source,
+        },
         "pipeline": _build_pipeline(r),
         "oracle": {
             "payload": oracle_payload or {},
