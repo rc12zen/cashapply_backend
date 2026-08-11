@@ -118,4 +118,9 @@ def refresh_aging_map(db: Session, source_file: SourceFile) -> dict:
         "row_count": len(raw_rows),
         "invoice_count": aging_map.invoice_count,
         "customer_count": aging_map.customer_count,
+        # What AgingMap.build() refused to index, and why -- see
+        # aging/aging_map.py's is_payable() / is_usable_invoice_number().
+        # Surfaced here so a refresh reports its exclusions instead of
+        # silently shrinking the matchable pool.
+        "build_report": aging_map.build_report,
     }

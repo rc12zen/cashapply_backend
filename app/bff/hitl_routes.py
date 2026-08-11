@@ -52,6 +52,7 @@ from ..hitl import (
     mark_eligible_for_receipt, discard_row, edit_gl_rate,
     override_settlement_as_customer_payment,
 )
+from ..hitl.overpayment import park_overpayment
 from ..hitl.split_and_map import get_distribution_context, preview_distribution, confirm_distribution, get_active_invoices_for_customer
 from ..hitl.distribution_actions import (
     approve_distribution_entry, reject_distribution_entry, reopen_distribution_entry,
@@ -140,11 +141,12 @@ def reject(id: int, payload: dict, request: Request, db: Session = Depends(get_d
 @router.post("/reopen/{id}")
 def reopen(id: int, payload: dict, request: Request, db: Session = Depends(get_db),
            user: User = Depends(require_permission("hitl:reject"))):
-    """Undo a rejection — restore the row to the state it was rejected from and
-    reuse its existing Oracle receipt (see hitl/service.py's reopen_row()).
-    Same permission tier as /reject (hitl:reject). Blocks with a clear reason
-    if the row isn't rejected, was changed concurrently, or its invoice can no
-    longer be safely re-claimed (gone from aging / taken by another payment)."""
+    """Undo a rejection OR un-park an overpayment — restore the row to the state
+    it left and reuse its existing Oracle receipt (see hitl/service.py's
+    reopen_row()). Same permission tier as /reject (hitl:reject). Blocks with a
+    clear reason if the row is neither rejected nor parked, was changed
+    concurrently, or its invoice can no longer be safely re-claimed (gone from
+    aging / taken by another payment)."""
     result = reopen_row(
         db, id, payload.get("comment"), triggered_by=user.email,
         expected_version=payload.get("expected_version"),
@@ -154,7 +156,7 @@ def reopen(id: int, payload: dict, request: Request, db: Session = Depends(get_d
     if result.get("error") == "not found":
         raise AppError(ErrorCode.ROW_NOT_FOUND)
     if result.get("error") in (
-        "not_rejected", "aging_unavailable", "invoice_not_in_aging", "invoice_claimed_elsewhere",
+        "not_reopenable", "aging_unavailable", "invoice_not_in_aging", "invoice_claimed_elsewhere",
     ):
         raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
 
@@ -162,6 +164,42 @@ def reopen(id: int, payload: dict, request: Request, db: Session = Depends(get_d
                  ip_address=_client_ip(request),
                  metadata={"comment": payload.get("comment"),
                            "restored_state": result.get("current_state")})
+    db.commit()
+    return result
+
+
+@router.post("/park-overpayment/{id}")
+def park_overpayment_route(id: int, payload: dict, request: Request, db: Session = Depends(get_db),
+                            user: User = Depends(require_permission("hitl:map"))):
+    """Record why an overpayment's excess exists and close the row out WITHOUT
+    posting anything (see hitl/overpayment.py). Nothing is sent to Oracle — the
+    bare receipt created during Bank Reconciliation keeps holding the cash
+    unapplied. Reversible via /reopen.
+
+    Permission tier is hitl:map rather than oracle:post because this action
+    deliberately does not post: it records a decision and releases the row's
+    invoice claims."""
+    result = park_overpayment(
+        db, id,
+        disposition=payload.get("disposition") or "",
+        comment=payload.get("comment"),
+        user=user,
+        expected_version=payload.get("expected_version"),
+    )
+    if result.get("error") == "version_conflict":
+        raise AppError(ErrorCode.ROW_VERSION_CONFLICT, detail=result.get("message"))
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") in (
+        "not_an_overpayment", "not_open", "already_decided",
+        "invalid_disposition", "comment_required",
+    ):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
+
+    log_activity(db, user, action="hitl.park_overpayment", entity_type="LineItem", entity_id=id,
+                 ip_address=_client_ip(request),
+                 metadata={"disposition": result.get("disposition"),
+                           "comment": payload.get("comment")})
     db.commit()
     return result
 
@@ -381,12 +419,21 @@ def mapping_preview(id: int, body: dict, db: Session = Depends(get_db),
 def mapping_confirm(id: int, body: dict, request: Request, db: Session = Depends(get_db),
                      user: User = Depends(require_permission("hitl:map"))):
     invoice_numbers = body.get("invoice_numbers") or []
-    result = confirm_manual_mapping(db, id, invoice_numbers, user)
+    # Only meaningful when the selection overpays (rule R9e) — see
+    # hitl/manual_mapping.py's _classify(). Confirming an overpaid selection
+    # without a disposition is refused there, not here, so the rule lives with
+    # the classification rather than in the transport layer.
+    result = confirm_manual_mapping(
+        db, id, invoice_numbers, user,
+        overpayment_disposition=body.get("overpayment_disposition"),
+        overpayment_comment=body.get("overpayment_comment"),
+    )
     if result.get("error"):
         raise AppError(ErrorCode.MAPPING_INVALID, detail=result["error"])
     log_activity(db, user, action="hitl.manual_mapping", entity_type="LineItem", entity_id=id,
                  ip_address=_client_ip(request),
-                 metadata={"invoice_numbers": invoice_numbers, "rule_id": result.get("rule_id")})
+                 metadata={"invoice_numbers": invoice_numbers, "rule_id": result.get("rule_id"),
+                           "overpayment_disposition": result.get("overpayment_disposition")})
     db.commit()
     return result
 

@@ -13,6 +13,7 @@ from .service import (
     override_settlement_as_customer_payment,
     edit_gl_rate,
 )
+from .overpayment import park_overpayment, DISPOSITIONS as OVERPAYMENT_DISPOSITIONS
 from .manual_mapping import (
     get_mapping_options,
     get_invoices_for_customer,
@@ -24,6 +25,8 @@ __all__ = [
     "approve_row",
     "reject_row",
     "reopen_row",
+    "park_overpayment",
+    "OVERPAYMENT_DISPOSITIONS",
     "build_breakup_analysis",
     "get_hitl_history",
     "retry_oracle_post",

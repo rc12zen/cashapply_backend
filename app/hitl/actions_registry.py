@@ -72,6 +72,32 @@ def _cond_gl_rate_editable(r: LineItem) -> bool:
     return r.oracle_post_status == "failed"
 
 
+def _cond_mappable_directly(r: LineItem) -> bool:
+    # Map Invoice is offered on its own for every category EXCEPT an open
+    # overpayment. An overpaid row has a single entry point — "Handle
+    # Overpayment" — because the two things a SPOC can do to it (apply what is
+    # owed, or post nothing and record why) are outcomes of one decision, and
+    # showing them as two sibling buttons made the SPOC compare two labels and
+    # guess which one moved money. That dialog routes to this same mapping card
+    # when they choose to apply.
+    #
+    # Keeps the old not_processed check: mapping never makes sense on a row that
+    # already posted (guards the rejected-then-reopened edge case, since the
+    # category gate alone does not cover it).
+    if r.rule_id == "R11":
+        return False
+    return r.current_state != "processed"
+
+
+def _cond_is_overpayment(r: LineItem) -> bool:
+    # Handle Overpayment — the action is seeded against conflict_exception,
+    # which covers a dozen unrelated rules, so this narrows it to the one that
+    # actually means "more money arrived than was owed". hitl/overpayment.py's
+    # park_overpayment() re-checks the same thing server-side; this is only
+    # what makes the button appear.
+    return r.rule_id == "R11"
+
+
 def _cond_settlement_override_eligible(r: LineItem) -> bool:
     # Settlement Override ("treat as customer payment") — only offered
     # once, on a Needs Distribution row not already overridden. See
@@ -89,6 +115,8 @@ CONDITION_CHECKS = {
     "receipt_eligibility_undecided": _cond_receipt_eligibility_undecided,
     "gl_rate_editable": _cond_gl_rate_editable,
     "settlement_override_eligible": _cond_settlement_override_eligible,
+    "is_overpayment": _cond_is_overpayment,
+    "mappable_directly": _cond_mappable_directly,
 }
 
 

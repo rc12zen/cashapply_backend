@@ -44,10 +44,59 @@ class AgingInvoiceView:
     ou_number: str
 
 
+def is_payable(outstanding_amount: float) -> bool:
+    """
+    A document only belongs in the matchable pool if the customer actually
+    owes us something on it.
+
+    A real aging export is not just open invoices. Roughly 10% of the rows in
+    a production export carry a NEGATIVE outstanding balance — credit memos,
+    unapplied receipts sitting on the customer's account, credit notes keyed
+    on the invoice form, and legacy conversion balances. The majority of them
+    carry a perfectly normal 14-digit Oracle document number, so lookup_invoice
+    could not tell them apart from an invoice and returned them like any other
+    candidate. Two things went wrong when one got matched:
+
+      1. It DRAGGED target_total DOWN, so a correct payment read as an
+         overpayment (evaluator.py's R11) — a pure false positive.
+      2. Worse, when the matched set happened to NET TO ZERO, evaluator.py
+         read shortfall_pct as 0.0 and returned R9a EXACT_MATCH — a *perfect
+         match* with a live Approve button, which would have posted a
+         zero/negative ReferenceAmount to Oracle.
+
+    Zero is excluded for the same reason: a fully-settled row still present in
+    the export contributes nothing and can only distort a total.
+    """
+    return outstanding_amount > 0
+
+
+def is_usable_invoice_number(invoice_number: str) -> bool:
+    """
+    Reject document numbers that cannot identify anything.
+
+    A production export contains free text in the invoice-number column —
+    "Scrap Sale", a customer's own name, hand-typed collection references, and
+    the bare value "1" repeated across several rows. lookup_invoice() resolves
+    a duplicated key by silently returning candidates[0], so a junk key does
+    not fail loudly, it quietly matches the wrong row.
+
+    Real Oracle document numbers always contain at least one digit and are
+    never one or two characters long, so this is deliberately conservative:
+    it drops only what could never have been matched correctly anyway.
+    """
+    s = (invoice_number or "").strip()
+    return len(s) >= 3 and any(ch.isdigit() for ch in s)
+
+
 class AgingMap:
     """
     Built once per run from the aging_invoices table.
     All lookups are pure reads — thread-safe for parallel chunk processing.
+
+    Only PAYABLE rows with a USABLE document number are indexed — see
+    is_payable() and is_usable_invoice_number() above for why. Everything
+    dropped is counted in `build_report` so the exclusion is visible rather
+    than silent.
     """
 
     def __init__(
@@ -56,11 +105,15 @@ class AgingMap:
         customer_names: list[str],
         name_to_rows: dict[str, list[AgingInvoiceView]],
         by_ou: dict[str, list[AgingInvoiceView]],
+        by_customer_number: dict[str, list[AgingInvoiceView]] | None = None,
+        build_report: dict | None = None,
     ):
         self._by_invoice = by_invoice
         self._customer_names = customer_names
         self._name_to_rows = name_to_rows
         self._by_ou = by_ou
+        self._by_customer_number = by_customer_number or {}
+        self.build_report = build_report or {}
 
     # ── Factory ───────────────────────────────────────────────────────────────
 
@@ -73,6 +126,10 @@ class AgingMap:
         by_invoice: dict[str, list[AgingInvoiceView]] = {}
         name_to_rows: dict[str, list[AgingInvoiceView]] = {}
         by_ou: dict[str, list[AgingInvoiceView]] = {}
+        by_customer_number: dict[str, list[AgingInvoiceView]] = {}
+
+        dropped_unpayable: list[dict] = []
+        dropped_malformed: list[dict] = []
 
         for r in aging_rows:
             view = AgingInvoiceView(
@@ -85,6 +142,25 @@ class AgingMap:
                 invoice_currency=str(r.invoice_currency or ""),
                 ou_number=str(r.ou_number or ""),
             )
+
+            if not is_usable_invoice_number(view.invoice_number):
+                dropped_malformed.append({
+                    "invoice_number": view.invoice_number,
+                    "customer_name": view.customer_name,
+                    "invoice_type": view.invoice_type,
+                })
+                continue
+
+            if not is_payable(view.outstanding_amount):
+                dropped_unpayable.append({
+                    "invoice_number": view.invoice_number,
+                    "customer_name": view.customer_name,
+                    "invoice_type": view.invoice_type,
+                    "outstanding_amount": view.outstanding_amount,
+                    "invoice_currency": view.invoice_currency,
+                })
+                continue
+
             key = view.invoice_number.upper()
             by_invoice.setdefault(key, []).append(view)
 
@@ -93,11 +169,35 @@ class AgingMap:
 
             by_ou.setdefault(view.ou_number, []).append(view)
 
+            if view.customer_number:
+                by_customer_number.setdefault(view.customer_number, []).append(view)
+
+        # A document number legitimately repeats across OUs, so a duplicate key
+        # is not by itself an error — lookup_invoice() disambiguates on
+        # ou_number. It IS worth reporting, because a duplicate with no OU
+        # preference available still falls back to candidates[0].
+        duplicate_keys = sorted(k for k, v in by_invoice.items() if len(v) > 1)
+
+        build_report = {
+            "kept": sum(len(v) for v in by_invoice.values()),
+            "dropped_unpayable_count": len(dropped_unpayable),
+            "dropped_malformed_count": len(dropped_malformed),
+            "duplicate_invoice_number_count": len(duplicate_keys),
+            # Capped samples — this report is persisted in the aging snapshot
+            # and returned by the refresh endpoint, so it must not grow with
+            # the size of the export.
+            "dropped_unpayable_sample": dropped_unpayable[:50],
+            "dropped_malformed_sample": dropped_malformed[:50],
+            "duplicate_invoice_numbers_sample": duplicate_keys[:50],
+        }
+
         return cls(
             by_invoice=by_invoice,
             customer_names=list(name_to_rows.keys()),
             name_to_rows=name_to_rows,
             by_ou=by_ou,
+            by_customer_number=by_customer_number,
+            build_report=build_report,
         )
 
     # ── Invoice lookup — O(1) ─────────────────────────────────────────────────
@@ -227,6 +327,29 @@ class AgingMap:
         if not customer_name:
             return []
         return self._name_to_rows.get(customer_name.strip().upper(), [])
+
+    def invoices_for_customer_number(
+        self, customer_number: str, exclude_ou: str | None = None
+    ) -> list[AgingInvoiceView]:
+        """
+        All open invoices for one customer ACCOUNT, optionally excluding a
+        single OU.
+
+        Used by rule_engine/overpayment_reason.py's cross-OU check. The aging
+        export spans every OU in one file, so when a payment lands in one OU's
+        bank account but the customer also has open invoices in another OU
+        (BRD Scenario 13), the evidence for that is already in memory — this
+        is the accessor that reaches it.
+
+        Keyed on customer_number rather than name because the same account can
+        appear under slightly different display names across OUs.
+        """
+        if not customer_number:
+            return []
+        rows = self._by_customer_number.get(str(customer_number), [])
+        if exclude_ou is None:
+            return list(rows)
+        return [v for v in rows if v.ou_number != exclude_ou]
 
     # ── Utility ───────────────────────────────────────────────────────────────
 

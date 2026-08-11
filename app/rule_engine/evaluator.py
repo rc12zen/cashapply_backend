@@ -221,6 +221,19 @@ def _resolve_matched_invoices(input_: dict) -> list[MatchedInvoice]:
         # Case 3 — no breakup info at all.
         # Distribute effective_received proportionally by outstanding weight.
         total_outstanding = sum(m.outstanding_amount for m in resolved)
+        if total_outstanding <= 0:
+            # Nothing to weight by, so there is no meaningful split. Leave every
+            # stated_amount as None and let evaluate_row's R12 guard classify
+            # the row -- a matched set with no payable balance is an exception,
+            # not an allocation problem.
+            #
+            # This used to be an unguarded division and raised ZeroDivisionError
+            # out of the rule engine, which the orchestrator's per-row try/except
+            # then swallowed into a generic row error with no reason attached.
+            # The way in was a credit document being matched alongside an invoice
+            # it cancelled out (+1000 and -1000); aging/aging_map.py's is_payable()
+            # now keeps such documents out of the pool, so this is the backstop.
+            return resolved
         for i, m in enumerate(resolved):
             if i < len(resolved) - 1:
                 weight = m.outstanding_amount / total_outstanding
@@ -238,6 +251,10 @@ def _resolve_matched_invoices(input_: dict) -> list[MatchedInvoice]:
 
         unstated                   = [m for m in resolved if m.stated_amount is None]
         total_outstanding_unstated = sum(m.outstanding_amount for m in unstated)
+
+        if total_outstanding_unstated <= 0:
+            # Same guard as Case 3 above, for the partial-breakup path.
+            return resolved
 
         for i, m in enumerate(unstated):
             if i < len(unstated) - 1:
@@ -377,10 +394,33 @@ def evaluate_row(
     else:
         received_total = credit_amount
 
-    if target_total == 0:
-        shortfall_pct = 0.0
-    else:
-        shortfall_pct = (target_total - received_total) / target_total * 100
+    # ── R12 — the matched set carries no payable balance ─────────────────────
+    # This branch used to read `if target_total == 0: shortfall_pct = 0.0`,
+    # which then fell straight through to the banding below and returned R9a
+    # EXACT_MATCH -> ready_to_post. A row that matched NOTHING PAYABLE was
+    # therefore presented as a *perfect match* with a live Approve button, and
+    # approving it would have sent Oracle reference amounts summing to zero (or
+    # negative) against a receipt holding real cash.
+    #
+    # The usual way in was a credit document being matched as though it were an
+    # invoice: invoice +1000 and credit memo -1000 in the same set nets to 0.
+    # aging/aging_map.py's is_payable() now keeps such documents out of the
+    # matchable pool entirely, so this should be unreachable from the aging
+    # path — it stays as the arithmetic backstop, because "nothing to pay" must
+    # never again be spelled the same way as "paid exactly right".
+    if target_total <= 0:
+        return RuleResult(
+            "R12", "NO_PAYABLE_BALANCE", "conflict_exception",
+            matched_invoices, target_total, received_total, 0.0,
+            notes=(
+                f"The {len(matched_invoices)} matched document(s) carry a combined "
+                f"payable balance of {target_total} — there is nothing outstanding to "
+                f"apply {received_total} against. Re-map this row to the invoice(s) the "
+                f"payment actually covers."
+            ),
+        )
+
+    shortfall_pct = (target_total - received_total) / target_total * 100
 
     if cross_currency.get("is_cross_currency"):
         if fx_credit_to_invoice:
@@ -428,8 +468,25 @@ def evaluate_row(
         # Overpayment — always conflict_exception per business policy.
         # R10 (OVERPAYMENT_EXPLAINED) is not used; all overpayments require
         # SPOC review regardless of remittance content.
-        return RuleResult("R11", "OVERPAYMENT_UNEXPLAINED", "conflict_exception",
-                           matched_invoices, target_total, received_total, shortfall_pct)
+        #
+        # This was the ONLY rule in this file that returned no `notes` at all,
+        # so the row-detail screen said "Overpayment" and stopped — the SPOC
+        # had to reconstruct the arithmetic by hand every time. The WHY (a
+        # duplicate claim, invoices open in another OU, unmatched invoices for
+        # the same customer, an FX difference) is computed separately by
+        # rule_engine/overpayment_reason.py once the row is persisted, because
+        # it needs the ledger and the full aging map — neither of which this
+        # deliberately pure function has access to.
+        excess = round(received_total - target_total, 2)
+        return RuleResult(
+            "R11", "OVERPAYMENT_UNEXPLAINED", "conflict_exception",
+            matched_invoices, target_total, received_total, shortfall_pct,
+            notes=(
+                f"Received {received_total} against matched invoice(s) totalling "
+                f"{target_total} — an excess of {excess}. Either map the invoice(s) this "
+                f"payment actually covers, or record why the excess exists."
+            ),
+        )
 
     if shortfall_pct == 0:
         result = RuleResult("R9a", "EXACT_MATCH", "ready_to_post",

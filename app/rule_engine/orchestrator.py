@@ -91,6 +91,7 @@ from ..schemas.extraction import IdentifiedPayment, UnknownPayment
 
 from .evaluator import evaluate_row
 from .state_machine import apply_transition
+from .overpayment_reason import apply_overpayment_diagnosis
 from .remittance_lookup import build_remittance_view
 from .fx_service import FxService, get_functional_currency
 from .ou_resolver import resolve_ou_status
@@ -602,6 +603,15 @@ def _process_identified_payment(
                 customer_fuzzy_min_pct=settings.CUSTOMER_FUZZY_MATCH_MIN_PCT,
             )
             apply_transition(db, line_item, rule_result, trigger="rule_engine")
+
+            # Explain an overpayment while the aging map and this row's session
+            # are both still in hand. R11 previously reached the SPOC with no
+            # cause at all -- see rule_engine/overpayment_reason.py. Advisory
+            # only: it stamps two fields, cannot change the row's category, and
+            # swallows its own errors so a diagnosis can never fail the run.
+            if line_item.rule_id == "R11":
+                apply_overpayment_diagnosis(db, line_item, aging_map)
+
             _mark_row_consumed(db, orig, run_id)
 
         return {"success": True, "bank_reference": orig.bank_reference, "error": None}
