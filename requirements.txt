@@ -13,7 +13,7 @@ openpyxl==3.1.5
 # every .xls upload fails with "Could not load file preview" / ingest error.
 xlrd==2.0.1
 rapidfuzz==3.10.0
-python-multipart==0.0.9
+python-multipart==0.0.31
 
 # Postgres driver — psycopg3 only (psycopg2-binary removed; no wheel for
 # Python 3.13 on Windows without VC++ Build Tools, and this project only
@@ -22,7 +22,7 @@ python-multipart==0.0.9
 psycopg[binary]==3.2.3
 
 # New — Auth (Azure Entra ID token validation)
-python-jose[cryptography]==3.3.0
+python-jose[cryptography]==3.4.0
 
 # New — AI providers (extraction/ai_providers.py). Anthropic and direct
 # OpenAI both use their own SDK; Azure OpenAI ALSO uses this same `openai`
@@ -38,5 +38,5 @@ openai>=1.99.0
 procrastinate==2.14.0
 
 # Dev/test
-pytest==8.3.3
+pytest==9.0.3
 pytest-asyncio==0.24.0
