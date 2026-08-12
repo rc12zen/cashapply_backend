@@ -84,6 +84,20 @@ def match_key(value) -> str:
 # spaces, so a single grouped account like "0002 0502 4781" stays intact.
 _ACCT_SEP = re.compile(r"\s*(?:&|,|/|\+|\band\b)\s*", re.IGNORECASE)
 
+# The ONE pattern the "regex" locator type ever uses: any 6-34 char
+# alphanumeric run containing at least one digit. Covers plain numeric
+# accounts ("000205024781") and IBAN-style alphanumerics ("GB29NWBK…"),
+# including when buried in text like "… (INR) - 000205024781".
+#
+# SECURITY: this is deliberately a server-side CONSTANT, not something the
+# request can set. It used to be `re.compile(locator.get("pattern", ""))`,
+# i.e. an attacker-controlled regex reaching a backtracking engine -- a
+# ReDoS sink (CWE-1333) flagged by VAPT. A caller-supplied "pattern" key is
+# now ignored entirely; the wizard's "Advanced: edit pattern" box that fed
+# it has been removed. Mirrors AUTO_ACCOUNT_REGEX in ConfigBuilderWizard.tsx,
+# which is only used there to describe the behaviour to the user.
+ACCOUNT_PATTERN = re.compile(r"((?=[A-Za-z0-9]*\d)[A-Za-z0-9]{6,34})")
+
 
 def _looks_like_account(n: str) -> bool:
     """A normalized token that plausibly is an account: 6+ chars with a digit."""
@@ -206,7 +220,9 @@ def extract_account_groups(filepath: str, locator: dict, source: dict | None = N
             )
 
         elif t == "regex":
-            pattern = re.compile(locator.get("pattern", ""))
+            # Fixed server-side pattern -- locator["pattern"] is intentionally
+            # NOT read here any more; see ACCOUNT_PATTERN above (ReDoS fix).
+            pattern = ACCOUNT_PATTERN
             snap = FileSnapshot.from_path(filepath)
             texts = _regex_texts(locator, filepath, source, snap)
             for text in texts:
@@ -226,7 +242,7 @@ def extract_account_groups(filepath: str, locator: dict, source: dict | None = N
                     groups.append(found)
             logger.info(
                 "[locator] type=regex file=%r pattern=%r texts_scanned=%d -> distinct_normalized=%s",
-                filepath, locator.get("pattern", ""), len(texts),
+                filepath, ACCOUNT_PATTERN.pattern, len(texts),
                 sorted({t_ for g in groups for t_ in g}),
             )
     except Exception as exc:

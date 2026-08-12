@@ -29,6 +29,7 @@ from typing import Optional
 import pandas as pd
 from openpyxl import load_workbook
 
+from ..common.regex_safety import safe_search
 from .detector import DetectionResult
 from .extractor import ExtractorFactory
 from .credit_rules import eval_credit_rule
@@ -370,7 +371,10 @@ def _resolve_file_fields(filepath: str, fields: list, cfg: dict) -> dict:
         elif src["type"] == "cell":
             result[name] = _read_cell(filepath, cfg, src["row"], src["col"])
         elif src["type"] == "filename_pattern":
-            m = re.search(src.get("pattern", ""), filename)
+            # safe_search() validates the config-supplied pattern (length,
+            # nested quantifiers, syntax) and bounds the scanned text before
+            # it reaches the backtracking engine -- see common/regex_safety.py.
+            m = safe_search(src.get("pattern", ""), filename)
             group = src.get("group", 1)
             result[name] = m.group(group) if m else ""
     return result
@@ -422,13 +426,15 @@ def _apply_exclusions(df: pd.DataFrame, exclusions: list) -> pd.DataFrame:
                     & (df[field].astype(str).str.strip() != "")
                 ]
 
-        elif t == "field_matches":
-            if field in df.columns:
-                df = df[
-                    ~df[field].astype(str).str.contains(
-                        exc.get("pattern", ""), na=False, regex=True
-                    )
-                ]
+        # NOTE: a "field_matches" exclusion type used to live here, applying a
+        # user-typed regex to EVERY row of the statement -- a ReDoS sink
+        # (CWE-1333) whose cost scaled with row count. It has been removed
+        # from both the wizard and this parser; the remaining three types
+        # cover the documented use case (skipping Opening/Closing Balance
+        # rows). An old recipe still carrying one is ignored rather than
+        # honoured -- falling through here drops no rows, which is the safe
+        # direction: an unfiltered row surfaces for review, it is not
+        # silently swallowed.
     return df
 
 

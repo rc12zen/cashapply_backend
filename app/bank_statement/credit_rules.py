@@ -11,9 +11,9 @@ flag_matches      : a flag/code column (raw name) matches a regex pattern
 """
 from __future__ import annotations
 
-import re
-
 import pandas as pd
+
+from ..common.regex_safety import safe_search
 
 
 def _column_for_logical(fields: list, logical_name: str) -> str | None:
@@ -53,6 +53,10 @@ def eval_credit_rule(row: pd.Series, rule: dict, fields: list) -> bool:
         val = row.get(rule["field"])
         if val is None:
             return False
-        return bool(re.search(rule["pattern"], str(val).strip()))
+        # The wizard always sends the fixed "(?i)cr" here (there is no UI to
+        # type another), but the API accepts a recipe body directly -- so the
+        # pattern is validated and length-bounded before it reaches the
+        # backtracking engine. See common/regex_safety.py (ReDoS / CWE-1333).
+        return bool(safe_search(rule["pattern"], str(val).strip()))
 
     raise ValueError(f"Unknown credit rule type: '{rule_type}'")
