@@ -14,6 +14,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -155,7 +156,37 @@ class Settings(BaseSettings):
     # Found back from Oracle. This setting is the resource-collection
     # ROOT -- fusion_client.py's own URL-building code is what appends
     # the specific resource path, for both endpoints it calls.
+    #
+    # REGRESSED ONCE, then fixed for good by the validator below. Correcting
+    # only this default was not enough: .env is gitignored, so every existing
+    # environment (local, UAT, prod) kept its own stale copy, and .env
+    # OVERRIDES the default. The bug reappeared the moment an unrelated TLS
+    # fix stopped masking it -- every POST had been dying at the TLS handshake
+    # before it could reach Oracle and collect its 404. A setting that only
+    # one file can get right, where that file is not in the repo, is not
+    # actually fixed -- hence normalisation at load time.
     ORACLE_FUSION_BASE_URL: str = "https://fa-etvl-test-saasfaprod1.fa.ocs.oraclecloud.com/fscmRestApi/resources/latest"
+
+    @field_validator("ORACLE_FUSION_BASE_URL")
+    @classmethod
+    def _strip_resource_suffix(cls, v: str) -> str:
+        """
+        Accept either form of the base URL and always yield the collection ROOT.
+
+        fusion_client.py appends the resource path itself, so a value ending in
+        "/standardReceipts" produces ".../standardReceipts/standardReceipts"
+        and a silent 404 with an EMPTY body -- which surfaces to the SPOC as
+        "Oracle Post Failed" with no message at all, the least diagnosable
+        failure the integration can produce.
+
+        Normalising here means a stale .env on any environment self-corrects
+        instead of failing every receipt, and both spellings stay valid for
+        whoever writes the next deployment config.
+        """
+        v = (v or "").strip().rstrip("/")
+        if v.lower().endswith("/standardreceipts"):
+            v = v[: -len("/standardReceipts")]
+        return v
     ORACLE_AUTH_MODE: Literal["basic", "oauth"] = "basic"
     ORACLE_BASIC_USERNAME: str | None = None
     ORACLE_BASIC_PASSWORD: str | None = None

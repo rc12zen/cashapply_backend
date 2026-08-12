@@ -15,6 +15,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from .common.logging_config import configure_logging
 configure_logging()  # must run before any other app import that grabs a logger at module load time
 
+from .common.tls_trust import configure_tls_trust
+configure_tls_trust()  # must run before anything opens an HTTPS connection — see tls_trust.py
+
 from .db.session import init_db
 from .db.settings import get_settings
 from .aging.watcher import start_watcher

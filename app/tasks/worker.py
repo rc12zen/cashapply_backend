@@ -19,6 +19,9 @@ from __future__ import annotations
 from ..common.logging_config import configure_logging
 configure_logging()  # must run before any task module import that grabs a logger at load time
 
+from ..common.tls_trust import configure_tls_trust
+configure_tls_trust()  # must run before any task opens an HTTPS connection — see common/tls_trust.py
+
 # Registers the tasks on procrastinate_app via their @procrastinate_app.task
 # decorators — required so the worker knows about them.
 from . import analysis_tasks, ingestion_tasks  # noqa: F401
