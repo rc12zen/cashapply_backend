@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from ..common.errors import AppError
 from ..common.error_codes import ErrorCode
+from ..common.upload_validation import safe_upload_filename
 from ..db.models import SourceFile
 from ..storage.client import get_storage_client
 from .file_sniff import check_extension_mismatch
@@ -23,6 +24,11 @@ def handle_aging_upload(db: Session, filename: str, data: bytes) -> dict:
     Does NOT load into aging_invoices — call parser.load_aging_into_db() separately
     (or via /api/config/refresh-aging) to keep upload + parse decoupled.
     """
+    # This route (unlike the bank-statement uploads) never called
+    # validate_statement_upload(), so filename safety was never checked here —
+    # storage_key below is set straight from the raw filename. See CWE-23 fix.
+    safe_upload_filename(filename)
+
     # PATCH: reject up front if the file's actual bytes don't match its
     # extension (e.g. a legacy .xls binary saved with a .xlsx name).
     # Without this, the upload silently "succeeds" — pandas can often

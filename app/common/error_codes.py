@@ -184,6 +184,11 @@ class ErrorCode:
         "This file's actual format doesn't match its file extension (e.g. a legacy .xls "
         "file saved with a .xlsx name). Excel will refuse to open it later if uploaded as-is.",
     )
+    STATEMENT_FILENAME_INVALID = ErrorDef(
+        2012, "STATEMENT_FILENAME_INVALID", 400,
+        "Invalid file name",
+        "That file name isn't allowed (no path separators or '..'). Rename the file and try again.",
+    )
 
     # ── 3000-3999  Config / Config Builder ──────────────────────────────────
     CONFIG_NOT_FOUND = ErrorDef(

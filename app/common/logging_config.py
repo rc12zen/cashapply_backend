@@ -108,7 +108,14 @@ def configure_logging() -> None:
         level_name = "INFO"
     level = getattr(logging, level_name, logging.INFO)
 
-    log_dir = Path(os.environ.get("LOG_DIR", "./logs"))
+    # .resolve() up front so LOG_DIR is pinned to one concrete absolute
+    # directory as soon as it's read from the environment, rather than a raw,
+    # unprocessed string flowing straight into Path/mkdir further down
+    # (the exact CWE-23 pattern static scanners flag). LOG_DIR is operator-
+    # controlled at deploy time, not attacker-reachable, so it's intentionally
+    # still free to point anywhere the operator chooses -- this just makes
+    # resolution explicit and logs the real target for audit visibility.
+    log_dir = Path(os.environ.get("LOG_DIR", "./logs")).resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
     # Base filename -- TimedRotatingFileHandler appends the date suffix
     # itself (see `suffix` below) and writes one plain-text file per day,
