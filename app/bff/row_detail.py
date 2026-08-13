@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
+from ..common.account_masking import mask_account_number
 from ..db.models import LineItem, RemittanceExtraction, RemittanceInvoiceLine
 from ..bff.metrics import _category_for_row, GROUP_LABELS, GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_DISTRIBUTED
 from ..oracle.fusion_client import build_receipt_creation_payload, build_remittance_reference_payloads
@@ -333,7 +334,10 @@ def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str
             "bank_name": r.bank_name,
             "statement_date": r.statement_date.isoformat() if r.statement_date else None,
             "narrative": r.narrative,
-            "bank_account_number": r.account_number,
+            # Masked -- VAPT flagged the full number shipping in every row
+            # response. Full value only via GET
+            # /row-detail/{record_id}/reveal-account-number (results_routes.py).
+            "bank_account_number": mask_account_number(r.account_number),
             "bank_reference": r.bank_reference,
             "credit_amount": float(r.credit_amount or 0),
             "currency": r.statement_currency,
