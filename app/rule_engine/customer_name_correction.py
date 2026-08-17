@@ -91,6 +91,79 @@ def get_customer_name_options(db: Session, line_item_id: int) -> dict:
     }
 
 
+def evaluate_as_customer(db: Session, r: LineItem, customer_name: str, aging_map):
+    """
+    Builds this row's rule-engine input AS IF its customer were
+    `customer_name`, and evaluates it.
+
+    EXTRACTED VERBATIM from correct_customer_name() below, which is still its
+    only mutating caller — the input dict, the hardcoded values and the single
+    evaluate_row() call are all unchanged, so this is not a new call site and
+    evaluator.py's documented three-call-site invariant still holds.
+
+    Deliberately PURE with respect to the LineItem: it reads `r` but writes
+    nothing to it and nothing to the session (build_remittance_view and
+    resolve_ou_status are both read-only lookups). That is what lets
+    hitl/reopen_with_edits.py dry-run a proposed customer change to preview the
+    resulting rule/bucket without persisting anything — the alternative was a
+    fourth hand-written copy of this input dict, which is exactly the
+    divergence risk the credit_memos_lookup comment below warns about.
+
+    Returns (rule_result, remittance_view) — the caller needs the view too, for
+    r.remittance_extraction_id.
+    """
+    remittance_view = build_remittance_view(db, r, customer_name)
+    ou_status = resolve_ou_status(
+        customer_name=customer_name,
+        bank_ou_number=r.ou_number,
+        aging_map=aging_map,
+        fuzzy_min_pct=60.0,
+    )
+
+    rule_input = {
+        "original_row": {
+            "credit_amount":       float(r.credit_amount or 0),
+            "currency":            r.statement_currency,
+            "functional_currency": r.functional_currency,
+            "narrative":           r.narrative,
+            "bank_reference":      r.bank_reference,
+            "ou_number":           r.ou_number,
+        },
+        "extraction": {
+            "extracted_invoices":  r.extracted_invoice_numbers or [],
+            "customer_match_pct":  100.0,
+            "invoice_match_pct":   100.0 if r.extracted_invoice_numbers else 0.0,
+            "customer_text_match": True,
+        },
+        "remittance": remittance_view,
+        "aging_lookup": lambda inv_no, ou: aging_map.lookup_invoice(inv_no, ou),
+        # Required by evaluate_row -- see _require_credit_memos_lookup().
+        # MUST stay identical to orchestrator.py's: if this re-evaluation
+        # path used different scoping, a row held for review on the main
+        # path would flip to auto-accepted once a customer name was fixed.
+        "credit_memos_lookup": lambda cust_no, ou, ccy: aging_map.credit_memos_for(
+            customer_number=cust_no, ou_number=ou, currency=ccy,
+        ),
+        "cross_currency": {
+            "is_cross_currency":              bool(r.is_cross_currency),
+            "credited_currency":              r.statement_currency,
+            "invoice_currency":               r.invoice_currency,
+            "fx_credit_to_invoice":           float(r.fx_credit_to_invoice) if r.fx_credit_to_invoice else None,
+            "fx_credit_to_invoice_source":    r.fx_credit_to_invoice_source,
+            "is_cross_ledger":                bool(r.is_cross_ledger),
+            "functional_currency":            r.functional_currency,
+            "fx_invoice_to_functional":       float(r.fx_invoice_to_functional) if r.fx_invoice_to_functional else None,
+            "fx_invoice_to_functional_source": r.fx_invoice_to_functional_source,
+        },
+        "ou_mismatch":                        ou_status.is_cross_ou,
+        "customer_ou_numbers":                ou_status.customer_ous,
+        "duplicate_invoice_across_customers": False,
+        "already_processed_match":            False,
+    }
+
+    return evaluate_row(rule_input), remittance_view
+
+
 def correct_customer_name(
     db: Session, line_item_id: int, corrected_customer_name: str, corrected_by: str,
 ) -> dict:
@@ -166,56 +239,7 @@ def correct_customer_name(
     r.customer_name_corrected_at = dt.datetime.utcnow()
     r.customer_name_corrected_by = corrected_by
 
-    remittance_view = build_remittance_view(db, r, corrected_customer_name)
-    ou_status = resolve_ou_status(
-        customer_name=corrected_customer_name,
-        bank_ou_number=r.ou_number,
-        aging_map=aging_map,
-        fuzzy_min_pct=60.0,
-    )
-
-    rule_input = {
-        "original_row": {
-            "credit_amount":       float(r.credit_amount or 0),
-            "currency":            r.statement_currency,
-            "functional_currency": r.functional_currency,
-            "narrative":           r.narrative,
-            "bank_reference":      r.bank_reference,
-            "ou_number":           r.ou_number,
-        },
-        "extraction": {
-            "extracted_invoices":  r.extracted_invoice_numbers or [],
-            "customer_match_pct":  100.0,
-            "invoice_match_pct":   100.0 if r.extracted_invoice_numbers else 0.0,
-            "customer_text_match": True,
-        },
-        "remittance": remittance_view,
-        "aging_lookup": lambda inv_no, ou: aging_map.lookup_invoice(inv_no, ou),
-        # Required by evaluate_row -- see _require_credit_memos_lookup().
-        # MUST stay identical to orchestrator.py's: if this re-evaluation
-        # path used different scoping, a row held for review on the main
-        # path would flip to auto-accepted once a customer name was fixed.
-        "credit_memos_lookup": lambda cust_no, ou, ccy: aging_map.credit_memos_for(
-            customer_number=cust_no, ou_number=ou, currency=ccy,
-        ),
-        "cross_currency": {
-            "is_cross_currency":              bool(r.is_cross_currency),
-            "credited_currency":              r.statement_currency,
-            "invoice_currency":               r.invoice_currency,
-            "fx_credit_to_invoice":           float(r.fx_credit_to_invoice) if r.fx_credit_to_invoice else None,
-            "fx_credit_to_invoice_source":    r.fx_credit_to_invoice_source,
-            "is_cross_ledger":                bool(r.is_cross_ledger),
-            "functional_currency":            r.functional_currency,
-            "fx_invoice_to_functional":       float(r.fx_invoice_to_functional) if r.fx_invoice_to_functional else None,
-            "fx_invoice_to_functional_source": r.fx_invoice_to_functional_source,
-        },
-        "ou_mismatch":                        ou_status.is_cross_ou,
-        "customer_ou_numbers":                ou_status.customer_ous,
-        "duplicate_invoice_across_customers": False,
-        "already_processed_match":            False,
-    }
-
-    rule_result = evaluate_row(rule_input)
+    rule_result, remittance_view = evaluate_as_customer(db, r, corrected_customer_name, aging_map)
     r.remittance_extraction_id = remittance_view.get("extraction_id")
     apply_transition(db, r, rule_result, trigger="customer_name_correction", triggered_by=corrected_by)
 
