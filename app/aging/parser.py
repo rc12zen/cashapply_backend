@@ -37,10 +37,16 @@ _COLUMNS_CONFIG = Path(__file__).parent / "aging_columns.json"
 @dataclass
 class RawAgingRow:
     """
-    Plain row shape matching exactly what AgingMap.build() reads
-    (invoice_number, customer_number, customer_name, invoice_type,
-    invoice_amount, outstanding_amount, invoice_currency, ou_number).
+    Plain row shape matching exactly what AgingMap.build() reads.
     No DB model, no SQLAlchemy — pure in-memory parsing output.
+
+    invoice_description / invoice_date carry DEFAULTS on purpose. This
+    dataclass is reconstructed straight from the persisted snapshot
+    (aging_store._load_snapshot_from_db does `RawAgingRow(**r)`), so a
+    snapshot written before these fields existed would raise TypeError on
+    the first read after deploy. Defaults make that old payload load
+    cleanly instead of taking the aging map down until someone re-uploads.
+    Any new field added here MUST carry a default for the same reason.
     """
     invoice_number: str
     customer_number: str
@@ -50,11 +56,41 @@ class RawAgingRow:
     outstanding_amount: float
     invoice_currency: str
     ou_number: str
+    # Blank on every unapplied receipt, populated on every credit memo —
+    # that is exactly how the credit-memo pool tells the two apart. Also
+    # the human-readable text the mapping card shows ("C-Worker Program
+    # Rebate ...") instead of a bare document number.
+    invoice_description: str = ""
+    # Kept as normalised text, not a date object: it only ever gets
+    # displayed, and this dataclass is JSON-serialised into the snapshot.
+    invoice_date: str = ""
 
 
 def _load_columns_config() -> dict:
     with open(_COLUMNS_CONFIG) as f:
         return json.load(f)
+
+
+def _to_text(val) -> str:
+    """
+    Excel cell -> plain display text. Handles the three shapes this export
+    actually produces: NaN (empty cell), a pandas Timestamp (date columns),
+    and ordinary strings/numbers. Dates are reduced to YYYY-MM-DD rather
+    than "2026-03-31 00:00:00", which is what str() on a Timestamp gives.
+    """
+    if val is None:
+        return ""
+    if isinstance(val, float) and str(val) == "nan":
+        return ""
+    if pd.isna(val):
+        return ""
+    if hasattr(val, "date"):          # datetime / pandas Timestamp
+        try:
+            return val.date().isoformat()
+        except Exception:             # noqa: BLE001 — odd date-likes fall back to str()
+            pass
+    s = str(val).strip()
+    return "" if s in ("nan", "-") else s
 
 
 def _to_float(val) -> float:
@@ -93,6 +129,11 @@ def parse_aging_file(local_path: str) -> list[RawAgingRow]:
             outstanding_amount=_to_float(row.get(cols["outstanding_amount"])),
             invoice_currency=str(row.get(cols["invoice_currency"], "") or ""),
             ou_number=str(row.get(cols["ou_number"], "") or ""),
+            # cols.get(): these two are newer than the config file, and a
+            # site-specific config that predates them should degrade to a
+            # blank field rather than KeyError the whole refresh.
+            invoice_description=_to_text(row.get(cols.get("invoice_description", ""))),
+            invoice_date=_to_text(row.get(cols.get("invoice_date", ""))),
         ))
     return rows
 

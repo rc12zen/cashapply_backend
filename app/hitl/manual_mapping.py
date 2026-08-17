@@ -45,11 +45,13 @@ visually verified the customer/invoice against the aging report itself.
 from __future__ import annotations
 
 import datetime as dt
+from typing import Optional
 
 from sqlalchemy.orm import Session
 
 from ..db.models import LineItem, RowStatusHistory, User
 from ..aging import aging_store
+from ..aging.aging_map import KIND_CREDIT_MEMO, KIND_UNAPPLIED_RECEIPT
 from ..rule_engine.evaluator import DEFAULT_SHORT_PAYMENT_TOLERANCE_PCT
 from ..rule_engine.fx_service import FxService
 from ..rule_engine.invoice_ledger import check_duplicate, record_application
@@ -129,6 +131,114 @@ def _serialize_invoice(v) -> dict:
     }
 
 
+def _serialize_credit(c) -> dict:
+    """One CreditMemoView -> the shape the mapping card renders."""
+    return {
+        "document_number": c.document_number,
+        "amount": c.amount,             # positive magnitude; source row is negative
+        "currency": c.currency,
+        "ou_number": c.ou_number,
+        "customer_name": c.customer_name,
+        "customer_number": c.customer_number,
+        "kind": c.kind,                 # "credit_memo" | "unapplied_receipt"
+        "description": c.description,   # "C-Worker Program Rebate ..." — blank on receipts
+        "document_date": c.document_date,
+        "document_type": c.document_type,
+    }
+
+
+def _shortfall_amount(r: LineItem) -> Optional[float]:
+    """
+    How much this row is short, in invoice currency.
+
+    Derived from target_total x shortfall_pct rather than
+    target_total - credit_amount on purpose: credit_amount is in the
+    CREDITED currency, target_total is in the INVOICE currency, and the two
+    are only comparable after the FX leg the rule engine already resolved.
+    shortfall_pct is that reconciled result, so this needs no FX of its own
+    and cannot silently subtract two different units.
+
+    None when the row isn't short (or was never evaluated).
+    """
+    if r.target_total is None or r.shortfall_pct is None:
+        return None
+    if float(r.shortfall_pct) <= 0:
+        return None
+    return round(float(r.target_total) * float(r.shortfall_pct) / 100.0, 2)
+
+
+def _credit_context(aging_map, r: LineItem, customer_name: Optional[str]) -> dict:
+    """
+    The customer's negative aging rows, plus which of the three situations
+    the SPOC is looking at.
+
+    Scoped to customer + OU + currency — of the 164 credit memos in the
+    31-Mar export that name a specific invoice, all 164 agree with it on all
+    three, and BRD Scenario 13 keeps money out of the wrong OU rather than
+    applying it across OUs.
+
+    SUGGESTION POLICY — a single exact amount match, and nothing else.
+    Never a sum of several. Assurant holds 164 open credit memos in one OU,
+    and some subset of 164 numbers fits almost any target, so combination
+    search would reliably produce a confident wrong answer that somebody
+    then approves. Two credit memos of the same amount is real ambiguity and
+    is reported as such rather than resolved by picking one.
+    """
+    matched = r.matched_invoices or []
+    first = matched[0] if matched else {}
+    customer_number = first.get("customer_number") or None
+    ou_number = first.get("ou_number") or r.ou_number or None
+    currency = first.get("invoice_currency") or None
+
+    credit_memos = aging_map.credit_memos_for(
+        customer_number=customer_number, customer_name=customer_name,
+        ou_number=ou_number, currency=currency, kind=KIND_CREDIT_MEMO,
+    )
+    unapplied = aging_map.credit_memos_for(
+        customer_number=customer_number, customer_name=customer_name,
+        ou_number=ou_number, currency=currency, kind=KIND_UNAPPLIED_RECEIPT,
+    )
+
+    shortfall = _shortfall_amount(r)
+    suggested = None
+    if shortfall is not None:
+        exact = [c for c in credit_memos if round(c.amount, 2) == shortfall]
+        if len(exact) == 1:
+            situation = "exact_match"
+            suggested = exact[0].document_number
+        elif len(exact) > 1:
+            situation = "ambiguous_match"
+        elif credit_memos:
+            situation = "credits_available"
+        else:
+            situation = "none"
+    else:
+        situation = "credits_available" if credit_memos else "none"
+
+    return {
+        "credit_memos": [_serialize_credit(c) for c in credit_memos],
+        # Shown so the SPOC can see them, never suggested and never counted
+        # towards a match: per Finance, nobody knows when a customer will
+        # come back to an unapplied receipt, so it must not drive a decision.
+        "unapplied_receipts": [_serialize_credit(c) for c in unapplied],
+        "credit_context": {
+            "situation": situation,
+            "shortfall_amount": shortfall,
+            "currency": currency,
+            "credit_memo_total": round(sum(c.amount for c in credit_memos), 2),
+            "credit_memo_count": len(credit_memos),
+            "unapplied_receipt_count": len(unapplied),
+            "suggested_document_number": suggested,
+            # The aging export is fully replaced daily with no history, so
+            # everything above is a snapshot of one file, not a standing
+            # fact. Surfaced so the card can say which file it came from
+            # rather than implying it is live.
+            "aging_filename": aging_store.get_status().get("filename"),
+            "aging_loaded_at": aging_store.get_status().get("loaded_at"),
+        },
+    }
+
+
 def get_mapping_options(db: Session, line_item_id: int) -> dict:
     """
     What the frontend needs to render the manual-mapping picker:
@@ -167,6 +277,10 @@ def get_mapping_options(db: Session, line_item_id: int) -> dict:
             "customer_identified": True,
             "customer_name": customer_name,
             "invoices": invoices,
+            # Negative aging rows for the same customer/OU/currency. Purely
+            # additive to this payload — a client that ignores these keys
+            # behaves exactly as before.
+            **_credit_context(aging_map, r, customer_name),
         }
 
     return {
@@ -174,13 +288,17 @@ def get_mapping_options(db: Session, line_item_id: int) -> dict:
         "customer_name": None,
         "customers": aging_map.customers_for_ou(r.ou_number, limit=500) if r.ou_number else [],
         "invoices": [],
+        # No customer yet, so nothing to scope a credit lookup to. Emitted
+        # empty rather than omitted so the client has one payload shape.
+        **_credit_context(aging_map, r, None),
     }
 
 
 def get_invoices_for_customer(db: Session, line_item_id: int, customer_name: str) -> dict:
     """Step 2 of the picker when no customer was auto-identified — SPOC
     searched/picked a customer, now fetch THEIR open invoices."""
-    if not db.query(LineItem).get(line_item_id):
+    r = db.query(LineItem).get(line_item_id)
+    if not r:
         return {"error": "Row not found"}
     aging_map = aging_store.get_aging_map()
     if aging_map is None:
@@ -188,6 +306,10 @@ def get_invoices_for_customer(db: Session, line_item_id: int, customer_name: str
     return {
         "customer_name": customer_name,
         "invoices": [_serialize_invoice(v) for v in aging_map.invoices_for_customer(customer_name)],
+        # Same credit context as get_mapping_options, now that a customer is
+        # known. Without this the SPOC would see credit memos on the
+        # auto-identified path but not after picking a customer by hand.
+        **_credit_context(aging_map, r, customer_name),
     }
 
 

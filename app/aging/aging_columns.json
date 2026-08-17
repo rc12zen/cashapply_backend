@@ -8,14 +8,16 @@
       "customer_name":      "CUSTOMER NAME",
       "invoice_number":     "INV NO",
       "invoice_type":       "INV TYPE",
-      "invoice_amount":     "INV AMT ",
+      "invoice_amount":     "INV AMT",
       "invoice_currency":   "INV CURR CODE",
       "outstanding_amount": "INV AMT UNPAID",
       "invoice_date":       "INVOICE DATE",
       "due_date":           "DUE DATE",
-      "ou_number":          "SEGMENT1"
+      "ou_number":          "SEGMENT1",
+      "invoice_description": "INV DESC"
     },
     "date_formats": ["DD-MON-YYYY"],
-    "notes": "Aging report contains OPEN/PENDING invoices only — closed/paid invoices are never present in this export. invoice_number is NOT globally unique; uniqueness key is (invoice_number, ou_number)."
+    "notes": "Aging report contains OPEN/PENDING invoices only — closed/paid invoices are never present in this export. invoice_number is NOT globally unique; uniqueness key is (invoice_number, ou_number). NEGATIVE outstanding_amount rows are credits, not debts — see aging_map.py's is_payable() and the credit-memo pool. INV DESC is populated on every credit memo and blank on every unapplied receipt, which is how the two are told apart.",
+    "_invoice_amount_note": "The key here was 'INV AMT ' with a trailing space until 2026-08. parse_aging_file() strips column names, so the lookup never matched and every invoice_amount in the system was 0.0. Do not reintroduce the space."
   }
 }
