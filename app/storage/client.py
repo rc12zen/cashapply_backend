@@ -15,7 +15,21 @@ import shutil
 from pathlib import Path
 from typing import BinaryIO
 
+from ..common.errors import AppError
+from ..common.error_codes import ErrorCode
 from ..db.settings import get_settings
+
+
+def _reject_escaping_blob_key(key: str) -> None:
+    """Backstop for AzureBlobStorageClient: blob names legitimately allow "/"
+    for virtual folders (unlike LocalStorageClient's filesystem path), so the
+    is_relative_to() trick below doesn't apply -- but ".." segments or a
+    leading "/" would still let a crafted key collide with / overwrite a
+    blob outside the intended bucket/prefix. Callers (uploads) are expected
+    to have already rejected this via safe_upload_filename(); this exists so
+    every blob operation is protected even if a future caller forgets."""
+    if not key or key.startswith("/") or ".." in key.replace("\\", "/").split("/"):
+        raise AppError(ErrorCode.STATEMENT_FILENAME_INVALID, detail=f"'{key}'")
 
 
 class StorageClient(abc.ABC):
@@ -48,7 +62,17 @@ class LocalStorageClient(StorageClient):
         self.root.mkdir(parents=True, exist_ok=True)
 
     def _path(self, bucket: str, key: str) -> Path:
-        p = self.root / bucket / key
+        # Contain to the specific bucket subfolder, not just the overall
+        # storage root -- "../evil.csv" would otherwise still resolve inside
+        # self.root (just outside `bucket`), slipping past a root-only check.
+        bucket_root = (self.root / bucket).resolve()
+        p = (self.root / bucket / key).resolve()
+        # Backstop against Path Traversal (CWE-23): every local read/write
+        # passes through here, so even a caller that skipped
+        # safe_upload_filename() can't make `key` (e.g. "../../x" or an
+        # absolute path) resolve outside its own bucket folder.
+        if not (p == bucket_root or bucket_root in p.parents):
+            raise AppError(ErrorCode.STATEMENT_FILENAME_INVALID, detail=f"'{key}'")
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
 
@@ -106,20 +130,25 @@ class AzureBlobStorageClient(StorageClient):
         return c
 
     def save(self, bucket, key, data):
+        _reject_escaping_blob_key(key)
         self._container(bucket).upload_blob(key, data, overwrite=True)
         return f"azure://{bucket}/{key}"
 
     def save_stream(self, bucket, key, stream):
+        _reject_escaping_blob_key(key)
         self._container(bucket).upload_blob(key, stream, overwrite=True)
         return f"azure://{bucket}/{key}"
 
     def read(self, bucket, key):
+        _reject_escaping_blob_key(key)
         return self._container(bucket).download_blob(key).readall()
 
     def exists(self, bucket, key):
+        _reject_escaping_blob_key(key)
         return self._container(bucket).get_blob_client(key).exists()
 
     def delete(self, bucket, key):
+        _reject_escaping_blob_key(key)
         bc = self._container(bucket).get_blob_client(key)
         if bc.exists():
             bc.delete_blob()
@@ -128,6 +157,7 @@ class AzureBlobStorageClient(StorageClient):
         return [b.name for b in self._container(bucket).list_blobs(name_starts_with=prefix)]
 
     def local_path_for_read(self, bucket, key):
+        _reject_escaping_blob_key(key)
         import tempfile
         data = self.read(bucket, key)
         suffix = os.path.splitext(key)[1] or ".tmp"

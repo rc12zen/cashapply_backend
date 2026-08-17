@@ -24,16 +24,63 @@ from app.db.session import session_scope
 ACTIONS: dict[str, tuple] = {
     "approve": (
         "Approve & Post", "check-circle", "oracle:post",
-        ["ready_for_oracle"], None, True, False, 10,
+        # short_payment was split out of ready_for_oracle (see bff/metrics.py
+        # GROUP_SHORT_PAYMENT) but is the identical Approve -> Oracle POST path,
+        # so both categories must offer this action. overpayment (R9e) is the
+        # same again — a SPOC-confirmed capped mapping, where each reference is
+        # capped at its own invoice's outstanding and the excess stays unapplied
+        # on the receipt. Must stay in step with hitl/service.py's approve_row()
+        # gate, which admits exactly these three groups.
+        ["ready_for_oracle", "short_payment", "overpayment"], None, True, False, 10,
     ),
     "reject": (
         "Reject", "x-circle", "hitl:reject",
         None, "not_rejected", True, True, 20,
     ),
+    # Reopen (undo a rejection, or un-park an overpayment) — see
+    # hitl/actions_registry.py's category gate + hitl/service.py's reopen_row(),
+    # which handles both terminal-but-reversible states through one path (both
+    # released their invoice claims, both left the Oracle receipt untouched, so
+    # both need the same three guards). Same permission tier as reject.
+    # confirm_required so it can't be a stray click, is_danger=False (it's a
+    # recovery, not a destructive action).
+    "reopen": (
+        "Reopen", "rotate-ccw", "hitl:reject",
+        ["rejected", "overpayment_parked"], None, True, False, 15,
+    ),
+    # THE single entry point for an overpaid row. Deliberately neutral: it
+    # promises a decision, not an outcome. The dialog it opens states the
+    # arithmetic once and offers the two real outcomes side by side —
+    #   "Apply & Post"     -> routes to the Manual Invoice Mapping card
+    #   "Explain & Close"  -> calls POST /api/hitl/park-overpayment/{id}
+    # so the SPOC picks a consequence rather than decoding a button name.
+    #
+    # This replaces the old "Resolve Overpayment" label, which read as though it
+    # fixed the problem when it actually meant "post nothing, just record why" —
+    # close to the opposite. confirm_required is False because the dialog itself
+    # is the confirmation step.
+    #
+    # Offered on any conflict_exception row; narrowed to R11 by the condition,
+    # and re-checked server-side in park_overpayment().
+    "handle_overpayment": (
+        "Handle Overpayment", "scale", "hitl:map",
+        ["conflict_exception"], "is_overpayment", False, False, 25,
+    ),
     "map_invoice": (
         "Map Invoice", "link", "hitl:map",
-        ["unidentified", "needs_remittance", "conflict_exception", "post_failed", "rejected"],
-        "not_processed", False, False, 30,
+        # NOTE: "rejected" removed — manual mapping refuses when hitl_status is
+        # set (see hitl/manual_mapping.py), so a Map-Invoice button on a rejected
+        # row always errored. Rejected rows are recovered via "reopen" above,
+        # which clears the flag; the row then re-surfaces Map Invoice through
+        # its own restored category if it needs mapping. ("post_failed" left as
+        # a separate known issue — same guard, out of scope for this change.)
+        ["unidentified", "needs_remittance", "conflict_exception", "post_failed"],
+        # Was "not_processed". Broadened to also hide this button on an OPEN
+        # OVERPAYMENT (R11): those rows get one entry point instead, "Handle
+        # Overpayment", whose dialog routes here when the SPOC chooses to apply.
+        # conflict_exception covers a dozen unrelated rules, so the exclusion has
+        # to be a condition rather than a category change.
+        "mappable_directly", False, False, 30,
     ),
     "recheck_remittance": (
         "Recheck Remittance", "refresh-cw", "hitl:map",
@@ -81,9 +128,20 @@ def seed_actions() -> None:
             action.sort_order = sort_order
             action.is_active = True
 
+        # Retire codes that are no longer in ACTIONS. Without this, renaming an
+        # action left the OLD row active in the DB and the frontend kept
+        # rendering both — which is exactly how "Resolve Overpayment" would have
+        # survived alongside its replacement, "Handle Overpayment".
+        # Deactivated rather than deleted so RowStatusHistory keeps resolving.
+        retired = [a for code, a in existing.items() if code not in ACTIONS and a.is_active]
+        for a in retired:
+            a.is_active = False
+
         print("Action seed complete:")
         for code, (label, *_rest) in ACTIONS.items():
             print(f"  {code:20s} -> {label}")
+        for a in retired:
+            print(f"  {a.code:20s} -> RETIRED (is_active=False)")
 
 
 if __name__ == "__main__":

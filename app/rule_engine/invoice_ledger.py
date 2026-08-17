@@ -68,17 +68,30 @@ def check_duplicate(
     remaining_before = round(float(outstanding_amount) - already_applied, 2)
 
     if new_amount > remaining_before + DUPLICATE_TOLERANCE:
-        return {
-            "blocked": True,
-            "already_applied": round(already_applied, 2),
-            "remaining_before": remaining_before,
-            "message": (
+        # Two genuinely different failures used to share one message, which read
+        # as nonsense in the second case ("already has 0.00 applied from another
+        # payment"). Distinguish them: either someone else holds part of the
+        # invoice, or the amount asked for is simply larger than the invoice.
+        if already_applied > 0:
+            message = (
                 f"Invoice {invoice_number} already has {already_applied:,.2f} applied from "
                 f"another payment — only {max(remaining_before, 0):,.2f} of it remains available, "
                 f"but this selection would apply {new_amount:,.2f}. This looks like the same "
                 f"invoice being mapped twice; if the earlier mapping was a mistake, release it "
                 f"first (reject that row) rather than mapping over it here."
-            ),
+            )
+        else:
+            message = (
+                f"Invoice {invoice_number} is outstanding for {outstanding_amount:,.2f} and is "
+                f"not claimed by any other payment, but this would apply {new_amount:,.2f} "
+                f"against it — more than the invoice is worth. Reduce the amount applied, or "
+                f"include the other invoice(s) this payment covers."
+            )
+        return {
+            "blocked": True,
+            "already_applied": round(already_applied, 2),
+            "remaining_before": remaining_before,
+            "message": message,
         }
     return {
         "blocked": False,
@@ -88,20 +101,54 @@ def check_duplicate(
     }
 
 
+def claim_amount_for(inv: dict, outstanding_amount: float | None = None) -> float:
+    """
+    How much of one invoice a matched_invoices entry actually CLAIMS.
+
+    The ledger answers "how much of this invoice is spoken for", so a claim can
+    never exceed the invoice's own outstanding balance — there is nothing beyond
+    it left to claim. That has to be enforced here rather than trusted from
+    matched_invoices, because `stated_amount` is an ALLOCATION of the received
+    amount, not a per-invoice balance, and on an overpaid row it deliberately
+    exceeds the invoice: evaluator.py's _resolve_matched_invoices() assigns a
+    lone invoice the entire effective_received.
+
+    Without the cap, reopening a parked overpayment failed with a
+    self-contradictory message — check_duplicate() was asked whether a claim of
+    137,950.28 fit inside a 97,390.28 invoice, said no, and reported it as
+    "already applied to another payment (0.00 claimed)", because nothing had
+    claimed it at all.
+
+    Pass `outstanding_amount` to cap against the CURRENT aging figure (what
+    reopen re-validates against); omitted, the entry's own recorded outstanding
+    is used.
+    """
+    amount = inv.get("stated_amount")
+    if amount is None:
+        amount = inv.get("outstanding_amount") or 0
+    cap = outstanding_amount if outstanding_amount is not None else inv.get("outstanding_amount")
+    if cap is None:
+        return float(amount)
+    return min(float(amount), float(cap))
+
+
 def record_application(db: Session, line_item, status: str = "pending") -> None:
     """Upserts one InvoiceApplication row per entry in
     line_item.matched_invoices. Idempotent per (line_item_id,
     invoice_number) — re-mapping the SAME row updates its own rows rather
-    than creating duplicates (see the UniqueConstraint on the model)."""
+    than creating duplicates (see the UniqueConstraint on the model).
+
+    The recorded amount is capped at the invoice's outstanding — see
+    claim_amount_for(). A no-op for every path that could already record
+    (exact matches claim exactly the outstanding, short payments claim less);
+    it only bites on an overpaid row's inflated stated_amount."""
     if not line_item.matched_invoices:
         return
     for inv in line_item.matched_invoices:
         invoice_number = inv.get("invoice_number")
         if not invoice_number:
             continue
-        amount = inv.get("stated_amount")
-        if amount is None:
-            amount = inv.get("outstanding_amount") or 0
+        amount = claim_amount_for(inv)
         existing = (
             db.query(InvoiceApplication)
             .filter(

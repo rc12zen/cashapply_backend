@@ -64,6 +64,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from ..common.account_masking import mask_account_number
 from ..db.models import AnalysisRun, LineItem, User
 from ..deps import get_db
 from ..auth import require_permission
@@ -161,7 +162,10 @@ def _serialize_record(r: LineItem) -> dict:
         "id": r.id,
         "run_id": r.run_id,
         "bank_name": r.bank_name,
-        "account_number": r.account_number,
+        # Masked -- feeds both /records (JSON list) and /export (CSV), and
+        # this view has no reveal action, so the full number never reaches
+        # either (VAPT remediation).
+        "account_number": mask_account_number(r.account_number),
         "business_unit": r.business_unit,
         "ou_number": r.ou_number,
         "statement_date": r.statement_date.isoformat() if r.statement_date else None,

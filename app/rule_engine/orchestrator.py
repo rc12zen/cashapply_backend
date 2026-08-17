@@ -91,6 +91,8 @@ from ..schemas.extraction import IdentifiedPayment, UnknownPayment
 
 from .evaluator import evaluate_row
 from .state_machine import apply_transition
+from .overpayment_reason import apply_overpayment_diagnosis
+from .shortage_reason import apply_shortage_diagnosis
 from .remittance_lookup import build_remittance_view
 from .fx_service import FxService, get_functional_currency
 from .ou_resolver import resolve_ou_status
@@ -385,6 +387,15 @@ def _build_rule_input(
         },
         "remittance": remittance_view,
         "aging_lookup": lambda inv_no, ou: aging_map.lookup_invoice(inv_no, ou),
+        # Required by evaluate_row -- see _require_credit_memos_lookup().
+        # Must be supplied by ALL THREE sites that build this dict
+        # (here, remittance_recheck.py, customer_name_correction.py) or the
+        # ones that miss it silently auto-accept short payments the others
+        # hold for review. Defaults to credit memos only, never unapplied
+        # receipts.
+        "credit_memos_lookup": lambda cust_no, ou, ccy: aging_map.credit_memos_for(
+            customer_number=cust_no, ou_number=ou, currency=ccy,
+        ),
         "cross_currency": {
             # Leg 1 — credit → invoice (for comparison + Oracle Amount)
             "is_cross_currency":              is_cross_currency,
@@ -602,6 +613,28 @@ def _process_identified_payment(
                 customer_fuzzy_min_pct=settings.CUSTOMER_FUZZY_MATCH_MIN_PCT,
             )
             apply_transition(db, line_item, rule_result, trigger="rule_engine")
+
+            # Explain an overpayment while the aging map and this row's session
+            # are both still in hand. R11 previously reached the SPOC with no
+            # cause at all -- see rule_engine/overpayment_reason.py. Advisory
+            # only: it stamps two fields, cannot change the row's category, and
+            # swallows its own errors so a diagnosis can never fail the run.
+            if line_item.rule_id == "R11":
+                apply_overpayment_diagnosis(db, line_item, aging_map)
+
+            # The same treatment for the opposite sign. R9c now catches two
+            # kinds of row: a shortfall over tolerance (as always), and --
+            # new -- a shortfall WITHIN tolerance where the customer holds
+            # open credit memos, which used to be auto-accepted silently
+            # with the credit memo left open in Oracle. The second kind
+            # especially must not reach the SPOC saying only "shortage":
+            # the point of holding it back is to show WHICH credit memos
+            # exist and whether one matches the gap exactly. Advisory only,
+            # same as above -- stamps two fields, cannot change the row's
+            # category, and swallows its own errors.
+            if line_item.rule_id == "R9c":
+                apply_shortage_diagnosis(db, line_item, aging_map)
+
             _mark_row_consumed(db, orig, run_id)
 
         return {"success": True, "bank_reference": orig.bank_reference, "error": None}

@@ -45,11 +45,13 @@ visually verified the customer/invoice against the aging report itself.
 from __future__ import annotations
 
 import datetime as dt
+from typing import Optional
 
 from sqlalchemy.orm import Session
 
 from ..db.models import LineItem, RowStatusHistory, User
 from ..aging import aging_store
+from ..aging.aging_map import KIND_CREDIT_MEMO, KIND_UNAPPLIED_RECEIPT
 from ..rule_engine.evaluator import DEFAULT_SHORT_PAYMENT_TOLERANCE_PCT
 from ..rule_engine.fx_service import FxService
 from ..rule_engine.invoice_ledger import check_duplicate, record_application
@@ -129,6 +131,114 @@ def _serialize_invoice(v) -> dict:
     }
 
 
+def _serialize_credit(c) -> dict:
+    """One CreditMemoView -> the shape the mapping card renders."""
+    return {
+        "document_number": c.document_number,
+        "amount": c.amount,             # positive magnitude; source row is negative
+        "currency": c.currency,
+        "ou_number": c.ou_number,
+        "customer_name": c.customer_name,
+        "customer_number": c.customer_number,
+        "kind": c.kind,                 # "credit_memo" | "unapplied_receipt"
+        "description": c.description,   # "C-Worker Program Rebate ..." — blank on receipts
+        "document_date": c.document_date,
+        "document_type": c.document_type,
+    }
+
+
+def _shortfall_amount(r: LineItem) -> Optional[float]:
+    """
+    How much this row is short, in invoice currency.
+
+    Derived from target_total x shortfall_pct rather than
+    target_total - credit_amount on purpose: credit_amount is in the
+    CREDITED currency, target_total is in the INVOICE currency, and the two
+    are only comparable after the FX leg the rule engine already resolved.
+    shortfall_pct is that reconciled result, so this needs no FX of its own
+    and cannot silently subtract two different units.
+
+    None when the row isn't short (or was never evaluated).
+    """
+    if r.target_total is None or r.shortfall_pct is None:
+        return None
+    if float(r.shortfall_pct) <= 0:
+        return None
+    return round(float(r.target_total) * float(r.shortfall_pct) / 100.0, 2)
+
+
+def _credit_context(aging_map, r: LineItem, customer_name: Optional[str]) -> dict:
+    """
+    The customer's negative aging rows, plus which of the three situations
+    the SPOC is looking at.
+
+    Scoped to customer + OU + currency — of the 164 credit memos in the
+    31-Mar export that name a specific invoice, all 164 agree with it on all
+    three, and BRD Scenario 13 keeps money out of the wrong OU rather than
+    applying it across OUs.
+
+    SUGGESTION POLICY — a single exact amount match, and nothing else.
+    Never a sum of several. Assurant holds 164 open credit memos in one OU,
+    and some subset of 164 numbers fits almost any target, so combination
+    search would reliably produce a confident wrong answer that somebody
+    then approves. Two credit memos of the same amount is real ambiguity and
+    is reported as such rather than resolved by picking one.
+    """
+    matched = r.matched_invoices or []
+    first = matched[0] if matched else {}
+    customer_number = first.get("customer_number") or None
+    ou_number = first.get("ou_number") or r.ou_number or None
+    currency = first.get("invoice_currency") or None
+
+    credit_memos = aging_map.credit_memos_for(
+        customer_number=customer_number, customer_name=customer_name,
+        ou_number=ou_number, currency=currency, kind=KIND_CREDIT_MEMO,
+    )
+    unapplied = aging_map.credit_memos_for(
+        customer_number=customer_number, customer_name=customer_name,
+        ou_number=ou_number, currency=currency, kind=KIND_UNAPPLIED_RECEIPT,
+    )
+
+    shortfall = _shortfall_amount(r)
+    suggested = None
+    if shortfall is not None:
+        exact = [c for c in credit_memos if round(c.amount, 2) == shortfall]
+        if len(exact) == 1:
+            situation = "exact_match"
+            suggested = exact[0].document_number
+        elif len(exact) > 1:
+            situation = "ambiguous_match"
+        elif credit_memos:
+            situation = "credits_available"
+        else:
+            situation = "none"
+    else:
+        situation = "credits_available" if credit_memos else "none"
+
+    return {
+        "credit_memos": [_serialize_credit(c) for c in credit_memos],
+        # Shown so the SPOC can see them, never suggested and never counted
+        # towards a match: per Finance, nobody knows when a customer will
+        # come back to an unapplied receipt, so it must not drive a decision.
+        "unapplied_receipts": [_serialize_credit(c) for c in unapplied],
+        "credit_context": {
+            "situation": situation,
+            "shortfall_amount": shortfall,
+            "currency": currency,
+            "credit_memo_total": round(sum(c.amount for c in credit_memos), 2),
+            "credit_memo_count": len(credit_memos),
+            "unapplied_receipt_count": len(unapplied),
+            "suggested_document_number": suggested,
+            # The aging export is fully replaced daily with no history, so
+            # everything above is a snapshot of one file, not a standing
+            # fact. Surfaced so the card can say which file it came from
+            # rather than implying it is live.
+            "aging_filename": aging_store.get_status().get("filename"),
+            "aging_loaded_at": aging_store.get_status().get("loaded_at"),
+        },
+    }
+
+
 def get_mapping_options(db: Session, line_item_id: int) -> dict:
     """
     What the frontend needs to render the manual-mapping picker:
@@ -167,6 +277,10 @@ def get_mapping_options(db: Session, line_item_id: int) -> dict:
             "customer_identified": True,
             "customer_name": customer_name,
             "invoices": invoices,
+            # Negative aging rows for the same customer/OU/currency. Purely
+            # additive to this payload — a client that ignores these keys
+            # behaves exactly as before.
+            **_credit_context(aging_map, r, customer_name),
         }
 
     return {
@@ -174,13 +288,17 @@ def get_mapping_options(db: Session, line_item_id: int) -> dict:
         "customer_name": None,
         "customers": aging_map.customers_for_ou(r.ou_number, limit=500) if r.ou_number else [],
         "invoices": [],
+        # No customer yet, so nothing to scope a credit lookup to. Emitted
+        # empty rather than omitted so the client has one payload shape.
+        **_credit_context(aging_map, r, None),
     }
 
 
 def get_invoices_for_customer(db: Session, line_item_id: int, customer_name: str) -> dict:
     """Step 2 of the picker when no customer was auto-identified — SPOC
     searched/picked a customer, now fetch THEIR open invoices."""
-    if not db.query(LineItem).get(line_item_id):
+    r = db.query(LineItem).get(line_item_id)
+    if not r:
         return {"error": "Row not found"}
     aging_map = aging_store.get_aging_map()
     if aging_map is None:
@@ -188,6 +306,10 @@ def get_invoices_for_customer(db: Session, line_item_id: int, customer_name: str
     return {
         "customer_name": customer_name,
         "invoices": [_serialize_invoice(v) for v in aging_map.invoices_for_customer(customer_name)],
+        # Same credit context as get_mapping_options, now that a customer is
+        # known. Without this the SPOC would see credit memos on the
+        # auto-identified path but not after picking a customer by hand.
+        **_credit_context(aging_map, r, customer_name),
     }
 
 
@@ -240,7 +362,23 @@ def _classify(r: LineItem, selected: list[dict]) -> dict:
             ),
         }
 
-    shortfall_pct = 0.0 if target_total == 0 else round((target_total - received_total) / target_total * 100, 2)
+    # Mirrors evaluator.py's R12 guard. `0.0 if target_total == 0` used to fall
+    # through to the R9a branch below, so a selection carrying no payable
+    # balance was reported to the SPOC as an EXACT MATCH. The aging picker now
+    # only ever offers payable invoices (aging/aging_map.py's is_payable), so
+    # this is the backstop, not the everyday path.
+    if target_total <= 0:
+        return {
+            "target_total": target_total, "received_total": received_total, "shortfall_pct": 0.0,
+            "fx_info": fx_info,
+            "qualifies": False, "tag": None, "rule_id": "R12", "reason_code": "NO_PAYABLE_BALANCE",
+            "message": (
+                f"The selected document(s) carry a combined payable balance of {target_total} — "
+                f"there is nothing outstanding to apply {received_total} against."
+            ),
+        }
+
+    shortfall_pct = round((target_total - received_total) / target_total * 100, 2)
 
     base = {
         "target_total": target_total, "received_total": received_total, "shortfall_pct": shortfall_pct,
@@ -248,11 +386,45 @@ def _classify(r: LineItem, selected: list[dict]) -> dict:
     }
 
     if shortfall_pct < 0:
+        # PATCH (business decision, confirmed): an overpayment used to be a dead
+        # end here exactly as a beyond-tolerance shortfall once was — see the
+        # R9d note further down, which loosened the OTHER side of this same
+        # boundary and explicitly left this one closed.
+        #
+        # It is now allowed, because refusing it settled nothing: the invoices
+        # the customer genuinely DID pay stayed open in the aging while their
+        # cash sat in Oracle, and the only action that could actually close the
+        # row was Reject — which records something that did not happen.
+        #
+        # Over-applying is impossible here, and not because of a check that
+        # could be bypassed. confirm_manual_mapping() stamps every selected
+        # invoice with `stated_amount = outstanding_amount`, and
+        # oracle/fusion_client.py's build_remittance_reference_payloads() sends
+        # exactly that as each ReferenceAmount — so each reference is capped at
+        # its own invoice's balance by construction. The difference simply stays
+        # unapplied on the receipt, which is the state every conflict row's
+        # receipt is already in today.
+        #
+        # This is the MANUAL path only. The automatic matcher must keep landing
+        # on R11: evaluator.py's _resolve_matched_invoices() assigns a single
+        # invoice the whole effective_received rather than its own outstanding,
+        # so the same move there would over-apply.
+        excess = round(received_total - target_total, 2)
+        ccy = fx_info["selected_currency"] or ""
         return {
-            **base, "qualifies": False, "tag": None, "rule_id": "R11", "reason_code": "OVERPAYMENT_UNEXPLAINED",
-            "message": f"Overpayment — received {received_total} {fx_info['selected_currency'] or ''} exceeds "
-                       f"selected invoice total {target_total} {fx_info['selected_currency'] or ''}. "
-                       f"Does not qualify for one-click posting; this needs SPOC review as a conflict/exception.",
+            **base, "qualifies": True, "tag": "overpayment_capped",
+            "rule_id": "R9e", "reason_code": "OVERPAYMENT_CAPPED",
+            "excess_amount": excess,
+            # The front end must collect a disposition before confirming — the
+            # SPOC knows what the unapplied amount is at the moment they pick the
+            # invoices, and making them come back for a second action loses it.
+            "requires_disposition": True,
+            "message": (
+                f"Received {received_total} {ccy} against selected invoice(s) totalling "
+                f"{target_total} {ccy}. Each invoice is applied at its own outstanding amount, "
+                f"so {target_total} {ccy} will post and {excess} {ccy} will stay unapplied on "
+                f"the receipt. Record why it stays unapplied to continue."
+            ),
         }
 
     if shortfall_pct == 0:
@@ -345,7 +517,12 @@ def preview_manual_mapping(db: Session, line_item_id: int, invoice_numbers: list
 
 
 def confirm_manual_mapping(
-    db: Session, line_item_id: int, invoice_numbers: list[str], user: User | None
+    db: Session,
+    line_item_id: int,
+    invoice_numbers: list[str],
+    user: User | None,
+    overpayment_disposition: str | None = None,
+    overpayment_comment: str | None = None,
 ) -> dict:
     """
     Re-validates from scratch (never trusts a stale client-side preview —
@@ -388,10 +565,34 @@ def confirm_manual_mapping(
     if not preview["qualifies"]:
         return {"error": preview["message"], "qualifies": False}
 
+    # An overpaid mapping (R9e) is only allowed to proceed WITH a recorded
+    # reason for the excess -- see _classify()'s R9e branch. Enforced here and
+    # not only in the UI, because this is the point where money becomes
+    # postable: without it the row would go Processed carrying an unexplained
+    # unapplied balance, which is exactly the silent-residual problem this
+    # whole flow exists to avoid.
+    is_overpaid = preview.get("rule_id") == "R9e"
+    if is_overpaid and not (overpayment_disposition or "").strip():
+        return {
+            "error": (
+                "This selection overpays the chosen invoice(s). Record why the remainder "
+                "stays unapplied (duplicate payment, another entity, advance payment, or "
+                "other) before confirming."
+            ),
+            "qualifies": False,
+            "requires_disposition": True,
+            "excess_amount": preview.get("excess_amount"),
+        }
+
     selected = preview["matched_invoices_preview"]
     fx_info = preview.get("fx_info") or {}
     from_state = r.current_state
 
+    # stated_amount = outstanding_amount is what caps each Oracle reference at
+    # its own invoice's balance -- see fusion_client.build_remittance_reference_
+    # payloads(), which sends `stated_amount or outstanding_amount` verbatim.
+    # On an overpaid row this is the entire safety mechanism, so it must stay
+    # exactly as it is: never the received amount, never a SPOC-typed figure.
     r.matched_invoices = [{**v, "stated_amount": v["outstanding_amount"]} for v in selected]
     r.target_total   = preview["target_total"]
     r.shortfall_pct  = preview["shortfall_pct"]
@@ -400,6 +601,15 @@ def confirm_manual_mapping(
     r.is_matched     = True
     r.current_state  = "review_approve"  # same state automatic ready_for_oracle rows sit in, awaiting Approve
     r.status         = "Ready for Oracle (Manual Mapping)"
+
+    if is_overpaid:
+        # Recorded now, at the moment the SPOC actually knows what the excess
+        # is. approve_row() computes the final unapplied_amount when the
+        # references are posted; this is the WHY, not the HOW MUCH.
+        r.overpayment_disposition    = overpayment_disposition.strip()
+        r.overpayment_disposition_at = dt.datetime.utcnow()
+        r.overpayment_disposition_by = user.email if user else None
+        r.status = "Overpayment — Ready to Post"
 
     # PATCH: the row's own currency/FX fields were frozen at analysis time
     # against whatever (if anything) automatic extraction guessed -- often
@@ -425,11 +635,20 @@ def confirm_manual_mapping(
     r.manually_mapped_at = dt.datetime.utcnow()
     r.manually_mapped_by = user.email if user else None
 
+    history_comment = f"Manually mapped to invoice(s): {', '.join(invoice_numbers)}"
+    if is_overpaid:
+        history_comment += (
+            f" | Overpayment — {preview.get('excess_amount')} left unapplied; "
+            f"disposition={r.overpayment_disposition}"
+        )
+        if (overpayment_comment or "").strip():
+            history_comment += f" | {overpayment_comment.strip()}"
+
     db.add(RowStatusHistory(
         line_item_id=r.id, from_state=from_state, to_state=r.current_state,
         trigger="manual_mapping", rule_id=r.rule_id,
         triggered_by=user.email if user else None,
-        comment=f"Manually mapped to invoice(s): {', '.join(invoice_numbers)}",
+        comment=history_comment,
     ))
     # PATCH: register this mapping in the ledger the moment it's confirmed
     # (status="pending", not yet "confirmed" -- that upgrade happens at
@@ -443,5 +662,11 @@ def confirm_manual_mapping(
         "success": True,
         "rule_id": r.rule_id,
         "reason_code": r.reason_code,
-        "message": preview["message"] + " Row moved to Ready for Oracle — use Approve to post it.",
+        "excess_amount": preview.get("excess_amount"),
+        "overpayment_disposition": r.overpayment_disposition if is_overpaid else None,
+        "message": preview["message"] + (
+            " Row moved to Overpayment — Ready to Post; use Approve to post it."
+            if is_overpaid else
+            " Row moved to Ready for Oracle — use Approve to post it."
+        ),
     }

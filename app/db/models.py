@@ -95,6 +95,13 @@ class RowState(str, enum.Enum):
     # created for the CHILD rows only, one per customer in the breakup).
     # See hitl/split_and_map.py's confirm_distribution().
     DISTRIBUTED              = "distributed"
+    # NEW: terminal-but-reversible state for an overpaid row (R11) whose
+    # excess a SPOC has explained and closed out WITHOUT posting anything --
+    # see hitl/overpayment.py's park_overpayment(). Distinct from "rejected"
+    # (nothing was reversed -- the bare Oracle receipt is still valid and
+    # still holds the cash unapplied) and from "processed" (no invoice
+    # references were ever attached). Reopen restores pre_park_state.
+    OVERPAYMENT_PARKED       = "overpayment_parked"
 
 
 class SettlementIdentifierType(str, enum.Enum):
@@ -361,6 +368,62 @@ class LineItem(Base):
     # legacy rows rejected before this column existed (reopen falls back to a
     # safe default in that case).
     pre_reject_state = Column(String, nullable=True)
+
+    # ── Overpayment (R11) handling ───────────────────────────────────────────
+    # WHY the row looks overpaid, computed once by
+    # rule_engine/overpayment_reason.py right after the rule engine tags a row
+    # R11 -- R11 was previously the only rule that produced NO explanation at
+    # all, so the SPOC saw "Overpayment" and nothing else. One of:
+    #   DUPLICATE_SUSPECT | CROSS_OU_CANDIDATE | UNMATCHED_INVOICES_EXIST
+    #   | FX_DIFFERENCE | UNEXPLAINED
+    # overpayment_evidence carries the supporting detail behind that verdict
+    # (e.g. the candidate invoices found in another OU, with their totals) so
+    # the front end can show the working, not just the conclusion.
+    overpayment_reason   = Column(String, nullable=True)
+    overpayment_evidence = Column(JSON, nullable=True)
+
+    # ── Shortage (R9c) handling ──────────────────────────────────────────────
+    # The mirror image of the two columns above, same contract, same call
+    # site: WHY the row came up short, computed once by
+    # rule_engine/shortage_reason.py right after the rule engine tags a row
+    # R9c. One of:
+    #   CREDIT_MEMO_EXACT_MATCH | CREDIT_MEMO_AMBIGUOUS | CREDIT_MEMO_AVAILABLE
+    #   | DEDUCTION_STATED | SHORTAGE_UNEXPLAINED
+    # shortage_evidence carries the working behind the verdict -- which credit
+    # memos the customer holds, their total, and which one (if any) matches
+    # the shortfall to the cent.
+    #
+    # Note this became worth having only once negative aging rows stopped
+    # being discarded at load (aging/aging_map.py's credit pool). Before that
+    # a short payment inside tolerance was auto-accepted silently and there
+    # was nothing to explain, because nobody ever saw the row.
+    shortage_reason   = Column(String, nullable=True)
+    shortage_evidence = Column(JSON, nullable=True)
+
+    # Route B (hitl/overpayment.py's park_overpayment) -- the SPOC's recorded
+    # explanation for an excess that is NOT being posted. One of:
+    #   awaiting_remittance | duplicate_payment | cross_ou | advance_payment
+    #   | other
+    # Set together with current_state = "overpayment_parked"; all three are
+    # cleared again on reopen.
+    overpayment_disposition    = Column(String, nullable=True)
+    overpayment_disposition_at = Column(DateTime, nullable=True)
+    overpayment_disposition_by = Column(String, nullable=True)  # SPOC email
+
+    # Same role pre_reject_state plays for reject: the current_state held right
+    # before park_overpayment() overwrote it, so reopen restores exactly rather
+    # than guessing. Nullable -- None for rows never parked, cleared on reopen.
+    pre_park_state = Column(String, nullable=True)
+
+    # Route A (capped manual mapping, rule R9e) -- how much of the receipt was
+    # deliberately LEFT UNAPPLIED in Oracle after posting. Each invoice
+    # reference is capped at that invoice's own outstanding_amount (see
+    # hitl/manual_mapping.py's confirm_manual_mapping, which stamps
+    # stated_amount = outstanding_amount), so on an overpaid row the receipt
+    # total legitimately exceeds the sum of its references. This records that
+    # difference rather than letting it vanish silently once the row goes
+    # Processed. In invoice_currency, same unit as target_total.
+    unapplied_amount = Column(Numeric(18, 2), nullable=True)
 
     # ── Settlement identity (credit card / cheque / third-party) ─────────────
     # Set by rule_engine/evaluator.py's R16/R17/R18 the moment detection

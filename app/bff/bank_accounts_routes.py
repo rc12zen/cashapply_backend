@@ -44,6 +44,7 @@ from sqlalchemy.orm import Session
 
 from ..common.errors import AppError
 from ..common.error_codes import ErrorCode
+from ..common.account_masking import mask_account_number
 from ..db.models import BankAccount, BankAccountOU, OrganizationUnit, User
 from ..deps import get_db
 from ..auth import require_permission
@@ -65,7 +66,11 @@ def _account_dict(a: BankAccount) -> dict:
     return {
         "id": a.id,
         "bank_name": a.bank_name,
-        "account_number": a.account_number,
+        # Masked -- the VAPT report flagged full account numbers shipping in
+        # every response. Full value is only ever returned by GET
+        # /{account_id}/reveal below, which re-checks this same permission
+        # and audit-logs the reveal.
+        "account_number": mask_account_number(a.account_number),
         "account_last4": a.account_last4,
         "display_name": a.display_name,
         "currency": a.currency,
@@ -100,6 +105,26 @@ def list_bank_accounts(db: Session = Depends(get_db),
     Viewer (same tier as Config/Overview/etc)."""
     accounts = db.query(BankAccount).order_by(BankAccount.bank_name, BankAccount.account_number).all()
     return {"accounts": [_account_dict(a) for a in accounts]}
+
+
+@router.get("/{account_id}/reveal")
+def reveal_account_number(account_id: int, request: Request,
+                           db: Session = Depends(get_db),
+                           user: User = Depends(require_permission("run:view"))):
+    """Full account number, on demand -- same permission as list_bank_accounts
+    above (this doesn't unlock anything a viewer couldn't already reach, it
+    just makes pulling the real number a deliberate, audited action instead
+    of something that ships in every page load)."""
+    account = db.query(BankAccount).get(account_id)
+    if not account:
+        raise AppError(ErrorCode.BANK_ACCOUNT_NOT_FOUND)
+
+    log_activity(
+        db, user, action="bank_account.account_number_revealed", entity_type="BankAccount",
+        entity_id=account.id, ip_address=_client_ip(request),
+    )
+    db.commit()
+    return {"account_number": account.account_number}
 
 
 @router.get("/business-units")

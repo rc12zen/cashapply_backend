@@ -40,6 +40,8 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from ..common.errors import AppError
+from ..common.regex_safety import safe_search
 from ..db.models import SettlementIdentifier, SettlementIdentifierType
 
 
@@ -57,9 +59,15 @@ def _text_matches(candidate: str, pattern: str) -> bool:
     candidate = candidate.strip().lower()
     pattern = pattern.strip()
     if len(pattern) >= 2 and pattern.startswith("/") and pattern.endswith("/"):
+        # A "/…/"-delimited identifier is the one place this table carries a
+        # real regex. Validated + length-capped first -- see
+        # common/regex_safety.py (ReDoS / CWE-1333). An unsafe or malformed
+        # pattern degrades to "no match" here rather than raising, matching
+        # this function's existing re.error behaviour: classification is
+        # best-effort and must never break an in-flight analysis run.
         try:
-            return bool(re.search(pattern[1:-1], candidate, flags=re.IGNORECASE))
-        except re.error:
+            return bool(safe_search(pattern[1:-1], candidate, flags=re.IGNORECASE))
+        except AppError:
             return False
     return pattern.lower() in candidate
 

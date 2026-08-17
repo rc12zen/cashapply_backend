@@ -95,6 +95,13 @@ def _recheck_one(db: Session, r: LineItem, aging_map) -> dict:
         },
         "remittance": remittance_view,
         "aging_lookup": lambda inv_no, ou: aging_map.lookup_invoice(inv_no, ou),
+        # Required by evaluate_row -- see _require_credit_memos_lookup().
+        # MUST stay identical to orchestrator.py's: if this re-evaluation
+        # path used different scoping, a row held for review on the main
+        # path would flip to auto-accepted the moment a remittance arrived.
+        "credit_memos_lookup": lambda cust_no, ou, ccy: aging_map.credit_memos_for(
+            customer_number=cust_no, ou_number=ou, currency=ccy,
+        ),
         "cross_currency": {
             "is_cross_currency":              bool(r.is_cross_currency),
             "credited_currency":              r.statement_currency,

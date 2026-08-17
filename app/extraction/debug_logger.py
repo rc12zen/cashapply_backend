@@ -24,7 +24,13 @@ import os
 import threading
 import datetime as dt
 
-_LOG_DIR = os.environ.get("EXTRACTION_LOG_DIR", "logs/extraction")
+# .abspath() up front so EXTRACTION_LOG_DIR is pinned to one concrete
+# directory as soon as it's read from the environment, rather than a raw,
+# unprocessed string flowing straight into os.makedirs/open further down
+# (the CWE-23 pattern static scanners flag). It's operator-controlled at
+# deploy time, not attacker-reachable, so it's intentionally still free to
+# point anywhere the operator chooses -- this just makes resolution explicit.
+_LOG_DIR = os.path.abspath(os.environ.get("EXTRACTION_LOG_DIR", "logs/extraction"))
 _lock = threading.Lock()  # log file is shared across ThreadPoolExecutor workers
 
 

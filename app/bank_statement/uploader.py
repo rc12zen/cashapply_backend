@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
+from ..common.upload_validation import safe_upload_filename
 from ..db.models import SourceFile
 from ..storage.client import get_storage_client
 from .detector import detect_config, list_matching_configs
@@ -20,6 +21,7 @@ def handle_statement_upload(db: Session, filename: str, data: bytes) -> dict:
     Save the statement file and create a SourceFile record with detected metadata.
     Returns detection summary for the API response.
     """
+    safe_upload_filename(filename)
     storage = get_storage_client()
     key = filename
     storage.save(STATEMENT_BUCKET, key, data)

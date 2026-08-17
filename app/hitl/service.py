@@ -40,11 +40,13 @@ from ..oracle.receipt_creation import create_receipt_for_line_item
 from ..bff.metrics import (
     _category_for_row, _settlement_override_category, GROUP_READY_FOR_ORACLE,
     GROUP_SHORT_PAYMENT, GROUP_UNIDENTIFIED, GROUP_NEEDS_DISTRIBUTION,
-    GROUP_NEEDS_REMITTANCE, GROUP_LABELS,
+    GROUP_NEEDS_REMITTANCE, GROUP_LABELS, GROUP_OVERPAYMENT,
+    GROUP_OVERPAYMENT_PARKED,
 )
 from ..rule_engine.state_machine import CATEGORY_TO_STATE
 from ..rule_engine.invoice_ledger import (
     confirm_applications, release_applications, record_application, check_duplicate,
+    claim_amount_for,
 )
 from ..aging.aging_store import get_aging_map
 
@@ -241,7 +243,18 @@ def approve_row(
     # dashboard/ledger grouping, so this can never silently drift out of
     # sync with what the UI calls "Ready for Oracle" / "Short Payment".
     category = _category_for_row(r)
-    if category not in (GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT):
+    # GROUP_OVERPAYMENT (rule R9e) joins the two groups that were already
+    # postable. It is a GROUP and not a rule_id special-case on purpose: this
+    # gate deliberately mirrors bff/metrics.py's grouping exactly so it can
+    # never drift out of sync with what the UI calls postable, and a rule_id
+    # exception buried in this condition would have broken that.
+    #
+    # Safe to admit because an R9e row can only have been produced by
+    # hitl/manual_mapping.py's confirm_manual_mapping(), which stamps every
+    # matched invoice with stated_amount = outstanding_amount — so each Oracle
+    # reference is capped at that invoice's own balance and the excess stays
+    # unapplied on the receipt. The AUTOMATIC path never produces R9e.
+    if category not in (GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_OVERPAYMENT):
         return {
             "id": r.id,
             "error": "not_approvable",
@@ -263,6 +276,19 @@ def approve_row(
     r.current_state = "processed" if result["success"] else "post_failed"
     r.status        = "Processed" if result["success"] else "Post Failed"
     r.version       = (r.version or 0) + 1
+
+    # Record the residual on a capped overpayment (R9e). The references just
+    # posted sum to target_total, while the receipt Oracle already holds is for
+    # the full credited amount — so this difference is deliberately left
+    # unapplied. Writing it down is the whole point: once current_state becomes
+    # "processed" the row otherwise looks like any other settled payment, and an
+    # unapplied balance nobody recorded is exactly how a production aging ends
+    # up carrying unapplied cash from a decade ago.
+    if result["success"] and r.rule_id == "R9e":
+        target = float(r.target_total or 0)
+        shortfall_pct = float(r.shortfall_pct or 0)
+        received = round(target * (1 - shortfall_pct / 100), 2) if target else 0.0
+        r.unapplied_amount = round(received - target, 2)
 
     # PATCH: upgrade this row's ledger entries from "pending" to
     # "confirmed" once the Oracle invoice-mapping call actually succeeds —
@@ -388,11 +414,22 @@ def reopen_row(
     if not r:
         return {"error": "not found"}
 
-    if r.hitl_status != "rejected":
+    # Two terminal-but-reversible states share this undo. A parked overpayment
+    # (hitl/overpayment.py's park_overpayment) needs exactly the same three
+    # guards for exactly the same reason: it also released its invoice claims,
+    # it also left the Oracle receipt untouched, and the aging can also have
+    # moved on while it sat there. Rather than a second near-identical function
+    # that would drift, both go through this one.
+    was_rejected = r.hitl_status == "rejected"
+    was_parked   = bool(r.current_state and r.current_state.value == "overpayment_parked")
+    if not (was_rejected or was_parked):
         return {
             "id": r.id,
-            "error": "not_rejected",
-            "message": f"Row {r.id} is not rejected — only a rejected row can be reopened.",
+            "error": "not_reopenable",
+            "message": (
+                f"Row {r.id} is neither rejected nor a parked overpayment — only "
+                f"those two can be reopened."
+            ),
         }
 
     # ── Guard 1: optimistic locking (same contract as approve_row/reject_row)
@@ -408,11 +445,12 @@ def reopen_row(
             "current_version": r.version,
         }
 
-    # Where to put it back. pre_reject_state was captured at reject time; legacy
-    # rows rejected before that column existed fall back to review_approve (the
-    # state every approvable row sits in) — safe, because the display category
-    # itself always recomputes from rule_id regardless of current_state.
-    restore_state = r.pre_reject_state or "review_approve"
+    # Where to put it back. pre_reject_state / pre_park_state were captured at
+    # reject / park time; legacy rows from before those columns existed fall
+    # back to review_approve (the state every approvable row sits in) — safe,
+    # because the display category itself always recomputes from rule_id
+    # regardless of current_state.
+    restore_state = (r.pre_park_state if was_parked else r.pre_reject_state) or "review_approve"
 
     # ── Guards 2 + 3: only rows that actually CLAIM invoices need re-validating
     # and re-claiming (a matched, post-ready row). Rows with no matched invoices
@@ -442,12 +480,16 @@ def reopen_row(
                     "message": (
                         f"Can't reopen — invoice {inv_no} is no longer in the current "
                         f"aging report (it may have been paid, closed, or removed since "
-                        f"this row was rejected)."
+                        f"this row was {'parked' if was_parked else 'rejected'})."
                     ),
                 }
-            claim = m.get("stated_amount")
-            if claim is None:
-                claim = m.get("outstanding_amount") or 0
+            # Capped at the CURRENT aging outstanding, not taken raw from
+            # stated_amount — see invoice_ledger.claim_amount_for(). An overpaid
+            # row's stated_amount is the whole received amount, so re-staking it
+            # verbatim asked check_duplicate whether more money than the invoice
+            # is worth fitted inside it, and reopen failed on every parked
+            # overpayment with a message about a claim that did not exist.
+            claim = claim_amount_for(m, view.outstanding_amount)
             dup = check_duplicate(
                 db, inv_no, ou,
                 outstanding_amount=view.outstanding_amount,
@@ -473,6 +515,15 @@ def reopen_row(
     r.pre_reject_state = None
     r.version         = (r.version or 0) + 1
 
+    # Clear the park decision too, so a reopened overpayment goes back to being
+    # an open, undecided R11 rather than one that still claims to be explained.
+    # The RowStatusHistory entry written below keeps the discarded decision.
+    if was_parked:
+        r.pre_park_state             = None
+        r.overpayment_disposition    = None
+        r.overpayment_disposition_at = None
+        r.overpayment_disposition_by = None
+
     # Re-stake the ledger claim reject_row() released (idempotent upsert —
     # flips the previously-"released" row back to "pending"; see
     # invoice_ledger.record_application). Only for rows that claim invoices,
@@ -481,7 +532,9 @@ def reopen_row(
         record_application(db, r, status="pending")
 
     db.add(RowStatusHistory(
-        line_item_id=r.id, from_state="rejected", to_state=restore_state,
+        line_item_id=r.id,
+        from_state="overpayment_parked" if was_parked else "rejected",
+        to_state=restore_state,
         trigger="spoc_reopen", rule_id=r.rule_id,
         triggered_by=triggered_by, comment=comment,
     ))

@@ -47,9 +47,36 @@ def validate_statement_size(num_bytes: int | None) -> None:
         )
 
 
+def safe_upload_filename(filename: str | None) -> str:
+    """Raise AppError(STATEMENT_FILENAME_INVALID) if `filename` could act as a
+    path rather than a plain file name (CWE-23 / Path Traversal).
+
+    `filename` ends up stored verbatim as SourceFile.storage_key, which the
+    storage clients then use directly as (or as part of) a real filesystem
+    path / blob key — so a name like "../../app/main.py" or "C:\\Windows\\x"
+    must never reach that far. Returns `filename` unchanged on success (for
+    call-site convenience); raises otherwise.
+    """
+    name = filename or ""
+    # basename() strips any directory component -- if that changes the
+    # string, "/" or "\" (both are separators on Windows; POSIX only treats
+    # "/" as one, but rejecting "\" everywhere is the point) was present.
+    if not name or os.path.basename(name) != name:
+        raise AppError(ErrorCode.STATEMENT_FILENAME_INVALID, detail=f"'{filename}'")
+    if name in (".", "..") or ".." in name:
+        raise AppError(ErrorCode.STATEMENT_FILENAME_INVALID, detail=f"'{filename}'")
+    # Catches a Windows drive-letter/UNC form on a non-Windows dev machine,
+    # where os.path.basename() above wouldn't otherwise flag it as absolute.
+    if ":" in name or name.startswith("\\\\"):
+        raise AppError(ErrorCode.STATEMENT_FILENAME_INVALID, detail=f"'{filename}'")
+    return name
+
+
 def validate_statement_upload(filename: str | None) -> None:
     """Raise AppError(STATEMENT_FILE_TYPE_UNSUPPORTED) unless `filename` ends
-    in an allowed extension. No-op on success."""
+    in an allowed extension, or AppError(STATEMENT_FILENAME_INVALID) if it
+    isn't a safe plain file name. No-op on success."""
+    safe_upload_filename(filename)
     ext = os.path.splitext(filename or "")[1].lower().lstrip(".")
     if ext not in ALLOWED_STATEMENT_EXTENSIONS:
         shown = filename or "(no filename)"

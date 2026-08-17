@@ -9,11 +9,15 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
+from ..common.account_masking import mask_account_number
 from ..db.models import LineItem, RemittanceExtraction, RemittanceInvoiceLine
 from ..bff.metrics import _category_for_row, GROUP_LABELS, GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_DISTRIBUTED
 from ..oracle.fusion_client import build_receipt_creation_payload, build_remittance_reference_payloads
+from ..rule_engine.evaluator import DEFAULT_SHORT_PAYMENT_TOLERANCE_PCT
 from ..rule_engine.fx_service import get_ou_display_name
+from ..rule_engine.remittance_lookup import build_remittance_view
 from ..hitl.actions_registry import get_available_actions
+from ..hitl.overpayment import DISPOSITIONS
 
 
 def _build_pipeline(r: LineItem) -> list[dict]:
@@ -58,6 +62,111 @@ def _build_pipeline(r: LineItem) -> list[dict]:
                   "detail": r.reference_message or "Awaiting SPOC approval"})
 
     return nodes
+
+
+def _build_overpayment(db: Session, r: LineItem) -> dict | None:
+    """
+    Everything the row-detail screen needs to explain an overpayment, or None
+    for a row that has nothing to do with one.
+
+    Covers all three points in the lifecycle:
+      - OPEN (R11)              — the excess, the computed cause, the evidence
+      - PARKED                  — plus the recorded disposition and who made it
+      - PROCESSED via R9e       — plus how much was deliberately left unapplied
+
+    The remittance_now_available flag is computed HERE, on read, rather than by
+    a background sweep. A parked row waiting on remittance advice was parked
+    pending exactly that document, so the useful moment to check is when someone
+    is looking at the list — no worker, no state changing on its own, and the
+    row still only moves when a human clicks Reopen.
+    """
+    is_open_overpayment = r.rule_id == "R11"
+    is_parked = bool(r.current_state and r.current_state.value == "overpayment_parked")
+    is_capped = r.rule_id == "R9e"
+
+    if not (is_open_overpayment or is_parked or is_capped):
+        return None
+
+    target = float(r.target_total or 0)
+    shortfall_pct = float(r.shortfall_pct or 0)
+    received = round(target * (1 - shortfall_pct / 100), 2) if target else 0.0
+
+    block: dict = {
+        "is_open_overpayment": is_open_overpayment and not is_parked,
+        "is_parked": is_parked,
+        "is_capped": is_capped,
+        "target_total": target,
+        "received_total": received,
+        "excess_amount": round(received - target, 2),
+        "invoice_currency": r.invoice_currency,
+        # Computed by rule_engine/overpayment_reason.py at analysis time.
+        "reason": r.overpayment_reason,
+        "evidence": r.overpayment_evidence,
+        "disposition": r.overpayment_disposition,
+        "disposition_label": DISPOSITIONS.get(r.overpayment_disposition or ""),
+        "disposition_at": (
+            r.overpayment_disposition_at.isoformat() if r.overpayment_disposition_at else None
+        ),
+        "disposition_by": r.overpayment_disposition_by,
+        # Only set once a capped mapping actually posts — see hitl/service.py's
+        # approve_row(). Present but null before that.
+        "unapplied_amount": float(r.unapplied_amount) if r.unapplied_amount is not None else None,
+        "disposition_options": [
+            {"code": code, "label": label} for code, label in DISPOSITIONS.items()
+        ],
+    }
+
+    if is_parked and r.overpayment_disposition == "awaiting_remittance":
+        # Cheap read-time check: has App2 archived a remittance that matches
+        # this payment since it was parked? build_remittance_view() is the same
+        # matcher the automatic path uses, so a hit here means the row would
+        # genuinely re-evaluate differently if reopened.
+        try:
+            view = build_remittance_view(db, r, r.extracted_customer_name)
+            block["remittance_now_available"] = bool(view and view.get("found"))
+        except Exception:
+            # Advisory badge only — never let it break the detail page.
+            block["remittance_now_available"] = False
+
+    return block
+
+
+def _build_shortage(r: LineItem) -> dict | None:
+    """
+    Everything the row-detail screen needs to explain a shortage, or None
+    for a row that isn't short.
+
+    The mirror of _build_overpayment() above, minus the lifecycle: a
+    shortage has no "parked" state and no disposition to record, so this is
+    just the arithmetic plus whatever rule_engine/shortage_reason.py worked
+    out at analysis time.
+
+    Note `within_tolerance`. It distinguishes the two roads to R9c — a
+    shortfall that exceeded the 12% rule (always went to review) from one
+    that did NOT but was held back anyway because the customer holds open
+    credit memos. That second kind used to be auto-accepted silently, so
+    the SPOC seeing it for the first time deserves to be told why it is in
+    front of them rather than assuming the tolerance changed.
+    """
+    if r.rule_id != "R9c":
+        return None
+
+    target = float(r.target_total or 0)
+    shortfall_pct = float(r.shortfall_pct or 0)
+    received = round(target * (1 - shortfall_pct / 100), 2) if target else 0.0
+
+    return {
+        "target_total": target,
+        "received_total": received,
+        "shortfall_amount": round(target - received, 2),
+        "shortfall_pct": round(shortfall_pct, 2),
+        "invoice_currency": r.invoice_currency,
+        "within_tolerance": 0 < shortfall_pct <= DEFAULT_SHORT_PAYMENT_TOLERANCE_PCT,
+        "tolerance_pct": DEFAULT_SHORT_PAYMENT_TOLERANCE_PCT,
+        # Computed by rule_engine/shortage_reason.py at analysis time.
+        "reason": r.shortage_reason,
+        "evidence": r.shortage_evidence,
+    }
 
 
 def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str] | None = None) -> dict:
@@ -264,7 +373,10 @@ def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str
             "bank_name": r.bank_name,
             "statement_date": r.statement_date.isoformat() if r.statement_date else None,
             "narrative": r.narrative,
-            "bank_account_number": r.account_number,
+            # Masked -- VAPT flagged the full number shipping in every row
+            # response. Full value only via GET
+            # /row-detail/{record_id}/reveal-account-number (results_routes.py).
+            "bank_account_number": mask_account_number(r.account_number),
             "bank_reference": r.bank_reference,
             "credit_amount": float(r.credit_amount or 0),
             "currency": r.statement_currency,
@@ -302,6 +414,10 @@ def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str
             "fx_credit_to_invoice": _rate,
             "fx_credit_to_invoice_source": r.fx_credit_to_invoice_source,
         },
+        "overpayment": _build_overpayment(db, r),
+        # Null for every row that isn't R9c, same contract as "overpayment"
+        # above — the front end renders the card only when this is present.
+        "shortage": _build_shortage(r),
         "pipeline": _build_pipeline(r),
         "oracle": {
             "payload": oracle_payload or {},

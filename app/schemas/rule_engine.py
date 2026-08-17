@@ -42,10 +42,31 @@ class RuleEngineInputSchema(BaseModel):
     The complete input to evaluate_row(). Built by rule_engine/orchestrator.py
     from ExtractionResultSchema + live DB lookups.
 
-    NOTE: aging_lookup is a callable — not serialisable. When passing
-    across process boundaries (future Celery workers), serialize the
-    aging snapshot separately and reconstruct the lambda on the worker.
+    NOTE: aging_lookup and credit_memos_lookup are callables — not
+    serialisable. When passing across process boundaries (future Celery
+    workers), serialize the aging snapshot separately and reconstruct the
+    lambdas on the worker.
+
+    NOTE: this model is DOCUMENTATION ONLY — it is never instantiated
+    anywhere (no constructor call, no model_validate, no parse_obj), so it
+    validates nothing at runtime. The two callables below are declared to
+    stop it drifting further from the real dict, not because declaring them
+    enforces anything. The real contract is evaluate_row()'s own docstring
+    plus _require_credit_memos_lookup(), which does check at runtime.
     """
+    aging_lookup: Optional[Callable] = Field(
+        default=None,
+        description="callable(invoice_number, ou_number) -> AgingInvoiceView | None",
+    )
+    credit_memos_lookup: Optional[Callable] = Field(
+        default=None,
+        description=(
+            "REQUIRED at runtime. callable(customer_number, ou_number, currency) "
+            "-> list[CreditMemoView]. Every site building this dict must supply it; "
+            "see rule_engine/evaluator.py::_require_credit_memos_lookup for why a "
+            "missing value raises rather than defaulting to 'no credit memos'."
+        ),
+    )
     original_row: dict = Field(
         ...,
         description="Raw bank statement fields: credit_amount, currency, narrative, bank_reference, ou_number",

@@ -66,6 +66,23 @@ GROUP_READY_FOR_ORACLE    = "ready_for_oracle"    # R9a (exact match) ONLY as of
 # now gets its own list bucket and its own executive-summary visibility
 # instead of being invisible inside "Ready for Oracle".
 GROUP_SHORT_PAYMENT       = "short_payment"
+# NEW — the exact mirror of GROUP_SHORT_PAYMENT, for the OTHER side of the
+# same boundary. R9e is an overpaid row a SPOC manually mapped with every
+# invoice reference capped at its own outstanding (hitl/manual_mapping.py):
+# reviewed, cleared to post, but not a clean match — so it gets its own
+# bucket rather than sitting next to exact matches in Ready for Oracle, and
+# rather than staying in Conflict / Exception where the approve gate in
+# hitl/service.py would refuse it. Because this IS a group (not a rule_id
+# special case), that gate stays a plain category check and cannot drift out
+# of sync with what the UI shows.
+GROUP_OVERPAYMENT         = "overpayment"
+# NEW — terminal-but-reversible, for an overpaid row whose excess a SPOC
+# explained and closed out WITHOUT posting anything (hitl/overpayment.py's
+# park_overpayment). Distinct from rejected: nothing was reversed, the bare
+# Oracle receipt still holds the cash unapplied. Keyed on current_state, not
+# rule_id — a parked row's rule_id is still R11 (the underlying fact about
+# the row never changes), same pattern as GROUP_DISCARDED/GROUP_DISTRIBUTED.
+GROUP_OVERPAYMENT_PARKED  = "overpayment_parked"
 GROUP_CONFLICT_EXCEPTION  = "conflict_exception"
 GROUP_PROCESSED           = "processed"           # terminal — overrides rule_id
 GROUP_REJECTED            = "rejected"             # terminal — overrides rule_id
@@ -89,9 +106,10 @@ GROUP_DISTRIBUTED         = "distributed"
 # them — see the fix in this same patch).
 ALL_GROUPS: tuple[str, ...] = (
     GROUP_UNIDENTIFIED, GROUP_NEEDS_REMITTANCE, GROUP_NEEDS_DISTRIBUTION,
-    GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_CONFLICT_EXCEPTION,
+    GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_OVERPAYMENT,
+    GROUP_CONFLICT_EXCEPTION,
     GROUP_PROCESSED, GROUP_REJECTED, GROUP_POST_FAILED, GROUP_DISCARDED,
-    GROUP_DISTRIBUTED,
+    GROUP_DISTRIBUTED, GROUP_OVERPAYMENT_PARKED,
 )
 
 RULE_ID_TO_GROUP: dict[str, str] = {
@@ -104,6 +122,12 @@ RULE_ID_TO_GROUP: dict[str, str] = {
     # payment (not an overpayment) — same downstream Approve->Oracle path,
     # same bucket as R9b.
     "R9d": GROUP_SHORT_PAYMENT,
+    # NEW — see hitl/manual_mapping.py's _classify(). The mirror of R9d on the
+    # overpayment side: a SPOC manually selected the invoices for an overpaid
+    # row, each reference capped at its own outstanding, and recorded why the
+    # excess exists. Same downstream Approve->Oracle path; the difference stays
+    # unapplied on the receipt (LineItem.unapplied_amount records how much).
+    "R9e": GROUP_OVERPAYMENT,
     "R0":  GROUP_CONFLICT_EXCEPTION,
     "R1":  GROUP_CONFLICT_EXCEPTION,
     "R2":  GROUP_CONFLICT_EXCEPTION,
@@ -113,6 +137,11 @@ RULE_ID_TO_GROUP: dict[str, str] = {
     "R6":  GROUP_CONFLICT_EXCEPTION,
     "R9c": GROUP_CONFLICT_EXCEPTION,
     "R11": GROUP_CONFLICT_EXCEPTION,
+    # NEW — see evaluator.py. The matched invoices carry no payable balance at
+    # all (sum <= 0). This used to be read as shortfall_pct == 0 -> R9a
+    # EXACT_MATCH, i.e. a *perfect match* with a live Approve button, which
+    # could post a zero/negative reference amount to Oracle.
+    "R12": GROUP_CONFLICT_EXCEPTION,
     "R13": GROUP_CONFLICT_EXCEPTION,
     "R14": GROUP_CONFLICT_EXCEPTION,
     # NEW — see evaluator.py's R16/R17/R18. Deliberately its OWN group, not
@@ -136,6 +165,13 @@ GROUP_LABELS: dict[str, str] = {
     GROUP_NEEDS_DISTRIBUTION: "Needs Distribution",
     GROUP_READY_FOR_ORACLE:   "Ready for Oracle",
     GROUP_SHORT_PAYMENT:      "Short Payment",
+    # "Capped" was internal jargon — it described the per-invoice cap, which is a
+    # mechanism, not something a SPOC reading a tab needs to decode. These now
+    # say what state the row is in: one is a click away from posting (mirroring
+    # "Ready for Oracle", which the team already reads that way), the other is
+    # closed out with nothing posted.
+    GROUP_OVERPAYMENT:        "Overpayment — Ready to Post",
+    GROUP_OVERPAYMENT_PARKED: "Overpayment — Parked",
     GROUP_CONFLICT_EXCEPTION: "Conflict / Exception",
     GROUP_PROCESSED:          "Processed",
     GROUP_REJECTED:           "Rejected",
@@ -204,6 +240,14 @@ def _category_for_row(r: LineItem) -> str:
     # as Needs Distribution forever, or get caught by the override check.
     if r.current_state and r.current_state.value == "distributed":
         return GROUP_DISTRIBUTED
+    # NEW — see hitl/overpayment.py's park_overpayment(). Checked before the
+    # rule_id lookup below for the same reason as the two checks above: a
+    # parked row's rule_id is STILL "R11" (the underlying fact that it was
+    # overpaid never changes and is kept for audit), so without this it would
+    # fall through to GROUP_CONFLICT_EXCEPTION and sit in the exception queue
+    # forever despite having been explained and closed out.
+    if r.current_state and r.current_state.value == "overpayment_parked":
+        return GROUP_OVERPAYMENT_PARKED
     # NEW — see LineItem.settlement_override_at and hitl/service.py's
     # override_settlement_as_customer_payment(). A settlement identifier
     # match is a pattern match, not always a fact (the same payer name can
@@ -587,20 +631,15 @@ def compute_run_summary(db: Session, run_id: int) -> dict:
     for r in rows:
         rows_by_group[_category_for_row(r)].append(r)
 
-    metrics = {
-        "total_rows":              len(rows),
-        "unidentified":             len(rows_by_group[GROUP_UNIDENTIFIED]),
-        "needs_remittance":         len(rows_by_group[GROUP_NEEDS_REMITTANCE]),
-        "needs_distribution":       len(rows_by_group[GROUP_NEEDS_DISTRIBUTION]),
-        "distributed":              len(rows_by_group[GROUP_DISTRIBUTED]),
-        "ready_for_oracle":         len(rows_by_group[GROUP_READY_FOR_ORACLE]),
-        "short_payment":            len(rows_by_group[GROUP_SHORT_PAYMENT]),
-        "conflict_exception":       len(rows_by_group[GROUP_CONFLICT_EXCEPTION]),
-        "processed":                len(rows_by_group[GROUP_PROCESSED]),
-        "rejected":                 len(rows_by_group[GROUP_REJECTED]),
-        "post_failed":              len(rows_by_group[GROUP_POST_FAILED]),
-        "discarded":                len(rows_by_group[GROUP_DISCARDED]),
-    }
+    # PATCH: derived from ALL_GROUPS rather than hand-listed. `tabs` below was
+    # already built this way, but `metrics` was a literal — so a new group got
+    # its tab automatically while its KPI count silently came back undefined.
+    # Every group constant's value is exactly the metric key it had here, so
+    # this produces an identical dict for the existing groups and picks up new
+    # ones for free. Same fix ALL_GROUPS's own comment describes for the
+    # aggregation dicts; this was the one place still doing it by hand.
+    metrics = {"total_rows": len(rows)}
+    metrics.update({group: len(rows_by_group[group]) for group in ALL_GROUPS})
 
     # _source on each serialized row controls whether the frontend's row-click
     # navigates to the row-detail page (only rows that were actually
