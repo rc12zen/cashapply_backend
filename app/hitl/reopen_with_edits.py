@@ -72,9 +72,10 @@ import logging
 from sqlalchemy.orm import Session
 
 from ..aging import aging_store
-from ..db.models import LineItem, RowStatusHistory, User
+from ..db.models import LineItem, RowState, RowStatusHistory, User
 from ..oracle.fusion_client import build_receipt_creation_payload
 from ..rule_engine.customer_name_correction import (
+    _LOCKED_STATES as _CUSTOMER_EDIT_LOCKED_STATES,
     correct_customer_name, evaluate_as_customer,
 )
 from ..rule_engine.invoice_ledger import release_applications
@@ -95,6 +96,20 @@ def _reopen_kind(r: LineItem) -> str | None:
     if r.current_state and _state_value(r.current_state) == "overpayment_parked":
         return "parked"
     return None
+
+
+def _as_row_state(value: str):
+    """Coerce a stored state string back into the RowState enum.
+
+    Needed because callers downstream (_is_correctable, apply_transition) read
+    current_state.value, which only exists on the enum. Falls back to the raw
+    string for an unrecognised legacy value rather than raising -- a reopen must
+    not be blocked by an unknown historical state.
+    """
+    try:
+        return RowState(value)
+    except (ValueError, TypeError):
+        return value
 
 
 def _state_value(state) -> str | None:
@@ -319,6 +334,25 @@ def preview_reopen(
             ),
         })
 
+    # A customer change is applied by correct_customer_name(), which has its own
+    # eligibility rules. Mirror the one that survives this flow so preview and
+    # confirm cannot disagree: manually_mapped is cleared by confirm (a customer
+    # change invalidates the old mapping) and hitl_status is cleared before the
+    # call, but _LOCKED_STATES is checked against the RESTORED state, which this
+    # flow does not control. Predicting it here is the difference between a
+    # blocker the SPOC can see and a failure after they hit Confirm.
+    if customer_name and customer_name != before["customer_name"]:
+        restored = (r.pre_park_state if kind == "parked" else r.pre_reject_state) or "review_approve"
+        if restored in _CUSTOMER_EDIT_LOCKED_STATES:
+            blockers.append({
+                "code": "customer_edit_not_allowed",
+                "message": (
+                    f"This row was {kind} from '{restored}', which is a finalized state — "
+                    f"its customer cannot be corrected on reopen. The invoice mapping can "
+                    f"still be edited."
+                ),
+            })
+
     after: dict = dict(before)
     route = "unchanged"
 
@@ -501,7 +535,13 @@ def confirm_reopen(
     # unmodified (both refuse while hitl_status is set) ─────────────────────
     restore_state = (r.pre_park_state if was_parked else r.pre_reject_state) or "review_approve"
     r.hitl_status      = None
-    r.current_state    = restore_state
+    # MUST be the RowState ENUM, never a plain string. Both _is_correctable()
+    # and apply_transition() read current_state.value, and this row is handed
+    # straight to them below WITHOUT a reload -- assigning the raw string made
+    # every customer edit die with "'str' object has no attribute 'value'".
+    # service.py's reopen_row() can get away with the string because nothing
+    # downstream of it touches .value; this flow cannot.
+    r.current_state    = _as_row_state(restore_state)
     r.status           = "Reopened"
     r.pre_reject_state = None
     if was_parked:
@@ -516,10 +556,14 @@ def confirm_reopen(
 
     if customer_name and customer_name != before["customer_name"]:
         # A customer change invalidates any previously hand-picked mapping, so
-        # drop the flag that would otherwise make correct_customer_name refuse.
+        # drop the flag that would otherwise make correct_customer_name refuse
+        # (_is_correctable rejects manually_mapped rows outright).
         # Legitimate here and nowhere else: the SPOC is explicitly replacing
         # that decision, not having it overwritten underneath them.
-        if r.manually_mapped and invoice_numbers:
+        # NOT conditional on invoice_numbers -- a customer-only edit on a
+        # previously hand-mapped row was silently refused at confirm while
+        # preview said it would succeed.
+        if r.manually_mapped:
             r.manually_mapped = False
         res = correct_customer_name(db, r.id, customer_name, corrected_by=(user.email if user else "unknown"))
         if res.get("error"):
