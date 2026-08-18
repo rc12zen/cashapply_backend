@@ -16,6 +16,10 @@ RuleEngineInput = {
                      customer_text: str|None, ambiguous: bool,
                      is_cross_currency: bool, remittance_currency: str|None },
     aging_lookup: callable(invoice_number, ou_number) -> AgingInvoiceView|None
+    credit_memos_lookup: callable(customer_number, ou_number, currency)
+                          -> list[CreditMemoView]
+        REQUIRED — see _require_credit_memos_lookup() below for why a missing
+        key raises instead of defaulting to "no credit memos".
     cross_currency: { is_cross_currency: bool,
                       credited_currency: str, invoice_currency: str|None,
                       functional_currency: str,
@@ -267,11 +271,67 @@ def _resolve_matched_invoices(input_: dict) -> list[MatchedInvoice]:
     return resolved
 
 
+def _require_credit_memos_lookup(input_: dict) -> Callable:
+    """
+    Fetch the credit-memo lookup, refusing to run without it.
+
+    WHY THIS IS LOUD. The rule input is assembled independently in three
+    places — orchestrator.py (the main run), remittance_recheck.py and
+    customer_name_correction.py (both re-evaluate an existing row). All
+    three reach the R9b branch below.
+
+    If this were read with .get() and only one site supplied it, the other
+    two would silently behave as "customer holds no credit memos". A row
+    correctly held back for review on the main path would then be quietly
+    auto-accepted the moment a remittance arrived or a name was corrected —
+    the row would appear to un-flag itself, with nothing logged and no
+    error anywhere. That failure is invisible and it loses money, so a
+    missing key is an error, not a default.
+
+    Checked once at the top of evaluate_row rather than at the point of use
+    so a fourth call site fails on its very first row, not on the first row
+    that happens to be short.
+    """
+    lookup = input_.get("credit_memos_lookup")
+    if not callable(lookup):
+        raise KeyError(
+            "RuleEngineInput is missing the required 'credit_memos_lookup' callable. "
+            "Every site that builds this dict must supply it — see "
+            "orchestrator.py, remittance_recheck.py and customer_name_correction.py. "
+            "It must NOT be defaulted away: a missing lookup would silently "
+            "auto-accept short payments that should be held for review."
+        )
+    return lookup
+
+
+def _credit_memos_for_match(input_: dict, matched_invoices: list[MatchedInvoice]) -> list:
+    """
+    Open credit memos belonging to the customer this payment matched.
+
+    Scoped to the matched invoice's customer + OU + currency. That scoping
+    is not a guess: of the 164 credit memos in the 31-Mar-2026 export that
+    name a specific invoice, all 164 agree with it on all three, with no
+    counter-example — and BRD Scenario 13 has a payment landing in the
+    wrong OU parked in GL 23213 rather than applied across OUs.
+
+    Credit memos ONLY. An unapplied receipt is also money on the customer's
+    account, but per Finance nobody knows when a customer will come back to
+    one, so it must not influence an automatic decision. That exclusion is
+    the default in AgingMap.credit_memos_for().
+    """
+    lookup = _require_credit_memos_lookup(input_)
+    if not matched_invoices:
+        return []
+    m = matched_invoices[0]
+    return lookup(m.customer_number, m.ou_number, m.invoice_currency) or []
+
+
 def evaluate_row(
     input_: dict,
     short_payment_tolerance_pct: float = DEFAULT_SHORT_PAYMENT_TOLERANCE_PCT,
     customer_fuzzy_min_pct: float = DEFAULT_CUSTOMER_FUZZY_MIN_PCT,
 ) -> RuleResult:
+    _require_credit_memos_lookup(input_)   # fail fast, before any rule runs
     original_row = input_["original_row"]
     extraction = input_.get("extraction") or {}
     remittance = input_.get("remittance") or {}
@@ -495,8 +555,53 @@ def evaluate_row(
     elif 0 < shortfall_pct <= short_payment_tolerance_pct:
         # Per business rule: 0-12% shortage is acceptable regardless of
         # whether a remittance exists or explains the deduction.
-        result = RuleResult("R9b", "ACCEPTABLE_SHORT_PAYMENT", "acceptable_short_payment",
-                            matched_invoices, target_total, received_total, shortfall_pct)
+        #
+        # EXCEPT when the customer holds open credit memos. Then the
+        # shortfall has a plausible cause we can actually name, and letting
+        # it through on tolerance is how money leaks: the row is accepted
+        # with nobody looking, the credit memo stays OPEN in Oracle, and the
+        # customer can deduct the same amount again next month. Finance
+        # confirmed customers do deduct credit memos they already hold
+        # before paying, so this is the common case, not a corner case.
+        #
+        # Deliberately R9c and not a new rule id: the queue behaviour is
+        # identical, and reusing it leaves metrics.py's RULE_ID_TO_GROUP,
+        # the dashboard counts and every saved filter untouched. What the
+        # SPOC needs — WHICH credit memos, and whether one matches the
+        # shortfall exactly — is carried alongside, not encoded in the id.
+        open_credit_memos = _credit_memos_for_match(input_, matched_invoices)
+        if open_credit_memos:
+            shortfall_amount = round(target_total - received_total, 2)
+            available = round(sum(c.amount for c in open_credit_memos), 2)
+            exact = [c for c in open_credit_memos if round(c.amount, 2) == shortfall_amount]
+            # Only a SINGLE exact match is called out. Two credit memos of
+            # the same amount is genuinely ambiguous, and summing subsets is
+            # never attempted — Assurant holds 164 open credit memos in one
+            # OU, and some subset of 164 numbers fits almost any target, so
+            # combination search would manufacture confident wrong answers.
+            if len(exact) == 1:
+                cause = (
+                    f"Credit memo {exact[0].document_number} is for exactly "
+                    f"{shortfall_amount} — likely the deduction."
+                )
+            else:
+                cause = (
+                    f"No single credit memo matches the shortfall exactly; "
+                    f"{len(open_credit_memos)} open totalling {available}."
+                )
+            result = RuleResult(
+                "R9c", "UNEXPLAINED_SHORTAGE", "conflict_exception",
+                matched_invoices, target_total, received_total, shortfall_pct,
+                notes=(
+                    f"Short by {shortfall_amount} ({shortfall_pct:.1f}%), within the "
+                    f"{short_payment_tolerance_pct}% tolerance, but this customer holds "
+                    f"open credit memos — held for review instead of auto-accepted so "
+                    f"the credit memo is not left open to be claimed twice. {cause}"
+                ),
+            )
+        else:
+            result = RuleResult("R9b", "ACCEPTABLE_SHORT_PAYMENT", "acceptable_short_payment",
+                                matched_invoices, target_total, received_total, shortfall_pct)
 
     else:
         result = RuleResult("R9c", "UNEXPLAINED_SHORTAGE", "conflict_exception",

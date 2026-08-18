@@ -385,6 +385,81 @@ def reject_row(
     return {"id": r.id, "status": "Rejected"}
 
 
+def validate_reopen_claims(db: Session, r: LineItem, was_parked: bool = False) -> dict | None:
+    """
+    Guards 2 + 3 of the reopen contract, extracted verbatim from reopen_row()
+    so hitl/reopen_with_edits.py reuses exactly these checks instead of a
+    second, drifting copy:
+
+      2. every invoice this row claims must still exist in the CURRENT aging
+         report (it may have been paid/closed/removed while the row sat
+         rejected or parked);
+      3. no other row may have claimed that invoice beyond its outstanding
+         meanwhile.
+
+    Returns None when everything passes, or the structured error dict the
+    route turns into a "can't reopen — here's why" message. Mutates nothing.
+
+    Only rows that actually CLAIM invoices need re-validating (a matched,
+    post-ready row). Rows with no matched invoices (e.g. unidentified) had no
+    claim to release and have nothing to re-check — they pass straight through.
+    """
+    matched = r.matched_invoices or []
+    if not matched:
+        return None
+
+    aging = get_aging_map()
+    if aging is None:
+        return {
+            "id": r.id,
+            "error": "aging_unavailable",
+            "message": (
+                "Can't reopen — no aging report is currently loaded, so the "
+                "invoice(s) on this row can't be re-validated. Load the aging "
+                "report and try again."
+            ),
+        }
+    for m in matched:
+        inv_no = m.get("invoice_number")
+        ou = m.get("ou_number")
+        view = aging.lookup_invoice(inv_no, ou)
+        if view is None:
+            return {
+                "id": r.id,
+                "error": "invoice_not_in_aging",
+                "message": (
+                    f"Can't reopen — invoice {inv_no} is no longer in the current "
+                    f"aging report (it may have been paid, closed, or removed since "
+                    f"this row was {'parked' if was_parked else 'rejected'})."
+                ),
+            }
+        # Capped at the CURRENT aging outstanding, not taken raw from
+        # stated_amount — see invoice_ledger.claim_amount_for(). An overpaid
+        # row's stated_amount is the whole received amount, so re-staking it
+        # verbatim asked check_duplicate whether more money than the invoice
+        # is worth fitted inside it, and reopen failed on every parked
+        # overpayment with a message about a claim that did not exist.
+        claim = claim_amount_for(m, view.outstanding_amount)
+        dup = check_duplicate(
+            db, inv_no, ou,
+            outstanding_amount=view.outstanding_amount,
+            new_amount=claim,
+            exclude_line_item_id=r.id,
+        )
+        if dup["blocked"]:
+            return {
+                "id": r.id,
+                "error": "invoice_claimed_elsewhere",
+                "message": (
+                    f"Can't reopen — invoice {inv_no} is now applied to another "
+                    f"payment ({dup['already_applied']:,.2f} claimed, only "
+                    f"{max(dup['remaining_before'], 0):,.2f} left), so re-claiming it "
+                    f"here would double it up. Resolve the other claim first."
+                ),
+            }
+    return None
+
+
 def reopen_row(
     db: Session,
     line_item_id: int,
@@ -452,61 +527,11 @@ def reopen_row(
     # regardless of current_state.
     restore_state = (r.pre_park_state if was_parked else r.pre_reject_state) or "review_approve"
 
-    # ── Guards 2 + 3: only rows that actually CLAIM invoices need re-validating
-    # and re-claiming (a matched, post-ready row). Rows with no matched invoices
-    # (e.g. unidentified) had no claim to release and have nothing to re-check —
-    # they pass straight through.
+    # ── Guards 2 + 3 ────────────────────────────────────────────────────────
     matched = r.matched_invoices or []
-    if matched:
-        aging = get_aging_map()
-        if aging is None:
-            return {
-                "id": r.id,
-                "error": "aging_unavailable",
-                "message": (
-                    "Can't reopen — no aging report is currently loaded, so the "
-                    "invoice(s) on this row can't be re-validated. Load the aging "
-                    "report and try again."
-                ),
-            }
-        for m in matched:
-            inv_no = m.get("invoice_number")
-            ou = m.get("ou_number")
-            view = aging.lookup_invoice(inv_no, ou)
-            if view is None:
-                return {
-                    "id": r.id,
-                    "error": "invoice_not_in_aging",
-                    "message": (
-                        f"Can't reopen — invoice {inv_no} is no longer in the current "
-                        f"aging report (it may have been paid, closed, or removed since "
-                        f"this row was {'parked' if was_parked else 'rejected'})."
-                    ),
-                }
-            # Capped at the CURRENT aging outstanding, not taken raw from
-            # stated_amount — see invoice_ledger.claim_amount_for(). An overpaid
-            # row's stated_amount is the whole received amount, so re-staking it
-            # verbatim asked check_duplicate whether more money than the invoice
-            # is worth fitted inside it, and reopen failed on every parked
-            # overpayment with a message about a claim that did not exist.
-            claim = claim_amount_for(m, view.outstanding_amount)
-            dup = check_duplicate(
-                db, inv_no, ou,
-                outstanding_amount=view.outstanding_amount,
-                new_amount=claim,
-                exclude_line_item_id=r.id,
-            )
-            if dup["blocked"]:
-                return {
-                    "id": r.id,
-                    "error": "invoice_claimed_elsewhere",
-                    "message": (
-                        f"Can't reopen — invoice {inv_no} is now applied to another "
-                        f"payment ({dup['already_applied']:,.2f} claimed, only "
-                        f"{max(dup['remaining_before'], 0):,.2f} left), so re-claiming it "
-                        f"here would double it up. Resolve the other claim first."
-                    ),
-                }
+    blocker = validate_reopen_claims(db, r, was_parked=was_parked)
+    if blocker:
+        return blocker
 
     # ── All guards passed — restore ──────────────────────────────────────────
     r.hitl_status     = None

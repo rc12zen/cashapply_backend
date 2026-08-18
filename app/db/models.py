@@ -382,6 +382,24 @@ class LineItem(Base):
     overpayment_reason   = Column(String, nullable=True)
     overpayment_evidence = Column(JSON, nullable=True)
 
+    # ── Shortage (R9c) handling ──────────────────────────────────────────────
+    # The mirror image of the two columns above, same contract, same call
+    # site: WHY the row came up short, computed once by
+    # rule_engine/shortage_reason.py right after the rule engine tags a row
+    # R9c. One of:
+    #   CREDIT_MEMO_EXACT_MATCH | CREDIT_MEMO_AMBIGUOUS | CREDIT_MEMO_AVAILABLE
+    #   | DEDUCTION_STATED | SHORTAGE_UNEXPLAINED
+    # shortage_evidence carries the working behind the verdict -- which credit
+    # memos the customer holds, their total, and which one (if any) matches
+    # the shortfall to the cent.
+    #
+    # Note this became worth having only once negative aging rows stopped
+    # being discarded at load (aging/aging_map.py's credit pool). Before that
+    # a short payment inside tolerance was auto-accepted silently and there
+    # was nothing to explain, because nobody ever saw the row.
+    shortage_reason   = Column(String, nullable=True)
+    shortage_evidence = Column(JSON, nullable=True)
+
     # Route B (hitl/overpayment.py's park_overpayment) -- the SPOC's recorded
     # explanation for an excess that is NOT being posted. One of:
     #   awaiting_remittance | duplicate_payment | cross_ou | advance_payment
@@ -469,6 +487,19 @@ class LineItem(Base):
     customer_name_corrected_at = Column(DateTime, nullable=True)
     customer_name_corrected_by = Column(String, nullable=True)  # SPOC email
     ai_extracted_customer_name = Column(String, nullable=True)
+
+    # ── Reopen-with-edits tracking ────────────────────────────────────────────
+    # Set by hitl/reopen_with_edits.py's confirm_reopen(). Records that this
+    # row's CURRENT outcome came from a human editing it at reopen, rather than
+    # from analysis — distinct from manually_mapped (hand-picked an invoice) and
+    # customer_name_corrected (fixed the AI's customer) above, either or both of
+    # which a reopen edit may also set.
+    # reopen_edit_summary holds the committed before/after diff (customer,
+    # invoice numbers, rule_id) as a queryable JSON blob. RowStatusHistory
+    # carries the same story in free text, but that can't be reported on.
+    reopen_edited_at    = Column(DateTime, nullable=True)
+    reopen_edited_by    = Column(String, nullable=True)   # SPOC email
+    reopen_edit_summary = Column(JSON, nullable=True)
 
     # ── Legacy flags (kept for lib/api.ts backward-compatibility) ─────────────
     # DO NOT rename — frontend depends on these exact column names.

@@ -259,6 +259,12 @@ class ErrorCode:
         "A primary Business Unit is required",
         "Choose a primary Business Unit for this account — it can't be left unset.",
     )
+    CONFIG_PATTERN_INVALID = ErrorDef(
+        3013, "CONFIG_PATTERN_INVALID", 400,
+        "Invalid match pattern",
+        "That match pattern isn't valid or is too complex to run safely. "
+        "Simplify it and try again.",
+    )
 
     # ── 4000-4999  Run / Analysis ────────────────────────────────────────────
     RUN_ALREADY_IN_PROGRESS = ErrorDef(

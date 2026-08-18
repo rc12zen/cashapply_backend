@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
+from ..common.account_masking import mask_account_number
 from ..db.models import LineItem, RemittanceExtraction, RemittanceInvoiceLine
 from ..bff.metrics import _category_for_row, GROUP_LABELS, GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_DISTRIBUTED
 from ..oracle.fusion_client import build_receipt_creation_payload, build_remittance_reference_payloads
+from ..rule_engine.evaluator import DEFAULT_SHORT_PAYMENT_TOLERANCE_PCT
 from ..rule_engine.fx_service import get_ou_display_name
 from ..rule_engine.remittance_lookup import build_remittance_view
 from ..hitl.actions_registry import get_available_actions
@@ -127,6 +129,44 @@ def _build_overpayment(db: Session, r: LineItem) -> dict | None:
             block["remittance_now_available"] = False
 
     return block
+
+
+def _build_shortage(r: LineItem) -> dict | None:
+    """
+    Everything the row-detail screen needs to explain a shortage, or None
+    for a row that isn't short.
+
+    The mirror of _build_overpayment() above, minus the lifecycle: a
+    shortage has no "parked" state and no disposition to record, so this is
+    just the arithmetic plus whatever rule_engine/shortage_reason.py worked
+    out at analysis time.
+
+    Note `within_tolerance`. It distinguishes the two roads to R9c — a
+    shortfall that exceeded the 12% rule (always went to review) from one
+    that did NOT but was held back anyway because the customer holds open
+    credit memos. That second kind used to be auto-accepted silently, so
+    the SPOC seeing it for the first time deserves to be told why it is in
+    front of them rather than assuming the tolerance changed.
+    """
+    if r.rule_id != "R9c":
+        return None
+
+    target = float(r.target_total or 0)
+    shortfall_pct = float(r.shortfall_pct or 0)
+    received = round(target * (1 - shortfall_pct / 100), 2) if target else 0.0
+
+    return {
+        "target_total": target,
+        "received_total": received,
+        "shortfall_amount": round(target - received, 2),
+        "shortfall_pct": round(shortfall_pct, 2),
+        "invoice_currency": r.invoice_currency,
+        "within_tolerance": 0 < shortfall_pct <= DEFAULT_SHORT_PAYMENT_TOLERANCE_PCT,
+        "tolerance_pct": DEFAULT_SHORT_PAYMENT_TOLERANCE_PCT,
+        # Computed by rule_engine/shortage_reason.py at analysis time.
+        "reason": r.shortage_reason,
+        "evidence": r.shortage_evidence,
+    }
 
 
 def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str] | None = None) -> dict:
@@ -333,7 +373,10 @@ def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str
             "bank_name": r.bank_name,
             "statement_date": r.statement_date.isoformat() if r.statement_date else None,
             "narrative": r.narrative,
-            "bank_account_number": r.account_number,
+            # Masked -- VAPT flagged the full number shipping in every row
+            # response. Full value only via GET
+            # /row-detail/{record_id}/reveal-account-number (results_routes.py).
+            "bank_account_number": mask_account_number(r.account_number),
             "bank_reference": r.bank_reference,
             "credit_amount": float(r.credit_amount or 0),
             "currency": r.statement_currency,
@@ -372,6 +415,9 @@ def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str
             "fx_credit_to_invoice_source": r.fx_credit_to_invoice_source,
         },
         "overpayment": _build_overpayment(db, r),
+        # Null for every row that isn't R9c, same contract as "overpayment"
+        # above — the front end renders the card only when this is present.
+        "shortage": _build_shortage(r),
         "pipeline": _build_pipeline(r),
         "oracle": {
             "payload": oracle_payload or {},

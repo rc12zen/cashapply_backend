@@ -38,7 +38,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import threading
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from typing import Optional
 
 from .aging_map import AgingMap
@@ -103,7 +103,16 @@ def _load_snapshot_from_db() -> Optional[AgingStoreState]:
         if row is None:
             return None
         payload = json.loads(row.value)
-        raw_rows = [RawAgingRow(**r) for r in payload["rows"]]
+        # Tolerate snapshot/code drift in BOTH directions rather than taking
+        # the aging map down on deploy. A snapshot written before a field
+        # existed simply omits it (RawAgingRow supplies the default); one
+        # written by newer code carrying a field this build doesn't know
+        # about is ignored instead of raising TypeError on the unexpected
+        # kwarg. Either way the map loads and the app keeps running — a
+        # missing description column degrades the credit pool, it doesn't
+        # break matching.
+        known = {f.name for f in fields(RawAgingRow)}
+        raw_rows = [RawAgingRow(**{k: v for k, v in r.items() if k in known}) for r in payload["rows"]]
         aging_map = AgingMap.build(raw_rows)
         return AgingStoreState(
             aging_map=aging_map,
