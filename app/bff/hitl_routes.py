@@ -132,6 +132,9 @@ def reject(id: int, payload: dict, request: Request, db: Session = Depends(get_d
         raise AppError(ErrorCode.ROW_VERSION_CONFLICT, detail=result.get("message"))
     if result.get("error") == "not found":
         raise AppError(ErrorCode.ROW_NOT_FOUND)
+    # Already posted to Oracle — see hitl/service.py's reject_row() gate.
+    if result.get("error") == "already_posted":
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
 
     log_activity(db, user, action="hitl.reject", entity_type="LineItem", entity_id=id,
                  ip_address=_client_ip(request), metadata={"comment": payload.get("comment")})
