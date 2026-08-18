@@ -91,6 +91,33 @@ def get_customer_name_options(db: Session, line_item_id: int) -> dict:
     }
 
 
+def apply_customer_fields(r: LineItem, customer_name: str, corrected_by: str) -> None:
+    """
+    Write a human-confirmed customer name onto the row, with its audit trail.
+
+    EXTRACTED VERBATIM from correct_customer_name(), which is still its main
+    caller. Shared so hitl/reopen_with_edits.py can persist the same fields when
+    it has to run its own transition (clearing a mapping and correcting the
+    customer in one action, where calling correct_customer_name would mean a
+    second apply_transition() in the same session — which raises, see that
+    function's comment).
+    """
+    # Preserve the ORIGINAL AI-extracted name exactly once — the first
+    # correction records what the AI actually said; a second correction
+    # (correcting a correction) should not overwrite that original record.
+    if not r.customer_name_corrected:
+        r.ai_extracted_customer_name = r.extracted_customer_name
+
+    r.extracted_customer_name = customer_name
+    # Human-supplied name is treated as a confirmed exact match, not a
+    # fuzzy guess — feeds into the rule input the same way the AI's own
+    # match percentage would have.
+    r.customer_match_pct = 100.0
+    r.customer_name_corrected = True
+    r.customer_name_corrected_at = dt.datetime.utcnow()
+    r.customer_name_corrected_by = corrected_by
+
+
 def evaluate_as_customer(db: Session, r: LineItem, customer_name: str, aging_map):
     """
     Builds this row's rule-engine input AS IF its customer were
@@ -223,21 +250,7 @@ def correct_customer_name(
     from_rule_id = r.rule_id
     from_customer_name = r.extracted_customer_name
 
-    # Preserve the ORIGINAL AI-extracted name exactly once — the first
-    # correction records what the AI actually said; a second correction
-    # (correcting a correction) should not overwrite that original record.
-    if not r.customer_name_corrected:
-        r.ai_extracted_customer_name = r.extracted_customer_name
-
-
-    r.extracted_customer_name = corrected_customer_name
-    # Human-supplied name is treated as a confirmed exact match, not a
-    # fuzzy guess — feeds into rule_input below the same way the AI's own
-    # match percentage would have.
-    r.customer_match_pct = 100.0
-    r.customer_name_corrected = True
-    r.customer_name_corrected_at = dt.datetime.utcnow()
-    r.customer_name_corrected_by = corrected_by
+    apply_customer_fields(r, corrected_customer_name, corrected_by)
 
     rule_result, remittance_view = evaluate_as_customer(db, r, corrected_customer_name, aging_map)
     r.remittance_extraction_id = remittance_view.get("extraction_id")

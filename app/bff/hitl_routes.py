@@ -201,10 +201,12 @@ def reopen_preview(id: int, payload: dict, db: Session = Depends(get_db),
     """Read-only: what reopen-confirm WOULD do with these edits — the resulting
     rule/bucket, the before/after diff, and any blockers. Persists nothing, and
     is advisory only (confirm re-validates from scratch)."""
+    # NB: no `or []` -- an ABSENT invoice_numbers key (the SPOC didn't touch the
+    # selection) must stay distinguishable from an EMPTY list (they cleared it).
     result = reopen_with_edits.preview_reopen(
         db, id,
         customer_name=payload.get("customer_name"),
-        invoice_numbers=payload.get("invoice_numbers") or [],
+        invoice_numbers=payload.get("invoice_numbers"),
         overpayment_disposition=payload.get("overpayment_disposition"),
     )
     if result.get("error") == "Row not found":
@@ -223,7 +225,7 @@ def reopen_confirm(id: int, payload: dict, request: Request, db: Session = Depen
     result = reopen_with_edits.confirm_reopen(
         db, id, user,
         customer_name=payload.get("customer_name"),
-        invoice_numbers=payload.get("invoice_numbers") or [],
+        invoice_numbers=payload.get("invoice_numbers"),   # see reopen-preview: None != []
         comment=payload.get("comment"),
         expected_version=payload.get("expected_version"),
         overpayment_disposition=payload.get("overpayment_disposition"),

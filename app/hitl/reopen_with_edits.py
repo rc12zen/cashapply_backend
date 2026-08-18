@@ -76,9 +76,11 @@ from ..db.models import LineItem, RowState, RowStatusHistory, User
 from ..oracle.fusion_client import build_receipt_creation_payload
 from ..rule_engine.customer_name_correction import (
     _LOCKED_STATES as _CUSTOMER_EDIT_LOCKED_STATES,
-    correct_customer_name, evaluate_as_customer,
+    apply_customer_fields, correct_customer_name, evaluate_as_customer,
 )
+from ..rule_engine.evaluator import RuleResult
 from ..rule_engine.invoice_ledger import release_applications
+from ..rule_engine.state_machine import apply_transition
 from . import manual_mapping
 from .service import validate_reopen_claims
 
@@ -155,6 +157,34 @@ def _rejection_context(db: Session, r: LineItem) -> dict:
         "rejected_at":  entry.created_at.isoformat() if entry and getattr(entry, "created_at", None) else None,
         "rejected_from": r.pre_park_state or r.pre_reject_state,
     }
+
+
+def cleared_mapping_outcome(customer_name: str | None, customer_match_pct: float | None) -> tuple:
+    """
+    What a row becomes when the SPOC unticks every invoice — i.e. "none of these
+    are right, send it back to be mapped".
+
+    This is a real decision, not an error: clearing the mapping means the row has
+    no invoices, and the honest outcome is the same fork the codebase already
+    makes for exactly this situation in bff/metrics.py's
+    _settlement_override_category() — know WHO but not WHICH invoice is
+    R7/Needs Remittance; know neither is R8/Unidentified. Reusing that fork (and
+    the same confidence bar it uses, CUSTOMER_FUZZY_MATCH_MIN_PCT) keeps the two
+    from drifting into different answers for the same question.
+
+    Not routed through evaluate_row(): with no invoices and nothing new to match
+    on, the engine would resolve invoices straight back out of
+    r.extracted_invoice_numbers (the narrative extraction) and undo the very
+    thing the SPOC just did. Assigning the outcome here is the same thing
+    manual_mapping's _classify() does for the R9 family.
+
+    Returns (rule_id, reason_code, category).
+    """
+    from ..db.settings import get_settings
+    min_pct = get_settings().CUSTOMER_FUZZY_MATCH_MIN_PCT
+    if customer_name and (customer_match_pct or 0) >= min_pct:
+        return "R7", "CUSTOMER_ONLY_NO_REMIT", "needs_remittance"
+    return "R8", "NO_SIGNAL", "unidentified"
 
 
 def _bucket_pinned_by(r: LineItem) -> str | None:
@@ -301,12 +331,22 @@ def preview_reopen(
             "message": "No aging report is currently loaded — load one before reopening.",
         }
 
+    # None vs [] is a REAL distinction and must survive:
+    #   None -> the SPOC did not touch the invoice selection
+    #   []   -> they deliberately cleared it
+    # Collapsing them (invoice_numbers or []) made "untick everything" look
+    # identical to "no edit": the row fell through to the dry-run branch and the
+    # preview cheerfully reported the row's EXISTING exact match, still quoting
+    # the invoice that had just been unticked.
+    invoices_edited = invoice_numbers is not None
     invoice_numbers = [n for n in (invoice_numbers or []) if n]
     customer_name = (customer_name or "").strip() or None
     locked, lock_reason = _customer_lock(r)
 
     before = _outcome_snapshot(r)
     blockers: list[dict] = []
+
+    cleared_mapping = invoices_edited and not invoice_numbers
 
     # A locked customer is a hard blocker if they tried to change it anyway
     # (stale page, or a direct API call bypassing the disabled field).
@@ -315,8 +355,11 @@ def preview_reopen(
 
     # Guards 2 + 3 apply to the invoices the row ALREADY claims, and only when
     # those claims are being kept — a fresh selection replaces them outright,
-    # and is validated on its own terms by preview_selection() below.
-    if not invoice_numbers:
+    # and is validated on its own terms by preview_selection() below. Clearing
+    # the mapping outright is exempt too — it RELEASES the old claims rather than
+    # re-staking them, so a stale-aging or conflict failure on an invoice the row
+    # is about to stop claiming would block the one action that resolves it.
+    if not invoice_numbers and not cleared_mapping:
         claim_blocker = validate_reopen_claims(db, r, was_parked=(kind == "parked"))
         if claim_blocker:
             blockers.append({
@@ -356,7 +399,22 @@ def preview_reopen(
     after: dict = dict(before)
     route = "unchanged"
 
-    if invoice_numbers:
+    if cleared_mapping:
+        # ── Every invoice unticked -> the row goes back to being unmapped ─────
+        route = "cleared_mapping"
+        # Match pct reflects what the row WILL carry: a SPOC-picked customer is
+        # confirmed (100), otherwise whatever the extraction scored.
+        pct = 100.0 if customer_name else r.customer_match_pct
+        rule_id, reason_code, _category = cleared_mapping_outcome(effective_customer, pct)
+        after = {
+            "rule_id":         rule_id,
+            "reason_code":     reason_code,
+            "customer_name":   effective_customer,
+            "invoice_numbers": [],
+            "target_total":    None,
+            "shortfall_pct":   None,
+        }
+    elif invoice_numbers:
         # ── Invoice edit -> manual mapping's own classifier ──────────────────
         route = "invoice_mapping"
         sel = manual_mapping.preview_selection(db, r, invoice_numbers)
@@ -497,6 +555,9 @@ def confirm_reopen(
             "current_version": r.version,
         }
 
+    # Pass invoice_numbers to the preview UNCHANGED (None vs [] matters — see
+    # preview_reopen), then normalise for our own use below.
+    raw_invoice_numbers = invoice_numbers
     invoice_numbers = [n for n in (invoice_numbers or []) if n]
     customer_name = (customer_name or "").strip() or None
 
@@ -505,7 +566,7 @@ def confirm_reopen(
     # blocker clears exactly when confirm would actually succeed — the two must
     # never disagree.
     pre = preview_reopen(
-        db, line_item_id, customer_name, invoice_numbers,
+        db, line_item_id, customer_name, raw_invoice_numbers,
         overpayment_disposition=overpayment_disposition,
     )
     if pre.get("error"):
@@ -553,8 +614,54 @@ def confirm_reopen(
     # ── Steps 4-6: apply the edits, routed by what changed ──────────────────
     applied: list[str] = []
     outcome: dict = {}
+    cleared_mapping = pre.get("route") == "cleared_mapping"
 
-    if customer_name and customer_name != before["customer_name"]:
+    if cleared_mapping:
+        # ── Every invoice unticked: the row goes back to being unmapped ────────
+        # Handled as ONE transition rather than by delegating the customer half
+        # to correct_customer_name(): that would call apply_transition() and this
+        # branch needs a second call for the cleared outcome, which raises
+        # (apply_transition leaves current_state a plain string). So the customer
+        # fields are written through the shared helper and a single transition
+        # carries both changes.
+        if customer_name and customer_name != before["customer_name"]:
+            if r.manually_mapped:
+                r.manually_mapped = False
+            apply_customer_fields(r, customer_name, user.email if user else "unknown")
+            applied.append("customer_name")
+
+        rule_id, reason_code, category = cleared_mapping_outcome(
+            r.extracted_customer_name, r.customer_match_pct,
+        )
+        # A hand-built RuleResult, the same way manual_mapping's _classify()
+        # assigns the R9 family without the engine. matched_invoices=[] is what
+        # apply_transition turns into a cleared mapping, is_matched=False and the
+        # right state/status, so nothing is set by hand here.
+        cleared_result = RuleResult(
+            rule_id=rule_id, reason_code=reason_code, category=category,
+            matched_invoices=[], target_total=None, received_total=None,
+            shortfall_pct=None,
+            notes="Invoice mapping cleared by a SPOC on reopen.",
+        )
+        apply_transition(db, r, cleared_result,
+                         trigger="spoc_reopen_cleared_mapping",
+                         triggered_by=user.email if user else "unknown")
+        # Diagnosis from the outcome that no longer applies would otherwise
+        # linger on a row that now has no invoices at all.
+        r.overpayment_reason = None
+        r.overpayment_evidence = None
+        r.shortage_reason = None
+        r.shortage_evidence = None
+        r.manually_mapped = False
+        applied.append("cleared_mapping")
+        outcome = {
+            "message": (
+                "Row reopened with its invoice mapping cleared — it is back in the queue "
+                "to be mapped."
+            ),
+        }
+
+    elif customer_name and customer_name != before["customer_name"]:
         # A customer change invalidates any previously hand-picked mapping, so
         # drop the flag that would otherwise make correct_customer_name refuse
         # (_is_correctable rejects manually_mapped rows outright).
