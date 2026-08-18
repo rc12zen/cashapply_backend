@@ -33,9 +33,16 @@ ACTIONS: dict[str, tuple] = {
         # gate, which admits exactly these three groups.
         ["ready_for_oracle", "short_payment", "overpayment"], None, True, False, 10,
     ),
+    # condition_key was "not_rejected"; now "rejectable", which ALSO hides Reject
+    # once the row's invoice references have posted successfully to Oracle.
+    # Rejecting a posted row cannot reverse the Oracle application, releases the
+    # internal ledger claim (desyncing our records from Oracle), and strands the
+    # row with no available actions — see hitl/actions_registry.py's
+    # _cond_rejectable() for the full incident, and hitl/service.py's
+    # reject_row(), which enforces the same rule server-side.
     "reject": (
         "Reject", "x-circle", "hitl:reject",
-        None, "not_rejected", True, True, 20,
+        None, "rejectable", True, True, 20,
     ),
     # Reopen (undo a rejection, or un-park an overpayment) — see
     # hitl/actions_registry.py's category gate + hitl/service.py's reopen_row(),
