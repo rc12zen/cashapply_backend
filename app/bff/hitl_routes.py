@@ -52,6 +52,7 @@ from ..hitl import (
     mark_eligible_for_receipt, discard_row, edit_gl_rate,
     override_settlement_as_customer_payment,
 )
+from ..hitl import reopen_with_edits
 from ..hitl.overpayment import park_overpayment
 from ..hitl.split_and_map import get_distribution_context, preview_distribution, confirm_distribution, get_active_invoices_for_customer
 from ..hitl.distribution_actions import (
@@ -164,6 +165,84 @@ def reopen(id: int, payload: dict, request: Request, db: Session = Depends(get_d
                  ip_address=_client_ip(request),
                  metadata={"comment": payload.get("comment"),
                            "restored_state": result.get("current_state")})
+    db.commit()
+    return result
+
+
+@router.get("/{id}/reopen-options")
+def reopen_options(id: int, db: Session = Depends(get_db),
+                   user: User = Depends(require_permission("hitl:reject"))):
+    """Everything the Reopen & Review modal renders: current customer/invoices,
+    the pick-lists, why the row was rejected, whether the customer is locked by
+    an existing Oracle receipt, and whether its bucket is pinned by
+    reference_status. See hitl/reopen_with_edits.py."""
+    result = reopen_with_edits.get_reopen_options(db, id)
+    if result.get("error") == "Row not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error"):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message") or result["error"])
+    return result
+
+
+@router.get("/{id}/reopen-invoices")
+def reopen_invoices(id: int, customer_name: str, db: Session = Depends(get_db),
+                    user: User = Depends(require_permission("hitl:reject"))):
+    """That customer's open invoices, for when the SPOC changes the customer
+    inside the reopen modal."""
+    result = reopen_with_edits.get_invoices_for_customer(db, id, customer_name)
+    if result.get("error"):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result["error"])
+    return result
+
+
+@router.post("/{id}/reopen-preview")
+def reopen_preview(id: int, payload: dict, db: Session = Depends(get_db),
+                   user: User = Depends(require_permission("hitl:reject"))):
+    """Read-only: what reopen-confirm WOULD do with these edits — the resulting
+    rule/bucket, the before/after diff, and any blockers. Persists nothing, and
+    is advisory only (confirm re-validates from scratch)."""
+    # NB: no `or []` -- an ABSENT invoice_numbers key (the SPOC didn't touch the
+    # selection) must stay distinguishable from an EMPTY list (they cleared it).
+    result = reopen_with_edits.preview_reopen(
+        db, id,
+        customer_name=payload.get("customer_name"),
+        invoice_numbers=payload.get("invoice_numbers"),
+        overpayment_disposition=payload.get("overpayment_disposition"),
+    )
+    if result.get("error") == "Row not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error"):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message") or result["error"])
+    return result
+
+
+@router.post("/{id}/reopen-confirm")
+def reopen_confirm(id: int, payload: dict, request: Request, db: Session = Depends(get_db),
+                   user: User = Depends(require_permission("hitl:reject"))):
+    """Clear the rejection, apply the SPOC's edits, and let the bucket recompute
+    from them — one transaction. Never posts to Oracle: a row landing in
+    ready_for_oracle still needs an explicit Approve & Post."""
+    result = reopen_with_edits.confirm_reopen(
+        db, id, user,
+        customer_name=payload.get("customer_name"),
+        invoice_numbers=payload.get("invoice_numbers"),   # see reopen-preview: None != []
+        comment=payload.get("comment"),
+        expected_version=payload.get("expected_version"),
+        overpayment_disposition=payload.get("overpayment_disposition"),
+        overpayment_comment=payload.get("overpayment_comment"),
+    )
+    if result.get("error") == "version_conflict":
+        raise AppError(ErrorCode.ROW_VERSION_CONFLICT, detail=result.get("message"))
+    if result.get("error") == "Row not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error"):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message") or result["error"])
+
+    log_activity(db, user, action="hitl.reopen_with_edits", entity_type="LineItem", entity_id=id,
+                 ip_address=_client_ip(request),
+                 metadata={"applied": result.get("applied"),
+                           "from": result.get("from"), "to": result.get("to"),
+                           "comment": payload.get("comment")})
     db.commit()
     return result
 

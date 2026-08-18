@@ -33,20 +33,33 @@ ACTIONS: dict[str, tuple] = {
         # gate, which admits exactly these three groups.
         ["ready_for_oracle", "short_payment", "overpayment"], None, True, False, 10,
     ),
+    # confirm_required is now False: Reject opens RejectRowModal, which collects
+    # the REASON and carries its own confirm button. The inline "Sure?" on top of
+    # a modal was a double prompt for one decision.
     "reject": (
         "Reject", "x-circle", "hitl:reject",
-        None, "not_rejected", True, True, 20,
+        None, "not_rejected", False, True, 20,
     ),
     # Reopen (undo a rejection, or un-park an overpayment) — see
-    # hitl/actions_registry.py's category gate + hitl/service.py's reopen_row(),
-    # which handles both terminal-but-reversible states through one path (both
-    # released their invoice claims, both left the Oracle receipt untouched, so
-    # both need the same three guards). Same permission tier as reject.
-    # confirm_required so it can't be a stray click, is_danger=False (it's a
-    # recovery, not a destructive action).
+    # hitl/actions_registry.py's category gate. Same permission tier as reject.
+    #
+    # confirm_required is now False for the same reason as reject: this opens
+    # ReopenAndReviewModal (hitl/reopen_with_edits.py), where the SPOC edits the
+    # customer/invoice mapping, sees the resulting rule and bucket previewed, and
+    # confirms there. It is no longer the one-click pure undo that
+    # service.py's reopen_row() implements — that endpoint still exists and still
+    # works, it just no longer has a caller in the UI.
+    #
+    # applicable_categories deliberately UNCHANGED. It is already correct for
+    # both decisions taken: a row rejected from `processed` never reaches
+    # category "rejected" at all (reference_status == "success" outranks
+    # hitl_status in _category_for_row's precedence), so Reopen is already hidden
+    # there; a row rejected from `post_failed` DOES land in "rejected" and keeps
+    # its Reopen button, which is wanted — that is where cash is sitting on a
+    # created-but-unmapped Oracle receipt, so it must stay recoverable.
     "reopen": (
         "Reopen", "rotate-ccw", "hitl:reject",
-        ["rejected", "overpayment_parked"], None, True, False, 15,
+        ["rejected", "overpayment_parked"], None, False, False, 15,
     ),
     # THE single entry point for an overpaid row. Deliberately neutral: it
     # promises a decision, not an outcome. The dialog it opens states the

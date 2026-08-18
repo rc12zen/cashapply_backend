@@ -488,6 +488,19 @@ class LineItem(Base):
     customer_name_corrected_by = Column(String, nullable=True)  # SPOC email
     ai_extracted_customer_name = Column(String, nullable=True)
 
+    # ── Reopen-with-edits tracking ────────────────────────────────────────────
+    # Set by hitl/reopen_with_edits.py's confirm_reopen(). Records that this
+    # row's CURRENT outcome came from a human editing it at reopen, rather than
+    # from analysis — distinct from manually_mapped (hand-picked an invoice) and
+    # customer_name_corrected (fixed the AI's customer) above, either or both of
+    # which a reopen edit may also set.
+    # reopen_edit_summary holds the committed before/after diff (customer,
+    # invoice numbers, rule_id) as a queryable JSON blob. RowStatusHistory
+    # carries the same story in free text, but that can't be reported on.
+    reopen_edited_at    = Column(DateTime, nullable=True)
+    reopen_edited_by    = Column(String, nullable=True)   # SPOC email
+    reopen_edit_summary = Column(JSON, nullable=True)
+
     # ── Legacy flags (kept for lib/api.ts backward-compatibility) ─────────────
     # DO NOT rename — frontend depends on these exact column names.
     is_matched        = Column(Boolean, default=False)

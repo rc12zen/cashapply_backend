@@ -473,6 +473,25 @@ def preview_manual_mapping(db: Session, line_item_id: int, invoice_numbers: list
                 f"'{r.hitl_status}') and can no longer be manually mapped."
             ),
         }
+    return preview_selection(db, r, invoice_numbers)
+
+
+def preview_selection(db: Session, r: LineItem, invoice_numbers: list[str]) -> dict:
+    """
+    The whole of preview_manual_mapping() EXCEPT its row-lookup and
+    hitl_status guard — extracted verbatim, no logic changed.
+
+    Split out so hitl/reopen_with_edits.py can reuse this validation on a row
+    that DOES still carry hitl_status == "rejected". That guard is correct for
+    the manual-mapping card (never re-map underneath a recorded decision) but
+    wrong for the reopen flow, whose entire purpose is to edit the mapping of a
+    rejected row and clear that decision in the same action. The alternative
+    was a second copy of the aging lookup, same-customer, same-currency and
+    duplicate-claim checks, which would drift.
+
+    Still read-only: persists nothing, and callers must not treat it as
+    authoritative — confirm re-validates from scratch.
+    """
     if not invoice_numbers:
         return {"error": "Select at least one invoice."}
 
@@ -506,7 +525,7 @@ def preview_manual_mapping(db: Session, line_item_id: int, invoice_numbers: list
             db, v["invoice_number"], v["ou_number"],
             outstanding_amount=v["outstanding_amount"],
             new_amount=v["outstanding_amount"],
-            exclude_line_item_id=line_item_id,
+            exclude_line_item_id=r.id,
         )
         if dup["blocked"]:
             return {"error": dup["message"], "qualifies": False, "duplicate": dup}
@@ -558,8 +577,42 @@ def confirm_manual_mapping(
             ),
             "qualifies": False,
         }
+    return apply_selection(
+        db, r, invoice_numbers, user,
+        overpayment_disposition=overpayment_disposition,
+        overpayment_comment=overpayment_comment,
+    )
 
-    preview = preview_manual_mapping(db, line_item_id, invoice_numbers)
+
+def apply_selection(
+    db: Session,
+    r: LineItem,
+    invoice_numbers: list[str],
+    user: User | None,
+    overpayment_disposition: str | None = None,
+    overpayment_comment: str | None = None,
+    commit: bool = True,
+) -> dict:
+    """
+    The whole of confirm_manual_mapping() EXCEPT its row-lookup and
+    hitl_status guard — extracted verbatim apart from the `commit` flag below.
+
+    Split out for the same reason as preview_selection(): the reopen flow
+    (hitl/reopen_with_edits.py) legitimately needs to write a new mapping onto a
+    row that still carries hitl_status == "rejected", because it clears that
+    rejection in the same transaction. Everything that makes this safe is
+    unchanged — it still re-validates from scratch rather than trusting a
+    client preview, still stamps stated_amount = outstanding_amount so Oracle
+    references stay capped at each invoice's own balance, and still refuses an
+    overpaid selection without a recorded disposition.
+
+    `commit=False` lets the reopen flow stage this alongside its own field
+    changes and commit once, so a failure part-way cannot leave a row mapped
+    but still rejected.
+    """
+    line_item_id = r.id
+
+    preview = preview_selection(db, r, invoice_numbers)
     if preview.get("error"):
         return preview
     if not preview["qualifies"]:
@@ -656,7 +709,11 @@ def confirm_manual_mapping(
     # SAME invoice sees it as already claimed immediately, not only after
     # this row is later approved.
     record_application(db, r, status="pending")
-    db.commit()
+    # commit=False when the reopen flow is staging this alongside its own
+    # changes -- it commits once, so a mid-way failure can't leave a row
+    # mapped but still rejected. Every other caller keeps committing here.
+    if commit:
+        db.commit()
 
     return {
         "success": True,
