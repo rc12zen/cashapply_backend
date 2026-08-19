@@ -96,6 +96,17 @@ def parse_gl_rates_file(local_path: str) -> list[dict]:
     suffix = Path(local_path).suffix.lower()
     if suffix == ".csv":
         df = pd.read_csv(local_path, header=cfg["header_row"])
+    elif suffix == ".txt":
+        # Oracle's real extract (xxzen_gl_daily_rates_extract.txt) is a
+        # plain delimited text dump. This USED to auto-sniff the delimiter
+        # via pandas' sep=None/engine="python" because the exact delimiter
+        # was unconfirmed -- but tested against a real extract
+        # (Zensar_GL_Daily_Rates_Extract.txt), that sniffer mis-detects the
+        # delimiter as a plain space (splitting "From Currency" apart)
+        # instead of the real "|" pipe, silently producing garbage columns
+        # and causing every row to be skipped. The real delimiter is
+        # confirmed "|" -- use it explicitly rather than sniffing.
+        df = pd.read_csv(local_path, header=cfg["header_row"], sep="|")
     else:
         df = pd.read_excel(local_path, sheet_name=cfg["sheet_name"], header=cfg["header_row"])
     df.columns = [str(c).strip() for c in df.columns]
