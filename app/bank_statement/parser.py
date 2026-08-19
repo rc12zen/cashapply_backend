@@ -315,9 +315,46 @@ def _row_account(value, registered: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 def _read_cell(filepath: str, cfg: dict, row: int, col: int) -> str:
-    """Read a single cell from the file (metadata position, 0-indexed)."""
+    """Read a single cell from the file (metadata position, 0-indexed).
+
+    Handles .csv/.txt, .xls and .xlsx. The CSV branch is NOT optional garnish:
+    a `cell`-type field is how a recipe picks up statement metadata that sits
+    ABOVE the table -- the account number, currency or bank name in a preamble
+    block -- and that layout is just as common in a .csv export as in a
+    spreadsheet.
+
+    Before this branch existed, everything that was not .xls fell through to
+    openpyxl's load_workbook(), so pointing a cell field at a CSV failed with
+    "openpyxl does not support .csv file format", naming a library the user
+    never chose and giving no hint that the real problem was the file format.
+    """
     source = cfg.get("source", {})
     sheet_cfg = source.get("sheet", {})
+
+    if filepath.lower().endswith((".csv", ".txt")):
+        # No sheets in a CSV -- sheet_cfg is meaningless here, and the position
+        # is simply the Nth field of the Nth line. Delimiter and encoding are
+        # resolved exactly as the extractor resolves them, so a cell field and
+        # a column field can never disagree about where the columns are.
+        import csv as _csv
+
+        from .extractor.csv_extractor import resolve_encodings, sniff_dialect
+
+        declared_delim = source.get("delimiter", "auto")
+        for enc in resolve_encodings(source.get("encoding", "auto")):
+            try:
+                delim = (
+                    sniff_dialect(filepath, enc) if declared_delim == "auto"
+                    else declared_delim
+                )
+                with open(filepath, encoding=enc, newline="") as f:
+                    for r, values in enumerate(_csv.reader(f, delimiter=delim)):
+                        if r == row:
+                            return values[col].strip() if col < len(values) else ""
+                return ""   # requested row is past the end of the file
+            except UnicodeDecodeError:
+                continue    # wrong encoding -- try the next candidate
+        return ""
 
     if filepath.lower().endswith(".xls"):
         try:

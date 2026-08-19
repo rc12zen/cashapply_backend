@@ -66,23 +66,43 @@ class FileSnapshot:
                 pass
 
         elif ext in ("csv", "txt"):
-            try:
-                import csv as _csv
-                with open(filepath, encoding="utf-8", errors="replace", newline="") as f:
-                    sample = f.read(4096)
+            # Delimiter and encoding come from the same helpers the extractor
+            # uses (extractor/csv_extractor.py), so the snapshot sees the file
+            # split exactly the way extraction will.
+            #
+            # This used to sniff inline and trust the result. csv.Sniffer can
+            # return "\r" on a ragged header block with CRLF line endings, which
+            # csv.reader then rejects -- and because this branch swallows
+            # exceptions, that produced an EMPTY snapshot instead of an error.
+            # No cells means the account locator finds nothing, so the file
+            # simply looks unrecognised, for a reason pointing nowhere near the
+            # delimiter. sniff_dialect() validates the result, and the encoding
+            # is now tried properly rather than forced through utf-8 with
+            # errors="replace" (which turned latin-1 names into mojibake).
+            import csv as _csv
+
+            from .extractor.csv_extractor import resolve_encodings, sniff_dialect
+
+            for enc in resolve_encodings("auto"):
                 try:
-                    delim = _csv.Sniffer().sniff(sample).delimiter
-                except _csv.Error:
-                    delim = ","
-                with open(filepath, encoding="utf-8", errors="replace", newline="") as f:
-                    for r, row in enumerate(_csv.reader(f, delimiter=delim)):
-                        if r >= _MAX_ROWS:
-                            break
-                        for c, val in enumerate(row[:_MAX_COLS]):
-                            cells[("sheet1", r, c)] = str(val).strip()
-                sheets = ["Sheet1"]
-            except Exception:
-                pass
+                    delim = sniff_dialect(filepath, enc)
+                    with open(filepath, encoding=enc, newline="") as f:
+                        for r, row in enumerate(_csv.reader(f, delimiter=delim)):
+                            if r >= _MAX_ROWS:
+                                break
+                            for c, val in enumerate(row[:_MAX_COLS]):
+                                cells[("sheet1", r, c)] = str(val).strip()
+                    sheets = ["Sheet1"]
+                    break
+                except UnicodeDecodeError:
+                    # Wrong encoding, and the read may have stopped part-way --
+                    # discard what it collected before retrying, or the snapshot
+                    # would mix rows from two decodings.
+                    cells.clear()
+                    continue
+                except Exception:
+                    cells.clear()
+                    break
 
         return cls(filepath=filepath, filename=filename, extension=ext,
                    sheet_names=sheets, cells=cells)

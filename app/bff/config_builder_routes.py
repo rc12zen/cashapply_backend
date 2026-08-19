@@ -254,16 +254,41 @@ def builder_raw_preview(filename: str, db: Session = Depends(get_db),
             raise AppError(ErrorCode.CONFIG_FILE_UNREADABLE,
                             detail=f"'{filename}' doesn't look like a valid legacy Excel (.xls) file ({e.__class__.__name__})")
     elif ext in ("csv", "txt"):
-        try:
-            import csv
-            with open(local_path, encoding="utf-8", errors="replace") as f:
-                rows = [[str(v).strip() for v in row[:MAX_COLS]]
-                        for i, row in enumerate(csv.reader(f)) if i < MAX_ROWS]
-            sheets.append({"name": "Sheet1", "rows": _trim_trailing_empty_cols(rows)})
-        except Exception as e:
-            logger.exception("raw-preview: failed to read csv %s", filename)
+        # This preview MUST split the file exactly as extraction will, so it
+        # reuses the extractor's own delimiter sniffing and encoding fallback
+        # (bank_statement/extractor/csv_extractor.py) instead of assuming
+        # comma + utf-8.
+        #
+        # Both were hardcoded here previously, which meant a semicolon-delimited
+        # or latin-1 statement rendered as ONE mangled column in the wizard grid
+        # while extracting perfectly well. That is not merely cosmetic: the
+        # wizard asks the user to click a row to mark the header (and now the
+        # sub-header), and neither can be picked out of a single joined column.
+        import csv
+        from ..bank_statement.extractor.csv_extractor import resolve_encodings, sniff_dialect
+
+        rows = None
+        for enc in resolve_encodings("auto"):
+            try:
+                delim = sniff_dialect(local_path, enc)
+                with open(local_path, encoding=enc, newline="") as f:
+                    rows = [[str(v).strip() for v in row[:MAX_COLS]]
+                            for i, row in enumerate(csv.reader(f, delimiter=delim))
+                            if i < MAX_ROWS]
+                break
+            except UnicodeDecodeError:
+                continue   # wrong encoding for this file -- try the next candidate
+            except Exception as e:
+                logger.exception("raw-preview: failed to read csv %s", filename)
+                raise AppError(ErrorCode.CONFIG_FILE_UNREADABLE,
+                                detail=f"'{filename}' could not be parsed as CSV ({e.__class__.__name__})")
+
+        if rows is None:
+            logger.error("raw-preview: could not decode csv %s with any known encoding", filename)
             raise AppError(ErrorCode.CONFIG_FILE_UNREADABLE,
-                            detail=f"'{filename}' could not be parsed as CSV ({e.__class__.__name__})")
+                            detail=f"'{filename}' could not be read as text (tried UTF-8 and Latin-1)")
+
+        sheets.append({"name": "Sheet1", "rows": _trim_trailing_empty_cols(rows)})
     else:
         raise AppError(ErrorCode.CONFIG_FILE_TYPE_UNSUPPORTED, detail=f"'.{ext}' extension")
 
