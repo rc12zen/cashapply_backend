@@ -291,6 +291,37 @@ class Settings(BaseSettings):
     # single run. Keep this at/under your DB connection pool's capacity.
     RULE_ENGINE_MAX_WORKERS: int = 8
 
+    # ── API payload encryption (VAPT remediation) ────────────────────────────
+    # Encrypts JSON request and response BODIES with AES-256-GCM under a key
+    # shared with the frontend build. See app/common/crypto/ for the format,
+    # the key ring, and what is deliberately left unencrypted (file
+    # downloads, uploads, health probes).
+    #
+    # Enabled by default in every environment EXCEPT APP_ENV=local, so a
+    # deployment is encrypted without anyone remembering a flag, while local
+    # curl/pytest workflows and the reopen test guide keep working untouched.
+    # Set this explicitly to override in either direction -- true to
+    # reproduce a UAT decryption problem locally, false as an
+    # incident-response escape hatch (startup logs loudly when the override
+    # is what disabled it). None means "decide from APP_ENV".
+    API_ENCRYPTION_ENABLED: bool | None = None
+
+    # 32 bytes, base64-encoded -- mint with `python -m scripts.gen_api_key`.
+    # MUST match NEXT_PUBLIC_API_ENCRYPTION_KEY in the frontend build for
+    # this environment. Use a DIFFERENT key per environment so a key lifted
+    # from a UAT bundle decrypts nothing in prod.
+    #
+    # There is deliberately no key-ID setting: each payload carries a short
+    # fingerprint derived from the key itself, so a key is its own identity
+    # and there is nothing to keep in sync. See crypto/envelope.py.
+    API_ENCRYPTION_KEY: str = ""
+
+    # Set only while rotating a key, then remove. The backend keeps opening
+    # payloads sealed with the previous key while the frontend is rebuilt
+    # with the new one, which turns a rotation into three unhurried deploys
+    # instead of one synchronised deploy -- see crypto/keyring.py.
+    API_ENCRYPTION_KEY_PREVIOUS: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:
