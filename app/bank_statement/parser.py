@@ -135,6 +135,30 @@ def _excel_serial_to_date(n: float) -> Optional[dt.datetime]:
         return None
 
 
+def strip_time_component(s: str) -> str:
+    """
+    "2026-01-06 00:00:00" / "2026-01-06T00:00:00" -> "2026-01-06"; anything else
+    unchanged.
+
+    Datetime-looking strings are extremely common in practice: pandas renders a
+    real Excel/CSV date cell as a Timestamp, and str() of that always carries a
+    00:00:00 tail. A date FORMAT like %Y-%m-%d cannot parse that tail, so the
+    tail has to come off before the format is tried.
+
+    PUBLIC, and shared with date_inference.py on purpose. That module decides
+    which format to store in a recipe by testing candidates against real sample
+    values, so if it were stricter than this parser it would report "no known
+    format parses these" for values the parser reads perfectly -- which is
+    exactly the bug this helper was extracted to fix. Keep the two using one
+    implementation.
+
+    The guard matters: the pattern requires a time-looking token after the
+    separator, so a value that merely CONTAINS a space (never a valid date
+    format here, but cheap to be safe about) is not truncated blindly.
+    """
+    return re.split(r"[ T]", s, maxsplit=1)[0] if re.search(r"[ T]\d{1,2}:", s) else s
+
+
 def _parse_date(value, date_formats: list) -> Optional[dt.datetime]:
     if isinstance(value, pd.Timestamp):
         return value.to_pydatetime()
@@ -154,7 +178,7 @@ def _parse_date(value, date_formats: list) -> Optional[dt.datetime]:
         return None
 
     # Trim a trailing time component ("2026-01-06 00:00:00" / "...T00:00:00")
-    s_core = re.split(r"[ T]", s, maxsplit=1)[0] if re.search(r"[ T]\d{1,2}:", s) else s
+    s_core = strip_time_component(s)
 
     for fmt_key in date_formats:
         for candidate in (s, s_core):

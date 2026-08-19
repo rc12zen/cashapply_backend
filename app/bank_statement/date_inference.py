@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from .parser import _FORMAT_MAP
+from .parser import _FORMAT_MAP, strip_time_component
 
 # Candidate formats to test, unambiguous families first so that when several
 # survive AND agree on every date, the canonical pick is the least surprising
@@ -83,11 +83,29 @@ def infer_date_format(samples: list[str]) -> dict:
         seq: list[dt.date] = []
         ok = True
         for v in vals:
-            try:
-                seq.append(dt.datetime.strptime(v, fmt).date())
-            except ValueError:
+            # Raw value first, then with a trailing time component removed --
+            # the same two candidates, in the same order, that parser._parse_date
+            # tries at runtime.
+            #
+            # Without the second candidate this detector was STRICTER than the
+            # parser it exists to predict: a column of pandas-rendered dates
+            # ("2026-05-01 00:00:00", which is simply how a real Excel/CSV date
+            # cell stringifies) killed every candidate and reported "none of the
+            # known date formats parse every sample" -- while ingestion read
+            # those same values perfectly as YYYY-MM-DD. Reporting a format as
+            # unrecognised when the engine handles it is worse than a missing
+            # format: it sends someone off to re-check a correctly-mapped column.
+            parsed = None
+            for candidate in (v, strip_time_component(v)):
+                try:
+                    parsed = dt.datetime.strptime(candidate, fmt).date()
+                    break
+                except ValueError:
+                    continue
+            if parsed is None:
                 ok = False
                 break
+            seq.append(parsed)
         if ok:
             surviving.append((key, tuple(seq)))
 
