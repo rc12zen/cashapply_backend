@@ -357,6 +357,35 @@ def reject_row(
             "current_version": r.version,
         }
 
+    # ── GATE: a row whose invoice references already posted to Oracle cannot be
+    # rejected. This is the server-side half of actions_registry's `rejectable`
+    # condition — see that function for the incident this closes.
+    #
+    # In short: rejecting a posted row cannot undo the Oracle application, but it
+    # DOES release the internal ledger claim (below), leaving our records
+    # advertising an invoice Oracle has already settled. And because
+    # reference_status == "success" outranks hitl_status in _category_for_row()'s
+    # precedence, the row keeps displaying as processed — so the rejection is
+    # invisible, Reopen is not offered, and the row ends up with no actions at
+    # all. Reversing a real posting needs an Oracle-side reversal or a credit
+    # memo; neither is something this application does.
+    #
+    # Enforced here and not only in the action registry, for the same reason
+    # approve_row() gates server-side: a hidden button is a UI nicety, not
+    # enforcement — a direct API call, a stale page, or a bulk endpoint would
+    # otherwise walk straight past it.
+    if r.reference_status == "success":
+        return {
+            "id": r.id,
+            "error": "already_posted",
+            "message": (
+                f"Row {r.id} has already been approved and its invoice reference(s) "
+                f"posted to Oracle successfully, so it can no longer be rejected — "
+                f"rejecting it here would not reverse anything in Oracle. A posted "
+                f"receipt has to be corrected in Oracle (reversal or credit memo)."
+            ),
+        }
+
     # Capture where this row was RIGHT BEFORE rejection so reopen_row() can put
     # it back there (see LineItem.pre_reject_state). current_state is an Enum;
     # store its plain value string. Doubles as the accurate history from_state

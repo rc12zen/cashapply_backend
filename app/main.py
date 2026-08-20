@@ -9,6 +9,8 @@ handler are free to change; the URL + method must not.
 UPDATED — auth / RBAC / duplicate-detection / audit-logging integration.
 See cashapply-platform-hardening-design.md for the full design.
 """
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -21,6 +23,9 @@ from .aging.watcher import start_watcher
 from .gl_rates.watcher import start_gl_rates_watcher
 from .common.errors import register_exception_handlers
 from .common.request_context import RequestIdMiddleware
+from .common.crypto import envelope as crypto_envelope
+from .common.crypto import keyring as crypto_keyring
+from .common.crypto.middleware import ApiEncryptionMiddleware
 from .bff import (
     run_routes, results_routes, hitl_routes, config_routes, filters_routes,
     executive_summary, config_builder_routes, auth_routes, admin_routes,
@@ -57,6 +62,52 @@ app.add_middleware(
 # reverse registration order) and still sees every request, including ones
 # CORS would otherwise short-circuit as a preflight.
 app.add_middleware(RequestIdMiddleware)
+
+# ── API payload encryption (VAPT remediation) ────────────────────────────────
+# Encrypts JSON response bodies and decrypts JSON request bodies with
+# AES-256-GCM. See app/common/crypto/ for the wire format, the key ring, and
+# the list of things deliberately left readable (file downloads, multipart
+# uploads, /health, the OpenAPI docs).
+#
+# Registered LAST, so it sits innermost in the middleware stack (Starlette
+# applies middleware in reverse registration order). That position is
+# deliberate: ExceptionMiddleware lives inside all user middleware, so being
+# innermost is what lets deliberate error responses -- AppError,
+# HTTPException, RequestValidationError from common/errors.py -- get encrypted
+# along with successful ones. Registered any further out and every error body
+# would leave as plaintext.
+#
+# No route, service, or schema knows this exists. Handlers still return plain
+# dicts and still receive plain parsed bodies.
+_encryption_on = crypto_keyring.encryption_enabled(_settings)
+if _encryption_on:
+    # Built here rather than lazily per-request so a missing/malformed key
+    # stops the process from starting, with a message naming the setting to
+    # fix, instead of booting healthy and then failing every single request.
+    _api_keyring = crypto_keyring.load_keyring(_settings)
+    app.add_middleware(ApiEncryptionMiddleware, keyring=_api_keyring)
+    logging.getLogger("uvicorn.error").info(
+        "API payload encryption ENABLED (sealing with key %s, accepting key(s) %s)",
+        crypto_envelope.fingerprint_hex(_api_keyring.current_fingerprint),
+        ", ".join(_api_keyring.accepted_fingerprints),
+    )
+else:
+    # Encryption is now on by default in EVERY environment, so reaching this
+    # branch always means API_ENCRYPTION_ENABLED was explicitly set false --
+    # there is no longer an APP_ENV=local path that lands here implicitly.
+    # A legitimate escape hatch, and exactly the kind of setting that gets left
+    # behind, so a deployed environment logs it as an error rather than in
+    # passing. Locally it is expected (plaintext curl/pytest), so it is info.
+    _log = logging.getLogger("uvicorn.error")
+    _msg = (
+        "API payload encryption is DISABLED (APP_ENV=%s) because "
+        "API_ENCRYPTION_ENABLED was explicitly set false. Request and response "
+        "bodies are readable JSON. Remove that setting to restore the default."
+    )
+    if _settings.APP_ENV == "local":
+        _log.info(_msg, _settings.APP_ENV)
+    else:
+        _log.error(_msg, _settings.APP_ENV)
 
 # PATCH: the generic per-request ActivityLogMiddleware (design doc §6) has
 # been REMOVED — it wrote one ActivityLog row for every single GET/POST/PUT/
