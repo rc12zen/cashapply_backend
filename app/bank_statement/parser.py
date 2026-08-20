@@ -135,6 +135,30 @@ def _excel_serial_to_date(n: float) -> Optional[dt.datetime]:
         return None
 
 
+def strip_time_component(s: str) -> str:
+    """
+    "2026-01-06 00:00:00" / "2026-01-06T00:00:00" -> "2026-01-06"; anything else
+    unchanged.
+
+    Datetime-looking strings are extremely common in practice: pandas renders a
+    real Excel/CSV date cell as a Timestamp, and str() of that always carries a
+    00:00:00 tail. A date FORMAT like %Y-%m-%d cannot parse that tail, so the
+    tail has to come off before the format is tried.
+
+    PUBLIC, and shared with date_inference.py on purpose. That module decides
+    which format to store in a recipe by testing candidates against real sample
+    values, so if it were stricter than this parser it would report "no known
+    format parses these" for values the parser reads perfectly -- which is
+    exactly the bug this helper was extracted to fix. Keep the two using one
+    implementation.
+
+    The guard matters: the pattern requires a time-looking token after the
+    separator, so a value that merely CONTAINS a space (never a valid date
+    format here, but cheap to be safe about) is not truncated blindly.
+    """
+    return re.split(r"[ T]", s, maxsplit=1)[0] if re.search(r"[ T]\d{1,2}:", s) else s
+
+
 def _parse_date(value, date_formats: list) -> Optional[dt.datetime]:
     if isinstance(value, pd.Timestamp):
         return value.to_pydatetime()
@@ -154,7 +178,7 @@ def _parse_date(value, date_formats: list) -> Optional[dt.datetime]:
         return None
 
     # Trim a trailing time component ("2026-01-06 00:00:00" / "...T00:00:00")
-    s_core = re.split(r"[ T]", s, maxsplit=1)[0] if re.search(r"[ T]\d{1,2}:", s) else s
+    s_core = strip_time_component(s)
 
     for fmt_key in date_formats:
         for candidate in (s, s_core):
@@ -315,9 +339,46 @@ def _row_account(value, registered: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 def _read_cell(filepath: str, cfg: dict, row: int, col: int) -> str:
-    """Read a single cell from the file (metadata position, 0-indexed)."""
+    """Read a single cell from the file (metadata position, 0-indexed).
+
+    Handles .csv/.txt, .xls and .xlsx. The CSV branch is NOT optional garnish:
+    a `cell`-type field is how a recipe picks up statement metadata that sits
+    ABOVE the table -- the account number, currency or bank name in a preamble
+    block -- and that layout is just as common in a .csv export as in a
+    spreadsheet.
+
+    Before this branch existed, everything that was not .xls fell through to
+    openpyxl's load_workbook(), so pointing a cell field at a CSV failed with
+    "openpyxl does not support .csv file format", naming a library the user
+    never chose and giving no hint that the real problem was the file format.
+    """
     source = cfg.get("source", {})
     sheet_cfg = source.get("sheet", {})
+
+    if filepath.lower().endswith((".csv", ".txt")):
+        # No sheets in a CSV -- sheet_cfg is meaningless here, and the position
+        # is simply the Nth field of the Nth line. Delimiter and encoding are
+        # resolved exactly as the extractor resolves them, so a cell field and
+        # a column field can never disagree about where the columns are.
+        import csv as _csv
+
+        from .extractor.csv_extractor import resolve_encodings, sniff_dialect
+
+        declared_delim = source.get("delimiter", "auto")
+        for enc in resolve_encodings(source.get("encoding", "auto")):
+            try:
+                delim = (
+                    sniff_dialect(filepath, enc) if declared_delim == "auto"
+                    else declared_delim
+                )
+                with open(filepath, encoding=enc, newline="") as f:
+                    for r, values in enumerate(_csv.reader(f, delimiter=delim)):
+                        if r == row:
+                            return values[col].strip() if col < len(values) else ""
+                return ""   # requested row is past the end of the file
+            except UnicodeDecodeError:
+                continue    # wrong encoding -- try the next candidate
+        return ""
 
     if filepath.lower().endswith(".xls"):
         try:
