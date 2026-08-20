@@ -91,17 +91,23 @@ if _encryption_on:
         crypto_envelope.fingerprint_hex(_api_keyring.current_fingerprint),
         ", ".join(_api_keyring.accepted_fingerprints),
     )
-elif _settings.APP_ENV != "local":
-    # Off in a deployed environment can only happen via an explicit override,
-    # since the default is on everywhere but local. That is a legitimate
-    # incident-response escape hatch and also exactly the kind of setting that
-    # gets left behind, so it is logged as an error rather than in passing.
-    logging.getLogger("uvicorn.error").error(
-        "API payload encryption is DISABLED while APP_ENV=%s, because "
-        "API_ENCRYPTION_ENABLED was explicitly set false. API responses are "
-        "readable JSON. Unset it to restore the secure default.",
-        _settings.APP_ENV,
+else:
+    # Encryption is now on by default in EVERY environment, so reaching this
+    # branch always means API_ENCRYPTION_ENABLED was explicitly set false --
+    # there is no longer an APP_ENV=local path that lands here implicitly.
+    # A legitimate escape hatch, and exactly the kind of setting that gets left
+    # behind, so a deployed environment logs it as an error rather than in
+    # passing. Locally it is expected (plaintext curl/pytest), so it is info.
+    _log = logging.getLogger("uvicorn.error")
+    _msg = (
+        "API payload encryption is DISABLED (APP_ENV=%s) because "
+        "API_ENCRYPTION_ENABLED was explicitly set false. Request and response "
+        "bodies are readable JSON. Remove that setting to restore the default."
     )
+    if _settings.APP_ENV == "local":
+        _log.info(_msg, _settings.APP_ENV)
+    else:
+        _log.error(_msg, _settings.APP_ENV)
 
 # PATCH: the generic per-request ActivityLogMiddleware (design doc §6) has
 # been REMOVED — it wrote one ActivityLog row for every single GET/POST/PUT/

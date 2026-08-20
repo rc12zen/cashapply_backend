@@ -108,16 +108,27 @@ viable. It is not a weakened boundary: the finding concerns data being
 
 ## Configuration
 
-Encryption is **on by default in every environment except `APP_ENV=local`**, so
-a deployment is encrypted without anyone remembering a flag.
+Encryption is **on by default in every environment, local included** — local
+used to be the exception, which meant the one environment everyone iterates in
+was the one not exercising the code path.
+
+`API_ENCRYPTION_KEY` is **required**, with no in-code default: a key committed
+to the repository would not be a secret, and every environment left on it would
+share one. A ready-to-use value ships in `backend.env.local.example` — copy it
+into `.env` for local work. With encryption on and no key set, **startup fails**
+with a message naming the setting, rather than booting and failing every request.
 
 **Backend** (`.env`)
 
 ```
-API_ENCRYPTION_KEY=<base64, 32 bytes>     # required when enabled
-# API_ENCRYPTION_ENABLED=true             # override; only needed to force it ON locally
+API_ENCRYPTION_KEY=<base64, 32 bytes>     # required
+# API_ENCRYPTION_ENABLED=false            # opt out (plaintext curl/pytest)
 # API_ENCRYPTION_KEY_PREVIOUS=            # during rotation only
 ```
+
+> Use a **distinct key per environment**, so a key lifted from a UAT bundle
+> decrypts nothing in prod. Do not reuse the sample value from
+> `backend.env.local.example` for UAT or prod — it is in version control.
 
 **Frontend** (`.env.local` / `.env.uat`)
 
@@ -188,9 +199,10 @@ It reads keys from this checkout's own settings by default, so no key needs
 pasting into a shell (and into shell history). It also reports when a payload
 was never encrypted at all, which is an answer rather than a failure.
 
-To reproduce a UAT decryption problem locally, set `API_ENCRYPTION_ENABLED=true`
-with a key and restart. Local development is otherwise plaintext, so existing
-curl scripts and test guides are unaffected.
+Local development is now encrypted like every other environment, so a decryption
+bug shows up where you are already working rather than first appearing in UAT.
+For plaintext work — existing curl scripts, pytest, the reopen test guide — set
+`API_ENCRYPTION_ENABLED=false` and restart.
 
 ---
 

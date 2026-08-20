@@ -297,19 +297,36 @@ class Settings(BaseSettings):
     # the key ring, and what is deliberately left unencrypted (file
     # downloads, uploads, health probes).
     #
-    # Enabled by default in every environment EXCEPT APP_ENV=local, so a
-    # deployment is encrypted without anyone remembering a flag, while local
-    # curl/pytest workflows and the reopen test guide keep working untouched.
-    # Set this explicitly to override in either direction -- true to
-    # reproduce a UAT decryption problem locally, false as an
-    # incident-response escape hatch (startup logs loudly when the override
-    # is what disabled it). None means "decide from APP_ENV".
-    API_ENCRYPTION_ENABLED: bool | None = None
+    # ON by default in EVERY environment, local included. Encryption is the
+    # behaviour you get by saying nothing; turning it off is the thing that
+    # takes a deliberate act.
+    #
+    # Set API_ENCRYPTION_ENABLED=false in .env to disable it -- needed for
+    # plaintext curl/pytest work and the reopen test guide, and available as
+    # an incident-response escape hatch in a deployed environment. Startup
+    # logs loudly whenever this is what turned encryption off (see main.py),
+    # because it is exactly the kind of flag that gets left behind.
+    #
+    # This used to default to None, meaning "on unless APP_ENV=local". That
+    # made local silently different from every other environment, which is
+    # how a decryption bug reaches UAT undetected. Local now behaves like
+    # production until someone opts out.
+    API_ENCRYPTION_ENABLED: bool = True
 
     # 32 bytes, base64-encoded -- mint with `python -m scripts.gen_api_key`.
     # MUST match NEXT_PUBLIC_API_ENCRYPTION_KEY in the frontend build for
-    # this environment. Use a DIFFERENT key per environment so a key lifted
-    # from a UAT bundle decrypts nothing in prod.
+    # this environment.
+    #
+    # REQUIRED, since encryption is on by default. Deliberately has no
+    # in-code default: a key committed to this repository would not be a
+    # secret, and every environment that did not override it would silently
+    # share one -- so a key lifted from any frontend bundle would decrypt all
+    # of them. A ready-to-use value ships in backend.env.local.example
+    # instead; copy it into .env for local work, and mint a distinct one per
+    # deployed environment.
+    #
+    # With no key set, startup FAILS with a message naming this setting (see
+    # crypto/keyring.py) rather than booting and 500-ing on every request.
     #
     # There is deliberately no key-ID setting: each payload carries a short
     # fingerprint derived from the key itself, so a key is its own identity
@@ -321,6 +338,7 @@ class Settings(BaseSettings):
     # with the new one, which turns a rotation into three unhurried deploys
     # instead of one synchronised deploy -- see crypto/keyring.py.
     API_ENCRYPTION_KEY_PREVIOUS: str = ""
+
 
 
 @lru_cache

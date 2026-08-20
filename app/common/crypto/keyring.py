@@ -43,6 +43,13 @@ then decrypts nothing in prod. This costs nothing to arrange (the key is just
 another env var, and .env is already per-environment) and removes the worst
 version of a leak.
 
+There is deliberately NO in-code default key. One would make a fresh checkout
+boot with zero setup, but it would sit in version control -- so it would not be
+a secret, and every environment that had not overridden it would share it,
+which is precisely the property this section exists to avoid. A ready-to-use
+value lives in backend.env.local.example instead: copy-paste convenience for
+local work, without the code claiming a key it cannot keep.
+
 FAILING AT STARTUP, NOT AT THE FIRST REQUEST
 --------------------------------------------
 load_keyring() raises if encryption is enabled and the key is missing,
@@ -50,6 +57,11 @@ malformed, or the wrong length. main.py calls it during startup precisely so a
 misconfigured deployment refuses to boot with an explicit message, rather than
 starting healthily and then 500-ing on every request with something opaque. A
 key problem is a deployment problem; it should look like one.
+
+Because encryption is now ON by default everywhere (see encryption_enabled),
+this is also what a brand-new checkout hits: no .env, no key, and a startup
+error naming API_ENCRYPTION_KEY. That is the intended first experience -- the
+alternative is a silent fallback that looks configured and is not.
 """
 from __future__ import annotations
 
@@ -99,23 +111,19 @@ def encryption_enabled(settings) -> bool:
     """
     Whether to encrypt API payloads in this environment.
 
-    Default: on everywhere EXCEPT APP_ENV=local. Local development stays
-    plaintext so curl, pytest, and the test guides keep working untouched,
-    while every deployed environment is encrypted without anyone having to
-    remember to set a flag -- the safe default is the one you get by saying
-    nothing.
+    On unless API_ENCRYPTION_ENABLED is explicitly false -- in EVERY
+    environment, local included. Encryption is what you get by saying
+    nothing; disabling it takes a deliberate act, and startup logs loudly
+    when that is what happened (see main.py).
 
-    API_ENCRYPTION_ENABLED overrides that in EITHER direction when set
-    explicitly, which is what makes a UAT-only decryption bug reproducible
-    locally: set it true, restart, and local behaves like UAT. It can also
-    force encryption off in a deployed environment, which is a real
-    incident-response escape hatch and equally a foot-gun -- startup logs it
-    loudly when the override is what turned encryption off (see main.py).
+    This used to read "on unless APP_ENV=local", which left local silently
+    unencrypted. That is how a decryption bug reaches UAT undetected: the
+    one environment where anyone iterates was the one environment not
+    exercising the code path. Setting API_ENCRYPTION_ENABLED=false is still
+    there for plaintext curl/pytest work -- it is just opt-out now rather
+    than the default.
     """
-    override = getattr(settings, "API_ENCRYPTION_ENABLED", None)
-    if override is not None:
-        return bool(override)
-    return settings.APP_ENV != "local"
+    return bool(getattr(settings, "API_ENCRYPTION_ENABLED", True))
 
 
 def _decode_key(raw: str, setting_name: str) -> bytes:
