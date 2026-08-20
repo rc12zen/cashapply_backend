@@ -32,6 +32,39 @@ def _cond_not_rejected(r: LineItem) -> bool:
     return r.hitl_status != "rejected"
 
 
+def _cond_rejectable(r: LineItem) -> bool:
+    """
+    Reject is offered only while there is still something to reject.
+
+    Not already rejected (the old `not_rejected` rule), AND the row's invoice
+    references have NOT posted successfully to Oracle.
+
+    WHY THE SECOND HALF EXISTS -- a real incident, 2026-08-18:
+    Reject had no category or state gate of any kind, so the button appeared on
+    a `processed` row. Rejecting one did three harmful things and no useful one:
+
+      1. It could not undo the Oracle posting. The references are applied in
+         Oracle and this system has no reversal path, so the cash stayed
+         applied while our row claimed to be rejected.
+      2. reject_row() calls release_applications(), freeing the internal ledger
+         claim -- so our ledger advertised an invoice as available that Oracle
+         had already settled. Another bank row could then be mapped onto it.
+      3. The row became unreachable. `reference_status == "success"` outranks
+         `hitl_status == "rejected"` in _category_for_row()'s precedence, so it
+         still displayed as processed, never appeared in the Rejected bucket,
+         and Reopen (gated to rejected/overpayment_parked) was not offered.
+         Zero actions available.
+
+    A genuinely wrong posted receipt needs an Oracle-side reversal or a credit
+    memo, neither of which this app performs. Hiding Reject is therefore the
+    honest outcome -- see hitl/service.py's reject_row(), which enforces the
+    same rule server-side rather than trusting this to be a UI-only gate.
+    """
+    if r.hitl_status == "rejected":
+        return False
+    return r.reference_status != "success"
+
+
 def _cond_reference_status_failed(r: LineItem) -> bool:
     return r.reference_status == "failed"
 
@@ -110,6 +143,11 @@ def _cond_settlement_override_eligible(r: LineItem) -> bool:
 # code — see db/models.py's ActionDefinition docstring for why.
 CONDITION_CHECKS = {
     "not_rejected": _cond_not_rejected,
+    # Reject's actual gate. `not_rejected` is kept registered because older
+    # ActionDefinition rows in a database that has not been re-seeded still
+    # reference it by name -- removing the key would make Reject vanish
+    # entirely on those until seed_actions.py runs.
+    "rejectable": _cond_rejectable,
     "reference_status_failed": _cond_reference_status_failed,
     "not_processed": _cond_not_already_mapped_terminal,
     "receipt_eligibility_undecided": _cond_receipt_eligibility_undecided,
