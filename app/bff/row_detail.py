@@ -141,14 +141,18 @@ def _build_shortage(r: LineItem) -> dict | None:
     just the arithmetic plus whatever rule_engine/shortage_reason.py worked
     out at analysis time.
 
-    Note `within_tolerance`. It distinguishes the two roads to R9c — a
-    shortfall that exceeded the 12% rule (always went to review) from one
+    Note `within_tolerance`. It used to distinguish the two roads to R9c --
+    a shortfall that exceeded the 12% rule (always went to review) from one
     that did NOT but was held back anyway because the customer holds open
-    credit memos. That second kind used to be auto-accepted silently, so
-    the SPOC seeing it for the first time deserves to be told why it is in
-    front of them rather than assuming the tolerance changed.
+    credit memos. That second kind now stays R9b instead (see evaluator.py
+    -- the shortfall percentage alone decides the category; credit memos
+    are a note, not a reroute), so this block now also renders for R9b when
+    there's a credit-memo diagnosis worth showing. The SPOC seeing an
+    ACCEPTED short payment still flagged with open credit memos deserves
+    the same explanation as before -- it just isn't blocking approval
+    anymore.
     """
-    if r.rule_id != "R9c":
+    if r.rule_id not in ("R9b", "R9c"):
         return None
 
     target = float(r.target_total or 0)

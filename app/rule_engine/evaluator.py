@@ -554,29 +554,30 @@ def evaluate_row(
 
     elif 0 < shortfall_pct <= short_payment_tolerance_pct:
         # Per business rule: 0-12% shortage is acceptable regardless of
-        # whether a remittance exists or explains the deduction.
+        # whether a remittance exists or explains the deduction. This ALWAYS
+        # stays R9b/acceptable_short_payment -- the shortfall percentage is
+        # what decides the group, full stop.
         #
-        # EXCEPT when the customer holds open credit memos. Then the
-        # shortfall has a plausible cause we can actually name, and letting
-        # it through on tolerance is how money leaks: the row is accepted
-        # with nobody looking, the credit memo stays OPEN in Oracle, and the
-        # customer can deduct the same amount again next month. Finance
-        # confirmed customers do deduct credit memos they already hold
-        # before paying, so this is the common case, not a corner case.
-        #
-        # Deliberately R9c and not a new rule id: the queue behaviour is
-        # identical, and reusing it leaves metrics.py's RULE_ID_TO_GROUP,
-        # the dashboard counts and every saved filter untouched. What the
-        # SPOC needs — WHICH credit memos, and whether one matches the
-        # shortfall exactly — is carried alongside, not encoded in the id.
+        # Open credit memos do NOT move the row to a different group. They
+        # used to (see git history) -- routing to conflict_exception/R9c
+        # whenever the customer held any open credit memo, on the reasoning
+        # that letting it through on tolerance risks the credit memo being
+        # left open in Oracle and deducted again later. That's a real risk
+        # worth surfacing, but overriding the CATEGORY for it was the wrong
+        # layer: it took a row that already resolved cleanly on the primary
+        # metric (shortfall %) and moved it into a different queue based on
+        # a secondary signal. Per business direction, the credit-memo
+        # situation is now carried as a note on the SAME R9b result instead
+        # -- visible to whoever reviews the row, without rerouting it.
         open_credit_memos = _credit_memos_for_match(input_, matched_invoices)
+        notes = ""
         if open_credit_memos:
             shortfall_amount = round(target_total - received_total, 2)
             available = round(sum(c.amount for c in open_credit_memos), 2)
             exact = [c for c in open_credit_memos if round(c.amount, 2) == shortfall_amount]
             # Only a SINGLE exact match is called out. Two credit memos of
             # the same amount is genuinely ambiguous, and summing subsets is
-            # never attempted — Assurant holds 164 open credit memos in one
+            # never attempted -- Assurant holds 164 open credit memos in one
             # OU, and some subset of 164 numbers fits almost any target, so
             # combination search would manufacture confident wrong answers.
             if len(exact) == 1:
@@ -589,19 +590,15 @@ def evaluate_row(
                     f"No single credit memo matches the shortfall exactly; "
                     f"{len(open_credit_memos)} open totalling {available}."
                 )
-            result = RuleResult(
-                "R9c", "UNEXPLAINED_SHORTAGE", "conflict_exception",
-                matched_invoices, target_total, received_total, shortfall_pct,
-                notes=(
-                    f"Short by {shortfall_amount} ({shortfall_pct:.1f}%), within the "
-                    f"{short_payment_tolerance_pct}% tolerance, but this customer holds "
-                    f"open credit memos — held for review instead of auto-accepted so "
-                    f"the credit memo is not left open to be claimed twice. {cause}"
-                ),
+            notes = (
+                f"Short by {shortfall_amount} ({shortfall_pct:.1f}%), within the "
+                f"{short_payment_tolerance_pct}% tolerance. This customer holds open "
+                f"credit memos -- accepted on tolerance as usual, but flagging so the "
+                f"credit memo isn't left open to be claimed twice. {cause}"
             )
-        else:
-            result = RuleResult("R9b", "ACCEPTABLE_SHORT_PAYMENT", "acceptable_short_payment",
-                                matched_invoices, target_total, received_total, shortfall_pct)
+        result = RuleResult("R9b", "ACCEPTABLE_SHORT_PAYMENT", "acceptable_short_payment",
+                            matched_invoices, target_total, received_total, shortfall_pct,
+                            notes=notes)
 
     else:
         result = RuleResult("R9c", "UNEXPLAINED_SHORTAGE", "conflict_exception",
