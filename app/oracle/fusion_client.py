@@ -54,10 +54,11 @@ Amount:
   ConversionRate when Case 2 applies -- this app never computes or sends
   a functional-currency amount.
 
-ReceiptNumber: CASHAPPLY-<ou_number>-<YYYYMMDD>-<line_item_id> -- no
-extra suffix (a previous version had an unexplained "-226" appended,
-confirmed via a live Oracle test to push real values over Oracle's
-30-character ReceiptNumber limit -- removed).
+ReceiptNumber: FAL-<ou_number>-<YYYYMMDD>-<line_item_id> -- "FAL" =
+Fusion Auto LockBox (previously "CASHAPPLY", renamed to match the
+product's new name). No extra suffix (a previous version had an
+unexplained "-226" appended, confirmed via a live Oracle test to push
+real values over Oracle's 30-character ReceiptNumber limit -- removed).
 """
 from __future__ import annotations
 
@@ -310,8 +311,12 @@ class OracleFusionClient:
 def _build_receipt_number(line_item: LineItem) -> str:
     """
     Generates the Oracle `ReceiptNumber` -- supplied by us, not Oracle.
-    Format: CASHAPPLY-<ou_number>-<YYYYMMDD>-<line_item_id>
-      e.g.  CASHAPPLY-111-20260604-1583
+    Format: FAL-<ou_number>-<YYYYMMDD>-<line_item_id>
+      e.g.  FAL-111-20260604-1583
+
+    "FAL" = Fusion Auto LockBox (previously "CASHAPPLY" -- renamed to
+    match the product's new name; the format/uniqueness scheme itself is
+    unchanged).
 
     Unique: <line_item_id> is LineItem.id, a DB auto-increment primary
     key -- globally unique for the table's lifetime, never reused.
@@ -327,7 +332,7 @@ def _build_receipt_number(line_item: LineItem) -> str:
     ou = line_item.ou_number or "UNK"
     date_source = line_item.statement_date or line_item.created_at
     date_str = date_source.strftime("%Y%m%d") if date_source else "00000000"
-    receipt_number = f"CASHAPPLY-{ou}-{date_str}-{line_item.id}"
+    receipt_number = f"FAL-{ou}-{date_str}-{line_item.id}"
     if len(receipt_number) > 30:
         logger.warning(
             "ReceiptNumber '%s' (%d chars) exceeds Oracle's 30-char limit -- "

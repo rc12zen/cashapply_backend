@@ -108,7 +108,8 @@ class _JumpChain:
         # deliberately NOT hardcoding a key file path, since none was given
         # and the whole point is this already works with default SSH auth.
         self._jump_client = paramiko.SSHClient()
-        self._jump_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self._jump_client.load_system_host_keys()
+        self._jump_client.set_missing_host_key_policy(paramiko.RejectPolicy())
         self._jump_client.connect(
             s.ORACLE_FILE_JUMP_HOST, username=s.ORACLE_FILE_JUMP_USER,
             look_for_keys=True, allow_agent=True, timeout=30,
@@ -126,7 +127,8 @@ class _JumpChain:
         )
 
         self._target_client = paramiko.SSHClient()
-        self._target_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self._target_client.load_system_host_keys()
+        self._target_client.set_missing_host_key_policy(paramiko.RejectPolicy())
         self._target_client.connect(
             s.ORACLE_FILE_REMOTE_HOST, username=s.ORACLE_FILE_REMOTE_USER,
             sock=channel, look_for_keys=True, allow_agent=True, timeout=30,
