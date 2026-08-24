@@ -12,15 +12,31 @@ On startup:
   1. Creates the watch folder if it doesn't exist.
   2. Scans for any existing eligible file → loads it immediately.
   3. Starts a background thread that polls every AGING_POLL_INTERVAL_SECONDS (30).
-     When a new file appears (detected by filename), it:
+     When a new or changed file appears, it:
        a. Reads the bytes.
        b. Saves to blob storage (aging-reports bucket).
        c. Creates/updates the SourceFile DB record.
        d. Calls refresh_aging_map() to reload the AgingMap in memory.
 
-"New" means a filename not seen in this process lifetime (we track a set of
-processed filenames). If the same filename appears again it is skipped —
-to force a reload, rename the file or use a different filename.
+PATCH — dedupe is now by (filename, mtime), not filename alone:
+Previously "new" meant "a filename not seen in this process lifetime" (a
+plain set of filenames). That meant a file re-dropped with the SAME
+filename but genuinely different/refreshed content was silently ignored
+forever, for the rest of that process's lifetime — confirmed as a real,
+live bug during the prod/UAT stand-up: the Oracle SFTP puller correctly
+re-downloaded a fresher xxzen_aging_report_excel.xls into this folder, but
+because a file with that exact name had already been processed once
+earlier in the same backend run, the watcher never touched it again and
+the UI kept showing the stale snapshot. Tracking (filename -> last-
+processed mtime) instead means a re-drop with a newer mtime is correctly
+treated as new, while a byte-for-byte re-drop with an unchanged mtime
+still isn't reprocessed pointlessly.
+
+Also exposes check_now(), a synchronous "check immediately" entry point
+for a manual "Check Now" action on the frontend (see
+bff/config_routes.py's /check-aging-watch-folder) — same underlying scan
+logic as the background loop, just triggered on demand instead of waiting
+for the next AGING_POLL_INTERVAL_SECONDS tick.
 
 SFTP: stub branch is included below; set AGING_SOURCE=sftp and fill in the
 SFTP_* env vars when ready. The rest of the pipeline is identical.
@@ -48,8 +64,11 @@ log = logging.getLogger(__name__)
 AGING_BUCKET = "aging-reports"
 ELIGIBLE_EXTENSIONS = {".xlsx", ".xls", ".csv"}
 
-# Filenames processed in this server lifetime — avoids re-processing same file.
-_processed: set[str] = set()
+# Filenames processed in this server lifetime, mapped to the mtime they were
+# processed at — a file reappearing with a NEWER mtime is reprocessed; the
+# same mtime is skipped (avoids redundant reloads on every poll tick for a
+# file that hasn't actually changed).
+_processed: dict[str, float] = {}
 _lock = threading.Lock()
 
 
@@ -63,7 +82,9 @@ def _get_watch_folder() -> Path:
 
 
 def _eligible_files(folder: Path) -> list[Path]:
-    """All files in folder with an eligible extension, sorted oldest-first."""
+    """All files in folder with an eligible extension, sorted oldest-first
+    (by mtime), so if several are genuinely new/changed in one scan, the
+    most recent one ends up processed last and therefore active."""
     files = [
         f for f in folder.iterdir()
         if f.is_file() and f.suffix.lower() in ELIGIBLE_EXTENSIONS
@@ -77,7 +98,7 @@ def _process_file(filepath: Path) -> bool:
     Returns True on success.
     """
     filename = filepath.name
-    log.info(f"[aging_watcher] Processing new aging file: {filename}")
+    log.info(f"[aging_watcher] Processing aging file: {filename}")
 
     try:
         data = filepath.read_bytes()
@@ -92,10 +113,8 @@ def _process_file(filepath: Path) -> bool:
         # skipped (not raised) to match this function's existing
         # log-and-return-False contract; see file_sniff.py for the exact
         # detection logic. The file itself is left untouched in the watch
-        # folder, so a corrected drop-in replacement with the same
-        # filename won't be picked up automatically (see this module's
-        # docstring: "same filename = skipped, rename to force a reload")
-        # -- whoever fixes it should drop it in under a new filename.
+        # folder — a corrected drop-in replacement with a NEWER mtime will
+        # still be picked up and retried on the next scan.
         mismatch = check_extension_mismatch(filename, data)
         if mismatch:
             log.error(f"[aging_watcher] Skipping '{filename}': {mismatch}")
@@ -164,21 +183,36 @@ def _process_file(filepath: Path) -> bool:
         return False
 
 
-def _scan_once(folder: Path) -> None:
-    """Check folder for any file not yet processed this session."""
+def _scan_once(folder: Path) -> list[str]:
+    """
+    Check folder for any file that's new or whose mtime has advanced since
+    it was last processed. Returns the list of filenames actually
+    (re)loaded this scan, so callers (e.g. the manual check_now() entry
+    point) can report what happened rather than just "done, maybe nothing".
+    """
+    reloaded: list[str] = []
     for filepath in _eligible_files(folder):
         fname = filepath.name
+        mtime = filepath.stat().st_mtime
+
         with _lock:
-            if fname in _processed:
+            last_seen = _processed.get(fname)
+            if last_seen is not None and mtime <= last_seen:
                 continue
-            # Mark as seen immediately so concurrent ticks don't double-process.
-            _processed.add(fname)
+            # Mark as seen immediately (at this mtime) so concurrent ticks
+            # don't double-process the same version of this file.
+            _processed[fname] = mtime
 
         success = _process_file(filepath)
-        if not success:
-            # Remove from set so next tick can retry.
+        if success:
+            reloaded.append(fname)
+        else:
+            # Roll back the recorded mtime so the next tick retries this
+            # exact version instead of treating a failed load as "handled".
             with _lock:
-                _processed.discard(fname)
+                _processed.pop(fname, None)
+
+    return reloaded
 
 
 def _watch_loop(folder: Path, interval: int) -> None:
@@ -217,3 +251,19 @@ def start_watcher() -> None:
     )
     thread.start()
     log.info("[aging_watcher] Background watcher thread started.")
+
+
+def check_now() -> dict:
+    """
+    Manual, synchronous "check the watch folder right now" entry point —
+    backs the frontend's "Check Now" button (see
+    bff/config_routes.py POST /check-aging-watch-folder), rather than
+    waiting for the next background poll tick.
+
+    Returns a small summary rather than nothing, so the API/UI can tell the
+    user whether anything actually changed:
+        {"checked": True, "reloaded": [...filenames...]}
+    """
+    folder = _get_watch_folder()
+    reloaded = _scan_once(folder)
+    return {"checked": True, "reloaded": reloaded}

@@ -35,6 +35,7 @@ from ..aging.parser import refresh_aging_map
 from ..aging.preview import preview_aging_file, load_active_aging_file
 from ..aging.file_sniff import correct_extension_for
 from ..aging import aging_store
+from ..aging import watcher as aging_watcher
 
 router = APIRouter()
 
@@ -72,6 +73,27 @@ def refresh_aging(db: Session = Depends(get_db),
         "customer_count": result["customer_count"],
         "filename": latest.filename,
     }
+
+
+@router.post("/check-aging-watch-folder")
+def check_aging_watch_folder(user: User = Depends(require_permission("config:manage"))):
+    """
+    Manual "Check Now" action (Home page's Aging Report card) — re-scans
+    AGING_WATCH_FOLDER immediately by file modification time, instead of
+    waiting for the next AGING_POLL_INTERVAL_SECONDS background tick. See
+    aging/watcher.py's check_now() docstring for why this is mtime-based
+    rather than filename-based: a re-dropped file with the SAME filename
+    but a newer mtime (e.g. the Oracle SFTP puller refreshing the same
+    xxzen_aging_report_excel.xls path every run) is now correctly picked
+    up, where the previous filename-only dedupe would have skipped it for
+    the rest of the process's lifetime.
+
+    Returns the scan summary plus the resulting status, so the frontend
+    can update both "did anything change" and the Loaded/Not Loaded card
+    in a single round trip.
+    """
+    scan_result = aging_watcher.check_now()
+    return {**scan_result, "status": aging_store.get_status()}
 
 
 @router.delete("/remove-aging")
