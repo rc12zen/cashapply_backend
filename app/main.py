@@ -33,7 +33,7 @@ from .bff import (
     run_routes, results_routes, hitl_routes, config_routes, filters_routes,
     executive_summary, config_builder_routes, auth_routes, admin_routes,
     activity_log_routes, ai_usage_routes, storage_routes, bank_accounts_routes,
-    remittance_inbox_routes, settlement_identifier_routes,
+    remittance_inbox_routes, settlement_identifier_routes, csp_report_routes,
 )
 
 app = FastAPI(title="CashApply Backend", version="1.1.0")
@@ -192,3 +192,9 @@ app.include_router(storage_routes.router,      prefix="/api/storage",       tags
 app.include_router(bank_accounts_routes.router, prefix="/api/bank-accounts", tags=["bank-accounts"])
 app.include_router(settlement_identifier_routes.router, prefix="/api/bank-accounts", tags=["settlement-identifiers"])
 app.include_router(remittance_inbox_routes.router, prefix="/api/remittance-inbox", tags=["remittance-inbox"])
+
+# Deliberately registered at plain /api -- NOT /api/auth -- so it falls
+# under nginx's general rate-limit zone rather than the strict auth_strict
+# one (a burst of legitimate CSP violation reports on one page load
+# shouldn't get treated like a login brute-force attempt).
+app.include_router(csp_report_routes.router, prefix="/api", tags=["csp-report"])

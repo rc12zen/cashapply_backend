@@ -54,15 +54,18 @@ Amount:
   ConversionRate when Case 2 applies -- this app never computes or sends
   a functional-currency amount.
 
-ReceiptNumber: CASHAPPLY-<ou_number>-<YYYYMMDD>-<line_item_id> -- no
-extra suffix (a previous version had an unexplained "-226" appended,
-confirmed via a live Oracle test to push real values over Oracle's
-30-character ReceiptNumber limit -- removed).
+ReceiptNumber: FAL-<ou_number>-<YYYYMMDD>-<line_item_id> -- "FAL" =
+Fusion Auto LockBox (previously "CASHAPPLY", renamed to match the
+product's new name). No extra suffix (a previous version had an
+unexplained "-226" appended, confirmed via a live Oracle test to push
+real values over Oracle's 30-character ReceiptNumber limit -- removed).
 """
 from __future__ import annotations
 
 import datetime as dt
 import logging
+import threading
+import time
 
 import httpx
 
@@ -76,35 +79,80 @@ from ..aging import aging_store
 logger = logging.getLogger("cashapply.oracle")
 
 
+# ── Shared IDCS/OAuth token cache ───────────────────────────────────────
+# Module-level, not per-instance: OracleFusionClient() is created fresh at
+# 5 different call sites across the codebase (receipt_creation.py,
+# hitl/service.py x2, hitl/distribution_actions.py x2) -- including inside
+# the receipt-creation thread pool (ORACLE_RECEIPT_MAX_WORKERS), where
+# several threads call this concurrently. A per-instance cache meant every
+# single one of those calls fetched its own brand-new token from IDCS --
+# for a batch of 50 concurrent receipts, that's 50 separate token
+# requests, not 1. Sharing this at module level means every instance and
+# every thread reuses the SAME cached token until it's actually close to
+# expiring.
+#
+# _token_lock serializes the check-and-refresh section (not every request
+# -- see _get_oauth_token below) specifically to prevent a "thundering
+# herd": if the token has expired and 20 threads notice at once, this
+# ensures exactly ONE of them actually calls IDCS while the other 19 wait
+# and then reuse what it fetched, rather than firing 20 simultaneous
+# token requests at IDCS.
+_token_lock = threading.Lock()
+_cached_token: str | None = None
+_token_expires_at: float = 0.0  # time.monotonic() timestamp
+_EXPIRY_SAFETY_MARGIN_SECONDS = 60  # refresh slightly before actual expiry,
+# so a token doesn't expire mid-flight on a request that started right
+# before the deadline.
+
+
 class OracleFusionClient:
     def __init__(self):
         self.settings = get_settings()
-        self._token_cache: str | None = None
 
     def _get_oauth_token(self) -> str:
-        if self._token_cache:
-            return self._token_cache
-        s = self.settings
-        token_body = {
-            "grant_type": "client_credentials",
-            "client_id": s.ORACLE_OAUTH_CLIENT_ID,
-            "client_secret": s.ORACLE_OAUTH_CLIENT_SECRET,
-        }
-        # Redact the secret before logging — never print it, even in a debug curl.
-        log_oracle_request(
-            "POST", s.ORACLE_OAUTH_TOKEN_URL,
-            form_body={**token_body, "client_secret": "***REDACTED***"},
-            tag="oracle.oauth_token",
-        )
-        try:
-            resp = httpx.post(s.ORACLE_OAUTH_TOKEN_URL, data=token_body, timeout=30)
-        except httpx.HTTPError as e:
-            log_oracle_error(e, tag="oracle.oauth_token")
-            raise
-        log_oracle_response(resp, tag="oracle.oauth_token")
-        resp.raise_for_status()
-        self._token_cache = resp.json()["access_token"]
-        return self._token_cache
+        global _cached_token, _token_expires_at
+
+        with _token_lock:
+            now = time.monotonic()
+            if _cached_token and now < _token_expires_at:
+                return _cached_token
+
+            s = self.settings
+            token_body = {
+                "grant_type": "client_credentials",
+                "client_id": s.ORACLE_OAUTH_CLIENT_ID,
+                "client_secret": s.ORACLE_OAUTH_CLIENT_SECRET,
+            }
+            # IDCS requires an explicit scope naming the target resource;
+            # other OAuth providers may not use one at all, so this is only
+            # included when actually configured.
+            if s.ORACLE_OAUTH_SCOPE:
+                token_body["scope"] = s.ORACLE_OAUTH_SCOPE
+
+            # Redact the secret before logging — never print it, even in a debug curl.
+            log_oracle_request(
+                "POST", s.ORACLE_OAUTH_TOKEN_URL,
+                form_body={**token_body, "client_secret": "***REDACTED***"},
+                tag="oracle.oauth_token",
+            )
+            try:
+                resp = httpx.post(s.ORACLE_OAUTH_TOKEN_URL, data=token_body, timeout=30)
+            except httpx.HTTPError as e:
+                log_oracle_error(e, tag="oracle.oauth_token")
+                raise
+            log_oracle_response(resp, tag="oracle.oauth_token")
+            resp.raise_for_status()
+
+            body = resp.json()
+            _cached_token = body["access_token"]
+            # expires_in is in seconds, per the OAuth2 client-credentials
+            # spec IDCS follows. Default of 3600 (1 hour) only used if
+            # Oracle's response is ever missing the field -- shouldn't
+            # happen in practice, just a defensive fallback rather than a
+            # crash.
+            expires_in = int(body.get("expires_in", 3600))
+            _token_expires_at = now + expires_in - _EXPIRY_SAFETY_MARGIN_SECONDS
+            return _cached_token
 
     def _auth_headers(self) -> dict:
         s = self.settings
@@ -310,8 +358,12 @@ class OracleFusionClient:
 def _build_receipt_number(line_item: LineItem) -> str:
     """
     Generates the Oracle `ReceiptNumber` -- supplied by us, not Oracle.
-    Format: CASHAPPLY-<ou_number>-<YYYYMMDD>-<line_item_id>
-      e.g.  CASHAPPLY-111-20260604-1583
+    Format: FAL-<ou_number>-<YYYYMMDD>-<line_item_id>
+      e.g.  FAL-111-20260604-1583
+
+    "FAL" = Fusion Auto LockBox (previously "CASHAPPLY" -- renamed to
+    match the product's new name; the format/uniqueness scheme itself is
+    unchanged).
 
     Unique: <line_item_id> is LineItem.id, a DB auto-increment primary
     key -- globally unique for the table's lifetime, never reused.
@@ -327,7 +379,7 @@ def _build_receipt_number(line_item: LineItem) -> str:
     ou = line_item.ou_number or "UNK"
     date_source = line_item.statement_date or line_item.created_at
     date_str = date_source.strftime("%Y%m%d") if date_source else "00000000"
-    receipt_number = f"CASHAPPLY-{ou}-{date_str}-{line_item.id}"
+    receipt_number = f"FAL-{ou}-{date_str}-{line_item.id}"
     if len(receipt_number) > 30:
         logger.warning(
             "ReceiptNumber '%s' (%d chars) exceeds Oracle's 30-char limit -- "

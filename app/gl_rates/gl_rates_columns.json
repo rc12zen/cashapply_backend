@@ -1,0 +1,15 @@
+{
+  "DEFAULT": {
+    "_description": "Zensar GL Daily Rates extract — pipe-delimited (Oracle's real xxzen_gl_daily_rates_extract.txt export). header_row/sheet_name are unused for the .txt/.csv path (parser.py only applies them for the .xlsx/.xls branch) but kept here for parity with aging_columns.json's shape.",
+    "sheet_name": "Sheet1",
+    "header_row": 0,
+    "columns": {
+      "from_currency":        "From Currency",
+      "to_currency":          "To Currency",
+      "conversion_date":      "Conversion Date",
+      "conversion_rate":      "Conversion Rate",
+      "conversion_rate_type": "User Conversion Type"
+    },
+    "notes": "The real file carries TWO type-like columns: 'Conversion Type' and 'User Conversion Type'. 'User Conversion Type' is the one mapped to conversion_rate_type because it's the human-readable label ('Corporate' or 'MRC Daily') that matches what rule_engine/fx_service.py and fx_conversion_type_map.json expect. 'Conversion Type' instead carries an internal numeric/id-looking value on MRC Daily rows (e.g. '300000007815001') and the literal string 'Corporate' on Corporate rows -- not usable as a consistent rate-type label, so it is intentionally NOT mapped here."
+  }
+}

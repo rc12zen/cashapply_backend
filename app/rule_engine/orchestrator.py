@@ -622,17 +622,18 @@ def _process_identified_payment(
             if line_item.rule_id == "R11":
                 apply_overpayment_diagnosis(db, line_item, aging_map)
 
-            # The same treatment for the opposite sign. R9c now catches two
-            # kinds of row: a shortfall over tolerance (as always), and --
-            # new -- a shortfall WITHIN tolerance where the customer holds
-            # open credit memos, which used to be auto-accepted silently
-            # with the credit memo left open in Oracle. The second kind
-            # especially must not reach the SPOC saying only "shortage":
-            # the point of holding it back is to show WHICH credit memos
-            # exist and whether one matches the gap exactly. Advisory only,
-            # same as above -- stamps two fields, cannot change the row's
-            # category, and swallows its own errors.
-            if line_item.rule_id == "R9c":
+            # The same treatment for the opposite sign. Used to gate on
+            # rule_id == "R9c" only, back when a shortfall within tolerance
+            # but sitting next to open credit memos was rerouted to R9c.
+            # That rerouting was removed (see evaluator.py) -- the shortfall
+            # percentage alone now decides R9b vs R9c, full stop, and the
+            # credit-memo situation is surfaced as a diagnosis on the row
+            # instead of by moving its category. So this now also runs for
+            # R9b: an accepted short payment can still hold open credit
+            # memos worth flagging, even though it's no longer held for
+            # review. Advisory only, same as above -- stamps two fields,
+            # cannot change the row's category, and swallows its own errors.
+            if line_item.rule_id in ("R9b", "R9c"):
                 apply_shortage_diagnosis(db, line_item, aging_map)
 
             _mark_row_consumed(db, orig, run_id)

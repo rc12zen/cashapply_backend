@@ -53,7 +53,7 @@ from .parser import load_gl_rates_into_db, GL_RATES_BUCKET
 
 log = logging.getLogger(__name__)
 
-ELIGIBLE_EXTENSIONS = {".xlsx", ".xls", ".csv"}
+ELIGIBLE_EXTENSIONS = {".xlsx", ".xls", ".csv", ".txt"}
 
 # Filenames processed in this server lifetime -- avoids re-processing same file.
 _processed: set[str] = set()

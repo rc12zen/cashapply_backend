@@ -193,6 +193,12 @@ class Settings(BaseSettings):
     ORACLE_OAUTH_TOKEN_URL: str | None = None
     ORACLE_OAUTH_CLIENT_ID: str | None = None
     ORACLE_OAUTH_CLIENT_SECRET: str | None = None
+    # IDCS's client-credentials grant requires an explicit scope naming the
+    # resource being requested a token for -- e.g.
+    # "https://fa-etvl-saasfaprod1.fa.ocs.oraclecloud.com:443/" for
+    # production Fusion. Omitted entirely from the token request if unset,
+    # for compatibility with any non-IDCS OAuth provider that doesn't need it.
+    ORACLE_OAUTH_SCOPE: str | None = None
 
     # ── Auth: Microsoft Entra ID (Azure AD) SSO ──────────────────────────────
     AZURE_TENANT_ID: str | None = None
