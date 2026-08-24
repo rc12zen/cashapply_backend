@@ -38,6 +38,7 @@ openai>=1.99.0
 # New — Background task queue (Postgres-backed; no Redis/RabbitMQ/Celery)
 # PsycopgConnector (psycopg3) ships as a core part of procrastinate — no extra needed.
 procrastinate==2.14.0
+apscheduler>=3.10.4
 paramiko>=3.4.0
 
 # Dev/test
