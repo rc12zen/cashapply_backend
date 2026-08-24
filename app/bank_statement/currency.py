@@ -20,12 +20,18 @@ import re
 # Active ISO-4217 codes (the ones realistically seen across the org's banks,
 # plus the common majors). Extend freely — membership here is the allow-list.
 ISO_4217: set[str] = {
-    "AED", "AUD", "BHD", "BRL", "CAD", "CHF", "CNY", "CZK", "DKK", "EGP",
-    "EUR", "GBP", "HKD", "HUF", "IDR", "ILS", "INR", "JPY", "KES", "KRW",
-    "KWD", "LKR", "MAD", "MXN", "MYR", "NGN", "NOK", "NZD", "OMR", "PHP",
-    "PKR", "PLN", "QAR", "RON", "RUB", "SAR", "SEK", "SGD", "THB", "TRY",
-    "TWD", "TZS", "UGX", "USD", "VND", "ZAR",
+    "AED", "AUD", "BHD", "BRL", "CAD", "CHF", "CNY", "COP", "CZK", "DKK",
+    "EGP", "EUR", "GBP", "HKD", "HUF", "IDR", "ILS", "INR", "JPY", "KES",
+    "KRW", "KWD", "LKR", "MAD", "MXN", "MYR", "NGN", "NOK", "NZD", "OMR",
+    "PHP", "PKR", "PLN", "QAR", "RON", "RSD", "RUB", "SAR", "SEK", "SGD",
+    "THB", "TRY", "TWD", "TZS", "UGX", "USD", "VND", "ZAR",
 }
+# COP and RSD were added after both turned up in rule_engine/fx_service.py's
+# _STATIC_RATE_MAP (USD_COP, USD_RSD) while being absent here -- so the FX layer
+# could convert them but the config-builder dropdown, which is driven by this
+# set, could not offer them. A Colombian statement's config therefore could not
+# be saved at all: the wizard requires a currency, and COP was unselectable.
+# Anything the FX map knows about belongs in here.
 
 # Non-standard spellings → ISO. Keys are COMPACT (letters/digits only, uppercased);
 # normalize_currency() compacts the input the same way before looking up here.
