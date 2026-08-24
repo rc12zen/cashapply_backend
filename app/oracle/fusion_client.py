@@ -1,7 +1,16 @@
 """
-app.oracle.fusion_client  (PATCHED v5 -- simplified)
+app.oracle.fusion_client  (PATCHED v6 -- OAuth grant-type support)
 =======================================================
 POST /standardReceipts client. Supports Basic Auth and OAuth.
+
+v6 change: _get_oauth_token() now respects ORACLE_OAUTH_GRANT_TYPE
+("client_credentials" or "password") instead of hardcoding
+client_credentials. Some IDCS app registrations are configured for
+Resource Owner Password Credentials (grant_type=password), which
+additionally requires a username/password in the token request body
+alongside client_id/client_secret -- previously unsupported here,
+meaning a password-only IDCS app would have its token request rejected
+outright. See Settings.ORACLE_OAUTH_GRANT_TYPE/USERNAME/PASSWORD.
 
 RECEIPT-CREATION PAYLOAD MODEL -- exactly two cases, nothing else
 --------------------------------------------------------------------
@@ -119,20 +128,33 @@ class OracleFusionClient:
 
             s = self.settings
             token_body = {
-                "grant_type": "client_credentials",
+                "grant_type": s.ORACLE_OAUTH_GRANT_TYPE,
                 "client_id": s.ORACLE_OAUTH_CLIENT_ID,
                 "client_secret": s.ORACLE_OAUTH_CLIENT_SECRET,
             }
+            # Resource Owner Password Credentials grant additionally requires
+            # the end-user (IDCS service account) username/password in the
+            # same form body -- not used at all for client_credentials. Which
+            # grant an IDCS app accepts is fixed by how the Oracle admin
+            # configured that app registration, not something this client
+            # can detect on its own -- must match ORACLE_OAUTH_GRANT_TYPE.
+            if s.ORACLE_OAUTH_GRANT_TYPE == "password":
+                token_body["username"] = s.ORACLE_OAUTH_USERNAME
+                token_body["password"] = s.ORACLE_OAUTH_PASSWORD
             # IDCS requires an explicit scope naming the target resource;
             # other OAuth providers may not use one at all, so this is only
             # included when actually configured.
             if s.ORACLE_OAUTH_SCOPE:
                 token_body["scope"] = s.ORACLE_OAUTH_SCOPE
 
-            # Redact the secret before logging — never print it, even in a debug curl.
+            # Redact secrets before logging — never print them, even in a debug curl.
             log_oracle_request(
                 "POST", s.ORACLE_OAUTH_TOKEN_URL,
-                form_body={**token_body, "client_secret": "***REDACTED***"},
+                form_body={
+                    **token_body,
+                    "client_secret": "***REDACTED***",
+                    **({"password": "***REDACTED***"} if "password" in token_body else {}),
+                },
                 tag="oracle.oauth_token",
             )
             try:
@@ -145,8 +167,8 @@ class OracleFusionClient:
 
             body = resp.json()
             _cached_token = body["access_token"]
-            # expires_in is in seconds, per the OAuth2 client-credentials
-            # spec IDCS follows. Default of 3600 (1 hour) only used if
+            # expires_in is in seconds, per the OAuth2 spec both grant types
+            # IDCS supports follow. Default of 3600 (1 hour) only used if
             # Oracle's response is ever missing the field -- shouldn't
             # happen in practice, just a defensive fallback rather than a
             # crash.
