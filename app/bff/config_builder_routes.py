@@ -34,10 +34,12 @@ import dataclasses
 import datetime as dt
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from ..db.models import SourceFile, User, BankAccount, OrganizationUnit, AccountConfigRecipe
+from ..db.models import (
+    SourceFile, User, BankAccount, BankAccountOU, OrganizationUnit, AccountConfigRecipe,
+)
 from ..deps import get_db
 from ..auth import require_permission
 from ..audit.service import log_activity
@@ -446,6 +448,20 @@ def available_ous(db: Session = Depends(get_db),
 
 # ── save a recipe (create account or add a format recipe under an existing one) ──
 
+class AdditionalOU(BaseModel):
+    """One EXTRA Business Unit for an account that receives money for several.
+
+    Same three fields an account assignment carries for its primary OU, and
+    resolved through the same _get_or_create_organization_unit() -- so an OU
+    that has never been onboarded can be created right here, rather than having
+    to exist first. functional_currency is required only when the OU is
+    genuinely new; an existing OU's currency is never overwritten.
+    """
+    ou_number: str
+    business_unit: str = ""
+    functional_currency: str | None = None
+
+
 class AccountAssignment(BaseModel):
     """One account to onboard against the recipe being saved.
 
@@ -462,6 +478,19 @@ class AccountAssignment(BaseModel):
     bank: str | None = None
     currency: str | None = None
     override_account_validation: bool = False
+    # Business Units BEYOND the primary one above, for an account that receives
+    # money for more than one BU (see db/models.py's BankAccountOU).
+    #
+    # An OU here may be brand new -- it is onboarded on exactly the same terms
+    # as the primary (name + ledger currency, see AdditionalOU), so discovering
+    # mid-save that an account is shared does not mean abandoning the wizard to
+    # go and create the OU on another screen first.
+    #
+    # Previously this could only be set AFTER onboarding, from the Accounts &
+    # OU's page -- so a multi-BU account was always a two-screen job, and was
+    # frequently impossible because the second BU did not exist yet and had no
+    # statement of its own to bring it into being.
+    additional_ous: list[AdditionalOU] = Field(default_factory=list)
 
 
 class SaveRecipeRequest(BaseModel):
@@ -477,6 +506,12 @@ class SaveRecipeRequest(BaseModel):
     # instead of an optional free-text afterthought.
     ou_number: str
     business_unit: str
+    # Business Units BEYOND the primary one, for the single-account save path
+    # (the `accounts` fan-out carries its own per-account list). Must already
+    # (the `accounts` fan-out carries its own per-account list). See
+    # AccountAssignment.additional_ous and _apply_additional_ous -- an OU here
+    # may be new, and an empty list means "unchanged", not "remove them all".
+    additional_ous: list[AdditionalOU] = Field(default_factory=list)
     # Ledger/functional currency for this OU — required for Oracle FX Leg 2
     # resolution (rule_engine/fx_service.py's get_functional_currency()).
     # REQUIRED whenever ou_number is genuinely new (see
@@ -590,6 +625,58 @@ def _get_or_create_bank_account(db: Session, acct: str, display_name: str, bank:
     return account, True, None
 
 
+def _apply_additional_ous(db: Session, account: BankAccount, additional: list["AdditionalOU"],
+                           primary_ou: OrganizationUnit) -> list[str]:
+    """Attach this account's ADDITIONAL Business Units (BankAccountOU rows).
+
+    Returns the OU numbers actually attached, for the audit entry.
+
+    ONBOARDED ON THE SAME TERMS AS THE PRIMARY OU
+    -----------------------------------------------
+    Each entry carries the same three fields an account assignment does, and is
+    resolved through the SAME _get_or_create_organization_unit() -- so an OU
+    that has never been onboarded can be created here, named and given its
+    ledger currency, exactly as the primary OU is. Requiring it to exist first
+    would just re-create the dead end this whole feature exists to remove, one
+    level down: the wizard is often where someone FIRST discovers the account is
+    shared, and sending them to another screen mid-save to create the OU loses
+    the work in progress.
+
+    functional_currency is still required for a genuinely new OU and ignored for
+    an existing one -- that rule lives in _get_or_create_organization_unit and is
+    not special-cased here.
+
+    EMPTY MEANS "NOT SPECIFIED", NOT "REMOVE THEM ALL"
+    ---------------------------------------------------
+    A blank list leaves whatever is already attached untouched, because the
+    field defaults to [] -- so a routine re-save from the wizard (adding a new
+    format recipe, correcting a column mapping) can never silently strip a
+    multi-BU account back to one BU with nothing in the flow saying so.
+    Removing an additional BU stays the Accounts & OU's page's job, where it is
+    the explicit purpose of the screen rather than a side-effect of saving
+    something else.
+    """
+    seen: dict[str, "AdditionalOU"] = {}
+    for entry in additional or []:
+        number = (entry.ou_number or "").strip()
+        if not number or number == primary_ou.ou_number:
+            continue          # the primary is not an "additional"
+        seen.setdefault(number, entry)
+    if not seen:
+        return []
+
+    existing_links = {link.ou_id for link in account.additional_ou_links}
+    for number in sorted(seen):
+        entry = seen[number]
+        ou = _get_or_create_organization_unit(
+            db, number, (entry.business_unit or "").strip(), entry.functional_currency
+        )
+        if ou.id not in existing_links:
+            db.add(BankAccountOU(bank_account_id=account.id, ou_id=ou.id))
+    db.flush()
+    return sorted(seen)
+
+
 @router.post("/builder/save")
 def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
                  user: User = Depends(require_permission("config:manage"))):
@@ -617,6 +704,7 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
             bank=body.bank,
             currency=body.currency,
             override_account_validation=body.override_account_validation,
+            additional_ous=body.additional_ous,
         )]
 
     # Validate EVERY assignment before writing anything, so a bad entry at
@@ -706,6 +794,13 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
                     "to_ou_number": ou.ou_number,
                 })
 
+            # Additional Business Units for an account that receives money for
+            # more than one BU. A new OU here is onboarded on the same terms
+            # as the primary (name + ledger currency) -- see _apply_additional_ous.
+            attached_additional = _apply_additional_ous(
+                db, account, a.additional_ous, ou
+            )
+
             existing_versions = (
                 db.query(AccountConfigRecipe)
                 .filter(AccountConfigRecipe.bank_account_id == account.id,
@@ -733,6 +828,11 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
                          metadata={"display_name": a.display_name, "format": fmt,
                                    "version": next_version, "ou_number": ou.ou_number,
                                    "business_unit": ou.ou_name,
+                                   # Only present when this save actually
+                                   # attached extra BUs, so an ordinary
+                                   # single-BU save reads exactly as before.
+                                   **({"additional_ou_numbers": attached_additional}
+                                      if attached_additional else {}),
                                    "batch_size": len(assignments)})
 
             saved.append({

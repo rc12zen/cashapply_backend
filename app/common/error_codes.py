@@ -252,12 +252,24 @@ class ErrorCode:
     BUSINESS_UNIT_UNKNOWN = ErrorDef(
         3011, "BUSINESS_UNIT_UNKNOWN", 400,
         "Unknown Business Unit",
-        "That Business Unit doesn't exist yet — add it via Config Builder first.",
+        # Was "add it via Config Builder first", which described the only route
+        # that existed at the time -- and it was a dead end for the case that
+        # matters most: an account receiving money for a SECOND Business Unit
+        # often has no separate statement to onboard, so the OU could never be
+        # created at all. Business Units are now created directly on the
+        # Accounts & OU's page (see bank_accounts_routes.create_organization_unit).
+        "That Business Unit doesn't exist yet — add it on the Accounts & OU's page first.",
     )
     BUSINESS_UNIT_REQUIRED = ErrorDef(
         3012, "BUSINESS_UNIT_REQUIRED", 400,
         "A primary Business Unit is required",
         "Choose a primary Business Unit for this account — it can't be left unset.",
+    )
+    ORGANIZATION_UNIT_EXISTS = ErrorDef(
+        3014, "ORGANIZATION_UNIT_EXISTS", 409,
+        "Business Unit already exists",
+        "A Business Unit with that OU number is already set up. Edit the existing "
+        "one instead of creating a second.",
     )
     CONFIG_PATTERN_INVALID = ErrorDef(
         3013, "CONFIG_PATTERN_INVALID", 400,
