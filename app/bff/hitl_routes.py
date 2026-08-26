@@ -49,7 +49,7 @@ from ..hitl import (
     check_receipt_retry_eligibility_for_run, serialize_line_item,
     get_mapping_options, get_invoices_for_customer,
     preview_manual_mapping, confirm_manual_mapping,
-    mark_eligible_for_receipt, discard_row, edit_gl_rate,
+    mark_eligible_for_receipt, discard_row, restore_discarded_row, edit_gl_rate,
     override_settlement_as_customer_payment,
 )
 from ..hitl import reopen_with_edits
@@ -325,6 +325,34 @@ def discard(id: int, payload: dict, request: Request, db: Session = Depends(get_
         raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
 
     log_activity(db, user, action="hitl.discard", entity_type="LineItem", entity_id=id,
+                 ip_address=_client_ip(request), metadata={"comment": payload.get("comment")})
+    db.commit()
+    return result
+
+
+@router.post("/restore-discarded/{id}")
+def restore_discarded(id: int, payload: dict, request: Request, db: Session = Depends(get_db),
+                       user: User = Depends(require_permission("hitl:reject"))):
+    """
+    Undo a Discard — see hitl/service.py's restore_discarded_row(). Returns the
+    row to Unidentified with no eligibility decision recorded, so Mark Eligible
+    and Discard are both offered again.
+
+    Safe to expose because a discarded row has no Oracle footprint at all: the
+    eligibility gate holds receipt creation back until a SPOC decides, and
+    discard resolves that decision without ever calling Oracle. Nothing to
+    reverse, unlike un-rejecting a posted row.
+
+    Same permission tier as Discard and Reject — undoing a decision of that
+    weight is a decision of that weight.
+    """
+    result = restore_discarded_row(db, id, payload.get("comment"), triggered_by=user.email)
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") == "not_discarded":
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
+
+    log_activity(db, user, action="hitl.restore_discarded", entity_type="LineItem", entity_id=id,
                  ip_address=_client_ip(request), metadata={"comment": payload.get("comment")})
     db.commit()
     return result

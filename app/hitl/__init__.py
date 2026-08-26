@@ -10,6 +10,7 @@ from .service import (
     serialize_line_item,
     mark_eligible_for_receipt,
     discard_row,
+    restore_discarded_row,
     override_settlement_as_customer_payment,
     edit_gl_rate,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "serialize_line_item",
     "mark_eligible_for_receipt",
     "discard_row",
+    "restore_discarded_row",
     "override_settlement_as_customer_payment",
     "edit_gl_rate",
     "get_mapping_options",
