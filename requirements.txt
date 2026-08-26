@@ -7,6 +7,8 @@ pydantic>=2.9.2
 pydantic-settings>=2.5.2
 httpx==0.27.2
 pandas==2.2.3
+pandas==2.2.3
+numpy==1.26.4
 openpyxl==3.1.5
 # Legacy .xls (BIFF) support — pandas/openpyxl only handle .xlsx; xls preview
 # and parsing (bank_statement raw-preview + parser) need xlrd. Without it,
@@ -36,6 +38,8 @@ openai>=1.99.0
 # New — Background task queue (Postgres-backed; no Redis/RabbitMQ/Celery)
 # PsycopgConnector (psycopg3) ships as a core part of procrastinate — no extra needed.
 procrastinate==2.14.0
+apscheduler>=3.10.4
+paramiko>=3.4.0
 
 # Dev/test
 pytest==9.0.3

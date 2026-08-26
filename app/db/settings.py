@@ -168,6 +168,18 @@ class Settings(BaseSettings):
     # production Fusion. Omitted entirely from the token request if unset,
     # for compatibility with any non-IDCS OAuth provider that doesn't need it.
     ORACLE_OAUTH_SCOPE: str | None = None
+    # Which OAuth2 grant to use when ORACLE_AUTH_MODE=oauth. IDCS apps are
+    # configured for one specific grant type by the Oracle admin -- some
+    # environments use "client_credentials" (app-to-app, no end user), others
+    # require "password" (Resource Owner Password Credentials, tied to a
+    # named IDCS service-account user). Must match what the IDCS app
+    # registration actually allows, or the token request is rejected outright.
+    ORACLE_OAUTH_GRANT_TYPE: Literal["client_credentials", "password"] = "client_credentials"
+    # Only used when ORACLE_OAUTH_GRANT_TYPE="password" -- the IDCS
+    # service-account username/password sent in the token request body
+    # alongside client_id/client_secret.
+    ORACLE_OAUTH_USERNAME: str | None = None
+    ORACLE_OAUTH_PASSWORD: str | None = None
 
     # ── Auth: Microsoft Entra ID (Azure AD) SSO ──────────────────────────────
     AZURE_TENANT_ID: str | None = None
