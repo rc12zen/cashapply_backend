@@ -1,16 +1,7 @@
 """
-app.oracle.fusion_client  (PATCHED v6 -- OAuth grant-type support)
+app.oracle.fusion_client  (PATCHED v5 -- simplified)
 =======================================================
 POST /standardReceipts client. Supports Basic Auth and OAuth.
-
-v6 change: _get_oauth_token() now respects ORACLE_OAUTH_GRANT_TYPE
-("client_credentials" or "password") instead of hardcoding
-client_credentials. Some IDCS app registrations are configured for
-Resource Owner Password Credentials (grant_type=password), which
-additionally requires a username/password in the token request body
-alongside client_id/client_secret -- previously unsupported here,
-meaning a password-only IDCS app would have its token request rejected
-outright. See Settings.ORACLE_OAUTH_GRANT_TYPE/USERNAME/PASSWORD.
 
 RECEIPT-CREATION PAYLOAD MODEL -- exactly two cases, nothing else
 --------------------------------------------------------------------
@@ -80,7 +71,7 @@ import httpx
 
 from ..db.models import LineItem
 from ..db.settings import get_settings
-from ..rule_engine.fx_service import get_ou_display_name
+from ..rule_engine.fx_service import get_ou_display_name, FxService
 from .receipt_method_resolver import resolve_receipt_method
 from ..common.http_debug_log import log_oracle_request, log_oracle_response, log_oracle_error
 from ..aging import aging_store
@@ -127,38 +118,38 @@ class OracleFusionClient:
                 return _cached_token
 
             s = self.settings
+            # This Oracle IDCS instance is configured for the "password"
+            # grant, NOT client_credentials -- confirmed by comparing
+            # against a working Postman request (client_credentials
+            # returned a real, live 401 from IDCS with this exact
+            # client_id/secret; the password-grant shape below is what
+            # Postman actually used successfully). The client (this app)
+            # authenticates via HTTP Basic Auth on the request itself;
+            # the actual Oracle Fusion user account authenticates via
+            # username/password in the body -- both halves are required
+            # together for this specific IDCS setup.
             token_body = {
-                "grant_type": s.ORACLE_OAUTH_GRANT_TYPE,
-                "client_id": s.ORACLE_OAUTH_CLIENT_ID,
-                "client_secret": s.ORACLE_OAUTH_CLIENT_SECRET,
+                "grant_type": "password",
+                "username": s.ORACLE_OAUTH_USERNAME,
+                "password": s.ORACLE_OAUTH_PASSWORD,
             }
-            # Resource Owner Password Credentials grant additionally requires
-            # the end-user (IDCS service account) username/password in the
-            # same form body -- not used at all for client_credentials. Which
-            # grant an IDCS app accepts is fixed by how the Oracle admin
-            # configured that app registration, not something this client
-            # can detect on its own -- must match ORACLE_OAUTH_GRANT_TYPE.
-            if s.ORACLE_OAUTH_GRANT_TYPE == "password":
-                token_body["username"] = s.ORACLE_OAUTH_USERNAME
-                token_body["password"] = s.ORACLE_OAUTH_PASSWORD
-            # IDCS requires an explicit scope naming the target resource;
-            # other OAuth providers may not use one at all, so this is only
-            # included when actually configured.
             if s.ORACLE_OAUTH_SCOPE:
                 token_body["scope"] = s.ORACLE_OAUTH_SCOPE
+            client_auth = (s.ORACLE_OAUTH_CLIENT_ID, s.ORACLE_OAUTH_CLIENT_SECRET)
 
-            # Redact secrets before logging — never print them, even in a debug curl.
+            # Redact BOTH secrets before logging -- never print either,
+            # even in a debug curl.
             log_oracle_request(
                 "POST", s.ORACLE_OAUTH_TOKEN_URL,
-                form_body={
-                    **token_body,
-                    "client_secret": "***REDACTED***",
-                    **({"password": "***REDACTED***"} if "password" in token_body else {}),
-                },
+                form_body={**token_body, "password": "***REDACTED***"},
+                auth=(s.ORACLE_OAUTH_CLIENT_ID, "***REDACTED***"),
                 tag="oracle.oauth_token",
             )
             try:
-                resp = httpx.post(s.ORACLE_OAUTH_TOKEN_URL, data=token_body, timeout=30)
+                resp = httpx.post(
+                    s.ORACLE_OAUTH_TOKEN_URL, data=token_body,
+                    auth=client_auth, timeout=30,
+                )
             except httpx.HTTPError as e:
                 log_oracle_error(e, tag="oracle.oauth_token")
                 raise
@@ -167,11 +158,10 @@ class OracleFusionClient:
 
             body = resp.json()
             _cached_token = body["access_token"]
-            # expires_in is in seconds, per the OAuth2 spec both grant types
-            # IDCS supports follow. Default of 3600 (1 hour) only used if
-            # Oracle's response is ever missing the field -- shouldn't
-            # happen in practice, just a defensive fallback rather than a
-            # crash.
+            # expires_in is in seconds, per the OAuth2 spec IDCS follows.
+            # Default of 3600 (1 hour) only used if Oracle's response is
+            # ever missing the field -- shouldn't happen in practice,
+            # just a defensive fallback rather than a crash.
             expires_in = int(body.get("expires_in", 3600))
             _token_expires_at = now + expires_in - _EXPIRY_SAFETY_MARGIN_SECONDS
             return _cached_token
@@ -483,10 +473,46 @@ def build_receipt_creation_payload(line_item: LineItem) -> dict:
     )
     accounting_date_iso = dt.date.today().strftime("%Y-%m-%d")
 
-    # ── Leg 1: convert credit amount → invoice currency (already resolved
-    # upstream by the rule engine before this function ever runs) ───────────
-    is_cross_currency    = bool(line_item.is_cross_currency)
+    # ── Leg 1: convert credit amount → invoice currency ──────────────────────
+    # is_cross_currency here is CREDITED vs INVOICE currency (statement_currency
+    # != invoice_currency) -- normally already resolved upstream by the rule
+    # engine / manual mapping before this function ever runs. But
+    # line_item.fx_credit_to_invoice is just a cached value: if it's missing
+    # or stale (e.g. invoice_currency changed after the cached rate was
+    # stored, and nothing refreshed fx_credit_to_invoice to match), the OLD
+    # code silently fell through to `amount_in_invoice_ccy = credit_amount`
+    # -- i.e. it would send Oracle the RAW, UNCONVERTED credited amount
+    # labeled as if it were already in invoice currency. That is a silent
+    # wrong-amount bug, worse than Leg 2's hard failure. Fixed the same way
+    # Leg 2 already worked: re-check credited_currency -> invoice_currency
+    # live via FxService whenever the cached rate isn't there, and refuse to
+    # build the payload rather than post an amount that was never actually
+    # converted.
+    is_cross_currency    = bool(line_item.is_cross_currency) or (
+        bool(credited_currency) and bool(invoice_currency) and credited_currency != invoice_currency
+    )
     fx_credit_to_invoice = float(line_item.fx_credit_to_invoice) if line_item.fx_credit_to_invoice else None
+
+    if is_cross_currency and not fx_credit_to_invoice:
+        logger.warning(
+            "[receipt_payload] row=%s is_cross_currency but fx_credit_to_invoice is missing/"
+            "stale on the LineItem -- re-resolving %s->%s live instead of trusting the cached "
+            "value (or silently sending an unconverted amount).",
+            line_item.id, credited_currency, invoice_currency,
+        )
+        fx_credit_to_invoice, _leg1_source = FxService().get_rate_with_source(
+            from_ccy=credited_currency,
+            to_ccy=invoice_currency,
+            rate_date=line_item.statement_date,
+        )
+
+    if is_cross_currency and not fx_credit_to_invoice:
+        raise ValueError(
+            f"Cannot build receipt payload for LineItem {line_item.id}: cross-currency "
+            f"conversion rate ({credited_currency}->{invoice_currency}) is not resolved. "
+            f"Do not post an unconverted Amount."
+        )
+
     if is_cross_currency and fx_credit_to_invoice:
         amount_in_invoice_ccy = round(credit_amount * fx_credit_to_invoice, 2)
     else:

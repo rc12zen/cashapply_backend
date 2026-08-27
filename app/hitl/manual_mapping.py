@@ -678,6 +678,42 @@ def apply_selection(
     r.fx_credit_to_invoice = fx_info.get("fx_rate")
     r.fx_credit_to_invoice_source = fx_info.get("fx_rate_source")
 
+    # FIX: Leg 2 (invoice -> functional, i.e. Oracle's ConversionRate) was
+    # never revisited here -- it was frozen at analysis time against
+    # whatever invoice_currency was known THEN (often just defaulted to
+    # credited_currency when no invoice had matched yet, e.g. a
+    # CUSTOMER_ONLY_NO_REMIT row). r.invoice_currency above can change to
+    # the REAL selected invoice's currency, but is_cross_ledger /
+    # fx_invoice_to_functional were left stale -- meaning a row could sit
+    # in the DB claiming is_cross_ledger=False with a NULL rate even
+    # though invoice_currency now genuinely differs from
+    # functional_currency. build_receipt_creation_payload() recomputes
+    # is_cross_ledger fresh from these two fields at payload-build time,
+    # so a stale fx_invoice_to_functional there means posting fails with
+    # "conversion rate is not resolved" even when the rate exists in
+    # gl_daily_rates -- it just never got looked up. Recompute both here,
+    # every time a mapping is (re)confirmed, so they always reflect the
+    # invoice actually selected.
+    functional_currency = (r.functional_currency or "").upper().strip()
+    resolved_invoice_currency = (r.invoice_currency or "").upper().strip()
+    r.is_cross_ledger = (
+        bool(resolved_invoice_currency)
+        and bool(functional_currency)
+        and resolved_invoice_currency != functional_currency
+    )
+    if r.is_cross_ledger:
+        fx_leg2 = FxService()
+        leg2_rate, leg2_source = fx_leg2.get_rate_with_source(
+            from_ccy=resolved_invoice_currency,
+            to_ccy=functional_currency,
+            rate_date=r.statement_date,
+        )
+        r.fx_invoice_to_functional = leg2_rate
+        r.fx_invoice_to_functional_source = leg2_source
+    else:
+        r.fx_invoice_to_functional = None
+        r.fx_invoice_to_functional_source = None
+
     # PATCH: this used to be a persistent record that THIS row's current
     # mapping came from a SPOC, not automatic extraction — see the
     # LineItem.manually_mapped field comment in db/models.py for why this

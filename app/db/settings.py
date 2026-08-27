@@ -168,16 +168,12 @@ class Settings(BaseSettings):
     # production Fusion. Omitted entirely from the token request if unset,
     # for compatibility with any non-IDCS OAuth provider that doesn't need it.
     ORACLE_OAUTH_SCOPE: str | None = None
-    # Which OAuth2 grant to use when ORACLE_AUTH_MODE=oauth. IDCS apps are
-    # configured for one specific grant type by the Oracle admin -- some
-    # environments use "client_credentials" (app-to-app, no end user), others
-    # require "password" (Resource Owner Password Credentials, tied to a
-    # named IDCS service-account user). Must match what the IDCS app
-    # registration actually allows, or the token request is rejected outright.
-    ORACLE_OAUTH_GRANT_TYPE: Literal["client_credentials", "password"] = "client_credentials"
-    # Only used when ORACLE_OAUTH_GRANT_TYPE="password" -- the IDCS
-    # service-account username/password sent in the token request body
-    # alongside client_id/client_secret.
+    # This Oracle IDCS instance is actually configured for the "password"
+    # grant, NOT client_credentials -- confirmed against a real working
+    # Postman request. client_id/client_secret authenticate the CLIENT
+    # (sent via HTTP Basic Auth on the token request), while THIS
+    # username/password authenticate an actual Oracle Fusion user account
+    # -- both are required together for this specific IDCS setup.
     ORACLE_OAUTH_USERNAME: str | None = None
     ORACLE_OAUTH_PASSWORD: str | None = None
 
@@ -216,6 +212,38 @@ class Settings(BaseSettings):
     GL_RATES_WATCH_FOLDER: str = "./gl_rates_watch"  # folder scanned for new GL rate files
     GL_RATES_POLL_INTERVAL_SECONDS: int = 30        # how often to re-scan
 
+    # ── AR Receipt Methods auto-detection (file-based) ───────────────────────
+    # Same "drop a file in a watched folder" pattern as aging/GL-rates above
+    # (see receipt_methods/watcher.py, sibling of aging/watcher.py and
+    # gl_rates/watcher.py) -- EXCEPT unlike either of those, this one
+    # doesn't write to the DB or an in-memory map: it regenerates
+    # oracle/configs/receipt_method_map.json on disk (see
+    # receipt_methods/parser.py). oracle/receipt_method_resolver.py reads
+    # THAT file via app.common.json_cache, which is mtime-based -- so a
+    # freshly-written file is picked up by every process (API + worker)
+    # automatically, no restart/reload call needed.
+    RECEIPT_METHODS_SOURCE: str = "local_folder"           # "local_folder" | "sftp" (future)
+    RECEIPT_METHODS_WATCH_FOLDER: str = "./receipt_methods_watch"  # folder scanned for new extract files
+    RECEIPT_METHODS_POLL_INTERVAL_SECONDS: int = 30       # how often to re-scan
+
+    # ── Receipt method map OUTPUT (generated, kept OUT of the SVN tree) ──────
+    # receipt_methods/watcher.py REWRITES this file every time a fresh extract
+    # lands. Writing that into the SVN-tracked oracle/configs/ directory --
+    # where the original hand-curated file lives -- would mean every daily
+    # regeneration shows up as a local modification under `svn status`, risks
+    # being silently reverted by a future `svn revert`/`svn update`, and risks
+    # being accidentally checked in as if it were a code change. This path is
+    # deliberately OUTSIDE the working copy, same idea as AGING_WATCH_FOLDER/
+    # LOG_DIR already being outside it -- set to an absolute path in .env
+    # (e.g. /home/appadm/cashapply/runtime_data/receipt_method_map.json),
+    # same pattern as those two.
+    #
+    # oracle/receipt_method_resolver.py reads from here FIRST, falling back
+    # to the checked-in seed at oracle/configs/receipt_method_map.json only
+    # if this file doesn't exist yet (e.g. before the watcher/puller
+    # pipeline has run even once) -- see that module's _load_receipt_method_map().
+    RECEIPT_METHOD_MAP_OUTPUT_PATH: str = "./runtime_data/receipt_method_map.json"
+
     # ── Oracle Cloud file-transfer VM puller (SSH jump chain) ────────────────
     # Confirmed, tested connectivity (see context doc this was built from):
     #   App VM -> ssh {ORACLE_FILE_JUMP_USER}@{ORACLE_FILE_JUMP_HOST}   (hop 1, DMZ)
@@ -236,12 +264,12 @@ class Settings(BaseSettings):
     ORACLE_FILE_REMOTE_PATH: str = "/u01/xxzen/data/fin/outbound/ca"
 
     # Exact remote filenames confirmed via `ls -ltr` on the Oracle Cloud VM.
-    # Receipt-methods file deliberately NOT pulled yet -- out of scope for
-    # now; add ORACLE_RECEIPT_METHODS_REMOTE_FILENAME + a third pull-spec
-    # entry in oracle_file_pull/puller.py's PULL_SPECS when that's ready,
-    # rather than reworking this puller.
-    ORACLE_AGING_REMOTE_FILENAME:    str = "xxzen_aging_report_excel.xlsx"
-    ORACLE_GL_RATES_REMOTE_FILENAME: str = "xxzen_gl_daily_rates_extract.txt"
+    ORACLE_AGING_REMOTE_FILENAME:            str = "xxzen_aging_report_excel.xlsx"
+    ORACLE_GL_RATES_REMOTE_FILENAME:         str = "xxzen_gl_daily_rates_extract.txt"
+    # Now wired in (see oracle_file_pull/puller.py's third PullSpec) --
+    # lands in RECEIPT_METHODS_WATCH_FOLDER, where receipt_methods/watcher.py
+    # picks it up and regenerates oracle/configs/receipt_method_map.json.
+    ORACLE_RECEIPT_METHODS_REMOTE_FILENAME:  str = "xxzen_ar_receipt_methods_extract.txt"
 
     # How often the puller checks the remote files' mtimes. Requirement
     # says "4x/day" but exact clock times vs. even spacing was an open
@@ -356,7 +384,6 @@ class Settings(BaseSettings):
     # with the new one, which turns a rotation into three unhurried deploys
     # instead of one synchronised deploy -- see crypto/keyring.py.
     API_ENCRYPTION_KEY_PREVIOUS: str = ""
-
 
 
 @lru_cache

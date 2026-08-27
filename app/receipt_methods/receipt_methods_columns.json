@@ -1,0 +1,20 @@
+{
+  "DEFAULT": {
+    "_description": "Zensar AR Receipt Methods extract (xxzen_ar_receipt_methods_extract.txt). CONFIRMED against a real file on 2026-08-26 (via ze42-v-cshuiprd's puller/watcher run) -- header row: RECEIPT_CLASSES,BANK_ACCOUNT_NAME,BANK_ACCOUNT_NUM,CURRENCY_CODE,BANK_NAME,LE_NAME,BU_NAME,RECEIPT_METHOD_NAME,BANK_BRANCH_NAME. Comma-delimited standard CSV (quoted string fields, unquoted numeric-looking fields) despite the .txt extension -- NOT pipe-delimited like xxzen_gl_daily_rates_extract.txt. There is NO separate OU_NUMBER column -- it's embedded in BU_NAME (e.g. 'PUNE(111)') and must be parsed out; see parser.py's _extract_ou_number().",
+    "sheet_name": "Sheet1",
+    "header_row": 0,
+    "delimiter": ",",
+    "columns": {
+      "account_number":       "BANK_ACCOUNT_NUM",
+      "bu_name":              "BU_NAME",
+      "receipt_class":        "RECEIPT_CLASSES",
+      "receipt_method_name":  "RECEIPT_METHOD_NAME",
+      "currency":             "CURRENCY_CODE",
+      "bank_name":            "BANK_NAME",
+      "bank_account_name":    "BANK_ACCOUNT_NAME",
+      "bank_branch_name":     "BANK_BRANCH_NAME",
+      "le_name":              "LE_NAME"
+    },
+    "notes": "account_number is the join key against LineItem.account_number (matches receipt_method_map.json's existing 'accounts' dict keys). Read as a STRING, not inferred numeric -- BANK_ACCOUNT_NUM values like 07232560000170 lose their leading zero if pandas infers int64, producing an account number that can never match a real LineItem -- see parser.py's dtype=str on every read call. ou_number has no source column and is derived from bu_name (e.g. 'PUNE(111)' -> '111')."
+  }
+}

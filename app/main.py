@@ -21,6 +21,8 @@ from .db.session import init_db
 from .db.settings import get_settings
 from .aging.watcher import start_watcher
 from .gl_rates.watcher import start_gl_rates_watcher
+from .receipt_methods.watcher import start_receipt_methods_watcher
+from .oracle_file_pull.scheduler import start_oracle_file_pull_scheduler
 from .common.errors import register_exception_handlers
 from .common.request_context import RequestIdMiddleware
 from .common.crypto import envelope as crypto_envelope
@@ -127,6 +129,8 @@ def on_startup():
     init_db()   # create_all() — includes every new auth/RBAC/audit/dedup table.
     start_watcher()   # Auto-detect aging reports from AGING_WATCH_FOLDER
     start_gl_rates_watcher()   # Auto-detect GL Daily Rates files from GL_RATES_WATCH_FOLDER -- see gl_rates/watcher.py
+    start_receipt_methods_watcher()   # Auto-detect AR Receipt Methods files from RECEIPT_METHODS_WATCH_FOLDER -- regenerates oracle/configs/receipt_method_map.json -- see receipt_methods/watcher.py
+    start_oracle_file_pull_scheduler()   # Daily (09:30) pull of aging report + GL rates + receipt methods from the Oracle Cloud VM over the DMZ SSH jump chain -- see oracle_file_pull/scheduler.py
 
     # Procrastinate's sync connector does NOT lazily auto-open its pool —
     # every task.defer() call (run_routes.py's /start and /upload) would
@@ -191,7 +195,7 @@ app.include_router(settlement_identifier_routes.router, prefix="/api/bank-accoun
 app.include_router(remittance_inbox_routes.router, prefix="/api/remittance-inbox", tags=["remittance-inbox"])
 
 # Deliberately registered at plain /api -- NOT /api/auth -- so it falls
-# under nginx's general rate-limit zone rather than the strict auth_strict
+# under nginx's general rate-limit zone rather than the strict auth_striashkasasct
 # one (a burst of legitimate CSP violation reports on one page load
 # shouldn't get treated like a login brute-force attempt).
 app.include_router(csp_report_routes.router, prefix="/api", tags=["csp-report"])
