@@ -1,10 +1,10 @@
 """
 app.oracle_file_pull.puller
 ==============================
-Pulls the aging report and GL Daily Rates files from the Oracle Cloud
-file-transfer VM down into this app's LOCAL watch folders
-(AGING_WATCH_FOLDER / GL_RATES_WATCH_FOLDER — see db/settings.py), over
-the confirmed two-hop SSH jump chain:
+Pulls the aging report, GL Daily Rates, and AR Receipt Methods files from
+the Oracle Cloud file-transfer VM down into this app's LOCAL watch folders
+(AGING_WATCH_FOLDER / GL_RATES_WATCH_FOLDER / RECEIPT_METHODS_WATCH_FOLDER
+— see db/settings.py), over the confirmed two-hop SSH jump chain:
 
     App VM -> ssh {ORACLE_FILE_JUMP_USER}@{ORACLE_FILE_JUMP_HOST}       (DMZ)
            -> ssh {ORACLE_FILE_REMOTE_USER}@{ORACLE_FILE_REMOTE_HOST}   (Oracle Cloud VM)
@@ -13,20 +13,20 @@ Both hops are already key-based/passwordless — this opens that exact
 chain natively in paramiko (no shelling out to `ssh -J`), per the
 confirmed-working reference this was built from.
 
-SCOPE, DELIBERATELY: only the aging report and GL rates files are pulled
-right now. The receipt-methods file
-(xxzen_ar_receipt_methods_extract.txt, confirmed to exist in the same
-remote folder) is NOT pulled yet — that's a separate, not-yet-scoped
-task. Adding it later is a two-line change: add its remote filename +
+SCOPE: all three files confirmed to exist in the same remote folder are
+pulled — aging report, GL rates, and (as of this revision) AR receipt
+methods. Adding the receipt-methods entry was exactly the two-line change
+this module's docstring used to describe: a new remote filename +
 target local folder as a third entry in _build_pull_specs() below; no
-other part of this module needs to change.
+other part of this module needed to change.
 
 WHAT THIS DOES NOT DO: it does not parse, upsert, or otherwise touch the
-DOWNLOADED files' contents at all. Once a file lands in AGING_WATCH_FOLDER
-or GL_RATES_WATCH_FOLDER, the EXISTING watchers (app.aging.watcher /
-app.gl_rates.watcher) pick it up exactly as if someone had dropped it
-there by hand — this module's only job is "get the bytes from the remote
-VM into the right local folder, only when the remote file actually
+DOWNLOADED files' contents at all. Once a file lands in AGING_WATCH_FOLDER,
+GL_RATES_WATCH_FOLDER, or RECEIPT_METHODS_WATCH_FOLDER, the EXISTING
+watchers (app.aging.watcher / app.gl_rates.watcher /
+app.receipt_methods.watcher) pick it up exactly as if someone had dropped
+it there by hand — this module's only job is "get the bytes from the
+remote VM into the right local folder, only when the remote file actually
 changed."
 
 USAGE
@@ -61,11 +61,7 @@ class PullSpec:
 
 
 def _build_pull_specs(settings) -> list[PullSpec]:
-    """
-    What to pull, and where each one lands locally. Deliberately just
-    these two right now — see module docstring for how to add the
-    receipt-methods file later without touching anything else.
-    """
+    """What to pull, and where each one lands locally."""
     return [
         PullSpec(
             remote_filename=settings.ORACLE_AGING_REMOTE_FILENAME,
@@ -76,6 +72,11 @@ def _build_pull_specs(settings) -> list[PullSpec]:
             remote_filename=settings.ORACLE_GL_RATES_REMOTE_FILENAME,
             local_folder=settings.GL_RATES_WATCH_FOLDER,
             label="GL daily rates",
+        ),
+        PullSpec(
+            remote_filename=settings.ORACLE_RECEIPT_METHODS_REMOTE_FILENAME,
+            local_folder=settings.RECEIPT_METHODS_WATCH_FOLDER,
+            label="AR receipt methods",
         ),
     ]
 

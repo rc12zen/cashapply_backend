@@ -38,22 +38,62 @@ for the SAME class) -- these are listed in
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from ..common.json_cache import load_json_cached
 
+logger = logging.getLogger(__name__)
+
 _HERE = Path(__file__).parent
+
+# The original, hand-curated file, still checked into SVN under
+# oracle/configs/ -- used as a fallback ONLY (see _load_receipt_method_map()
+# below). Never written to by receipt_methods/watcher.py -- see
+# receipt_methods/parser.py's SEED_PATH comment for why the live,
+# daily-regenerated file deliberately lives elsewhere.
+_SEED_PATH = _HERE / "configs" / "receipt_method_map.json"
 
 
 def _load_receipt_method_map() -> dict:
-    # PATCH: was @lru_cache(maxsize=1) — same cross-process staleness bug
-    # as bank_statement/configs/account_loader.py and
-    # rule_engine/fx_service.py (see either file's PATCH note for the full
-    # explanation). Now mtime-based via app.common.json_cache.
-    path = _HERE / "configs" / "receipt_method_map.json"
-    return load_json_cached(path)
+    """
+    Priority:
+      1. RECEIPT_METHOD_MAP_OUTPUT_PATH (db/settings.py) -- the file
+         receipt_methods/watcher.py regenerates daily from the live Oracle
+         extract, deliberately kept OUTSIDE the SVN working copy.
+      2. The checked-in seed at oracle/configs/receipt_method_map.json --
+         used only if #1 isn't configured, or is configured but the
+         watcher/puller pipeline hasn't produced a file there yet.
+
+    PATCH: was @lru_cache(maxsize=1) — same cross-process staleness bug
+    as bank_statement/configs/account_loader.py and
+    rule_engine/fx_service.py (see either file's PATCH note for the full
+    explanation). Now mtime-based via app.common.json_cache -- for
+    WHICHEVER path is actually loaded, so both the API and worker
+    processes converge on a freshly-written generated file automatically,
+    same as before.
+    """
+    from ..db.settings import get_settings
+
+    settings = get_settings()
+    configured = (getattr(settings, "RECEIPT_METHOD_MAP_OUTPUT_PATH", "") or "").strip()
+
+    if configured:
+        generated_path = Path(configured).expanduser()
+        try:
+            return load_json_cached(generated_path)
+        except FileNotFoundError:
+            logger.warning(
+                "[receipt_method_resolver] No generated receipt method map at configured "
+                "RECEIPT_METHOD_MAP_OUTPUT_PATH=%s (receipt_methods watcher/puller hasn't produced "
+                "one yet) -- falling back to the checked-in seed at %s. This seed can go stale -- "
+                "treat this warning as a signal to check the watcher/puller pipeline, not routine.",
+                generated_path, _SEED_PATH,
+            )
+
+    return load_json_cached(_SEED_PATH)
 
 
 @dataclass
