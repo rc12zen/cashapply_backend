@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 from ..db.models import BankAccount, OrganizationUnit, SourceFile, StatementTransactionRow, User
 from ..storage.client import get_storage_client
 from ..bank_statement.detector import detect_config, list_matching_configs
-from ..bank_statement.account_locator import match_key
+from ..bank_statement.account_locator import match_key, last4
 from ..bank_statement.parser import parse_credit_rows
 from ..audit.service import log_activity
 from .file_hash import check_duplicate_file, compute_file_hash, record_file_hash
@@ -93,10 +93,33 @@ def _get_or_create_bank_account(db: Session, account_number: str | None, bank_na
                                   ou_number: str | None, currency: str | None) -> BankAccount | None:
     if not account_number:
         return None
-    existing = (
-        db.query(BankAccount)
-        .filter(BankAccount.account_number == account_number, BankAccount.bank_name == (bank_name or ""))
-        .first()
+    # IDENTITY IS THE ACCOUNT NUMBER, LEADING ZEROS IGNORED -- match_key, the same
+    # rule _account_for() below and bff/config_builder_routes.py's own
+    # _get_or_create_bank_account() use. This was an EXACT match on
+    # account_number AND bank_name, which made it the SECOND place in the system
+    # with a different idea of what "the same account" means, and it silently
+    # forked accounts:
+    #
+    # A Standard Chartered CSV writes its account as "188603500" while the same
+    # account is registered as "00188603500" (Oracle's form). Called from the
+    # file-level site below, the exact match missed, so a second BankAccount was
+    # created and stamped onto SourceFile.bank_account_id -- while _account_for(),
+    # which already used match_key, correctly filed every parsed ROW against the
+    # original. File pointed at the new empty account, rows sat on the old one,
+    # and /run/start refused with "no pending rows" because it counts rows by the
+    # FILE's account.
+    #
+    # bank_name is deliberately not part of the match: it is free text a person
+    # types (this database holds "CITI Bank", "CITI BANK" and "CITI7005" for one
+    # bank), and the old condition compared it against "" here while the INSERT
+    # below wrote "UNKNOWN" -- so an account this function created could never be
+    # found again by this function.
+    key = match_key(account_number)
+    existing = next(
+        (a for a in db.query(BankAccount)
+                      .filter(BankAccount.account_last4 == last4(account_number)).all()
+         if match_key(a.account_number) == key),
+        None,
     )
     if existing:
         # PATCH: previously returned as-is, forever — ou_id was frozen at
@@ -143,6 +166,12 @@ def _get_or_create_bank_account(db: Session, account_number: str | None, bank_na
     account = BankAccount(
         ou_id=ou.id if ou else None,
         account_number=account_number,
+        # account_last4 was never set here, only by the Config Builder's own
+        # creator. That mattered: the lookup above and _account_for()'s
+        # prefilter both narrow on account_last4, so an account created here was
+        # invisible to BOTH of them and got duplicated again on the next
+        # statement. NOT NULL isn't enforced on the column, so nothing caught it.
+        account_last4=last4(account_number),
         bank_name=bank_name or "UNKNOWN",
         currency=currency,
     )
