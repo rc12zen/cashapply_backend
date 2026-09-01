@@ -45,6 +45,7 @@ from sqlalchemy.orm import Session
 from ..common.errors import AppError
 from ..common.error_codes import ErrorCode
 from ..common.account_masking import mask_account_number
+from ..bank_statement.currency import normalize_currency
 from ..db.models import BankAccount, BankAccountOU, OrganizationUnit, User
 from ..deps import get_db
 from ..auth import require_permission
@@ -195,6 +196,101 @@ def update_business_units(account_id: int, body: UpdateBusinessUnitsRequest, req
     db.commit()
     db.refresh(account)
     return _account_dict(account)
+
+
+class CreateOrganizationUnitRequest(BaseModel):
+    ou_number: str
+    ou_name: str
+    functional_currency: str
+
+
+@router.post("/business-units")
+def create_organization_unit(body: CreateOrganizationUnitRequest, request: Request,
+                              db: Session = Depends(get_db),
+                              user: User = Depends(require_permission("ou:manage"))):
+    """
+    Create a Business Unit directly, without onboarding a bank statement first.
+
+    WHY THIS EXISTS -- the multi-BU dead end
+    -----------------------------------------
+    Until now an OrganizationUnit row could only come into being as a
+    side-effect of saving a bank-account config in Config Builder (see
+    config_builder_routes._get_or_create_organization_unit). But the "additional
+    Business Units" picker on this page can only OFFER OUs that already exist,
+    and PUT /{account_id}/business-units rejects anything unknown outright.
+
+    So the exact case additional BUs exist FOR was unreachable: one bank account
+    receiving money for two Business Units. Adding the second BU required
+    onboarding a statement belonging to it -- and for a shared account there
+    frequently IS no second statement, so it could never be added at all. The
+    only workaround was to find some unrelated statement for that BU, configure
+    it purely to bring the OU into existence, then come back here.
+
+    The list endpoint above already assumed OUs could exist independently of
+    accounts ("Deliberately includes OUs with NO bank account attached yet");
+    nothing ever created them that way. This is that missing path.
+
+    GET THE NAME EXACTLY RIGHT
+    ---------------------------
+    oracle/fusion_client.py's get_ou_display_name() builds Oracle's
+    "BusinessUnit" field as EXACTLY f"{ou_name}({ou_number})" -- e.g.
+    "PUNE(111)" -- and Oracle Fusion matches that string character for
+    character. A wrong case or a stray space 404s every receipt for this OU,
+    with no fuzzy fallback anywhere in the posting path. The create form shows
+    the resulting string live for this reason; it is still worth checking
+    against Oracle before the first run.
+
+    Same `ou:manage` tier as editing an OU's name/currency below -- that edit
+    already carries the identical exact-match risk, so creation is not a
+    higher-stakes act than the correction path that already exists.
+    """
+    ou_number = (body.ou_number or "").strip()
+    ou_name = (body.ou_name or "").strip()
+    raw_currency = (body.functional_currency or "").strip()
+
+    if not ou_number:
+        raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED, detail="OU Number cannot be blank")
+    if not ou_name:
+        raise AppError(ErrorCode.BUSINESS_UNIT_REQUIRED, detail="Business Unit name cannot be blank")
+    if not raw_currency:
+        raise AppError(ErrorCode.CONFIG_FIELD_REQUIRED, detail="Functional Currency cannot be blank")
+
+    # Standardise to an ISO-4217 code the same way every other currency entry
+    # point does (bank_statement/currency.py). functional_currency drives real
+    # Oracle FX conversion, and once set it is never overwritten by a later
+    # account save -- only by the edit endpoint below. A typo here is therefore
+    # effectively permanent until someone notices wrong conversions.
+    currency = normalize_currency(raw_currency)
+    if not currency:
+        raise AppError(
+            ErrorCode.CONFIG_FIELD_REQUIRED,
+            detail=f"Functional Currency '{raw_currency}' is not a recognised ISO-4217 code",
+        )
+
+    existing = db.query(OrganizationUnit).filter(OrganizationUnit.ou_number == ou_number).first()
+    if existing:
+        raise AppError(
+            ErrorCode.ORGANIZATION_UNIT_EXISTS,
+            detail=f"{ou_number} is already set up as '{existing.ou_name}'",
+        )
+
+    ou = OrganizationUnit(ou_number=ou_number, ou_name=ou_name, functional_currency=currency)
+    db.add(ou)
+    db.flush()
+
+    log_activity(
+        db, user, action="bank_account.ou_created", entity_type="OrganizationUnit",
+        entity_id=ou.ou_number, ip_address=_client_ip(request),
+        metadata={
+            "ou_number": ou.ou_number,
+            "ou_name": ou.ou_name,
+            "functional_currency": ou.functional_currency,
+            "oracle_business_unit_string": f"{ou.ou_name}({ou.ou_number})",
+        },
+    )
+    db.commit()
+    db.refresh(ou)
+    return _ou_dict(ou)
 
 
 class UpdateOrganizationUnitRequest(BaseModel):

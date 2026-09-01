@@ -656,24 +656,57 @@ def mark_eligible_for_receipt(db: Session, line_item_id: int, triggered_by: str)
 
     result = create_receipt_for_line_item(db, r)
 
-    r.receipt_eligibility    = "eligible"
-    r.receipt_eligibility_at = dt.datetime.utcnow()
-    r.receipt_eligibility_by = triggered_by
+    # ONLY record the decision if Oracle actually accepted the receipt.
+    #
+    # This used to be set unconditionally, which produced a dead end (found
+    # 2026-08-26): a failed Oracle call still stamped receipt_eligibility
+    # "eligible", so _cond_receipt_eligibility_undecided went False and BOTH
+    # Mark Eligible and Discard vanished -- while no receipt existed. Nothing
+    # else could rescue the row either: `retry_oracle` is gated to post_failed
+    # + reference_status_failed (that is the invoice-MAPPING retry, a different
+    # failure), the row stayed in Unidentified because "eligible" is not part
+    # of _category_for_row's precedence, and the run-level bulk retry refuses
+    # unless EVERY receipt attempt in the run failed. The row had no receipt
+    # and no way to make one.
+    #
+    # Leaving the flag untouched on failure returns the row to undecided, so
+    # the SPOC can simply try again -- or Discard it, which a failed attempt
+    # may well be the prompt for. Nothing is lost by not recording it: the
+    # attempt is durably on the row anyway (oracle_post_status="failed",
+    # oracle_status_code, post_message, oracle_posted_at, oracle_response_raw)
+    # and in the RowStatusHistory entry written below either way.
+    #
+    # Retrying is safe: _build_receipt_number() is deterministic
+    # (CASHAPPLY-{ou}-{date}-{row_id}), so if a first attempt actually landed
+    # in Oracle but the response was lost, Oracle's own duplicate check
+    # prevents a second receipt rather than creating one.
+    if result.get("success"):
+        r.receipt_eligibility    = "eligible"
+        r.receipt_eligibility_at = dt.datetime.utcnow()
+        r.receipt_eligibility_by = triggered_by
 
     db.add(RowStatusHistory(
         line_item_id=r.id, from_state="unidentified", to_state="unidentified",
         trigger="spoc_mark_eligible", rule_id=r.rule_id,
         triggered_by=triggered_by,
+        # The attempt is recorded either way, but the wording has to match what
+        # actually happened -- on failure the row is NOT marked eligible, and a
+        # history line claiming otherwise would be the only surviving record of
+        # a decision that was never stored.
         comment=(
-            f"Marked eligible for receipt creation — "
-            f"{'receipt created (' + str(r.oracle_ref_no) + ')' if result.get('success') else 'receipt creation FAILED: ' + str(result.get('message'))}"
+            f"Marked eligible for receipt creation — receipt created ({r.oracle_ref_no})"
+            if result.get("success") else
+            f"Receipt creation FAILED, row left undecided: {result.get('message')}"
         ),
     ))
     db.commit()
 
     return {
         "id": r.id,
-        "receipt_eligibility": "eligible",
+        # Report the real value, not a hardcoded "eligible" -- the frontend
+        # decides what to tell the SPOC from this, and on failure the honest
+        # answer is that nothing was recorded.
+        "receipt_eligibility": r.receipt_eligibility,
         "receipt_created": bool(result.get("success")),
         "oracle_ref_no": r.oracle_ref_no,
         "standard_receipt_id": r.standard_receipt_id,
@@ -733,6 +766,94 @@ def discard_row(db: Session, line_item_id: int, comment: str | None, triggered_b
     db.commit()
 
     return {"id": r.id, "status": "Discarded"}
+
+
+def restore_discarded_row(db: Session, line_item_id: int, comment: str | None,
+                          triggered_by: str) -> dict:
+    """
+    Undo a Discard: return the row to Unidentified with NO eligibility decision
+    recorded, exactly as it stood before someone discarded it.
+
+    WHY THIS IS SAFE, AND WHY IT IS NOT AN "UNDO REJECT"
+    -----------------------------------------------------
+    Discard is the one terminal state with no external footprint. Step 4.5 holds
+    receipt creation back for unidentified rows until a SPOC decides (see
+    LineItem.receipt_eligibility), and discard_row() above resolves that
+    decision to "no" WITHOUT ever calling Oracle. So a discarded row has no
+    receipt, no invoice references, and no ledger claim -- there is nothing to
+    reverse, which is precisely why this can exist while un-rejecting a posted
+    row cannot (that needs an Oracle-side credit memo; see _cond_rejectable).
+
+    WHY IT RESTORES TO *UNDECIDED*, NOT TO "ELIGIBLE"
+    -------------------------------------------------
+    receipt_eligibility goes back to None rather than "eligible". This is an
+    undo, so it returns the SPOC to the decision point -- Mark Eligible and
+    Discard both become available again -- instead of silently making the
+    opposite decision on their behalf and creating an Oracle receipt off the
+    back of a mis-click.
+
+    THE DEAD END THIS FIXES (found 2026-08-24)
+    -------------------------------------------
+    Before this existed there was no way out of `discarded` at all:
+
+      - mark_eligible_for_receipt() is gated by _guard_unidentified_undecided(),
+        which requires category == Unidentified AND receipt_eligibility is None.
+        A discarded row fails both halves.
+      - Reject was offered on discarded rows (its applicable_categories was
+        None, i.e. every category). Rejecting one moved it to Rejected, because
+        hitl_status outranks receipt_eligibility in _category_for_row().
+      - Reopen then cleared hitl_status but never touched receipt_eligibility,
+        so the row fell straight back through the precedence into Discarded --
+        now with Mark Eligible, Discard AND Reopen all hidden, and Reject the
+        only button left. An unbreakable loop.
+
+    Reject is now scoped away from both `discarded` and `unidentified` (see
+    scripts/seed_actions.py), so that path is closed from the other end too.
+    """
+    r = db.query(LineItem).get(line_item_id)
+    if not r:
+        return {"error": "not found"}
+
+    # Guard on the eligibility flag rather than the display category: a row
+    # that was discarded and THEN rejected reads as category `rejected`
+    # (hitl_status outranks receipt_eligibility), yet it is still a discarded
+    # row underneath and must still be recoverable. That combination is
+    # exactly what the old loop produced, so refusing it here would leave the
+    # already-stuck rows stuck.
+    if r.receipt_eligibility != "discarded":
+        return {
+            "error": "not_discarded",
+            "message": (
+                f"Row {r.id} is not discarded, so there is nothing to restore."
+            ),
+        }
+
+    # current_state is an Enum on a freshly-loaded row but a plain string once
+    # something in this session has already written to it -- same quirk
+    # reopen_with_edits.py documents. Only used for the history entry.
+    _cs = r.current_state
+    from_state = getattr(_cs, "value", _cs) or "discarded"
+
+    r.receipt_eligibility    = None
+    r.receipt_eligibility_at = None
+    r.receipt_eligibility_by = None
+    r.current_state          = "unidentified"
+    r.status                 = "Unidentified"
+    # Clear a rejection stacked on top of the discard as well -- otherwise the
+    # row would surface as Rejected rather than Unidentified, and the restore
+    # would look like it had done nothing.
+    if r.hitl_status == "rejected":
+        r.hitl_status = None
+    r.version                = (r.version or 0) + 1
+
+    db.add(RowStatusHistory(
+        line_item_id=r.id, from_state=from_state or "discarded", to_state="unidentified",
+        trigger="spoc_restore_discarded", rule_id=r.rule_id,
+        triggered_by=triggered_by, comment=comment,
+    ))
+    db.commit()
+
+    return {"id": r.id, "status": "Unidentified"}
 
 
 def override_settlement_as_customer_payment(db: Session, line_item_id: int, triggered_by: str) -> dict:

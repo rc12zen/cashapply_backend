@@ -46,9 +46,31 @@ ACTIONS: dict[str, tuple] = {
     # confirm_required is False: Reject opens RejectRowModal, which collects the
     # REASON and carries its own confirm button. The inline "Sure?" on top of a
     # modal was a double prompt for one decision.
+    # applicable_categories was None -- i.e. EVERY category -- leaving Reject as
+    # the only action with no category gate at all. Two categories where that
+    # was wrong (2026-08-24):
+    #
+    #   unidentified : nothing has been decided yet, so there is no decision to
+    #                  reverse. "Discard" is the correct exit for a row that is
+    #                  not a real receivable, and offering both side by side
+    #                  asked the SPOC to choose between two buttons that meant
+    #                  almost the same thing.
+    #   discarded    : same, plus it created an inescapable loop. Rejecting a
+    #                  discarded row moved it to Rejected (hitl_status outranks
+    #                  receipt_eligibility in _category_for_row); Reopen then
+    #                  cleared hitl_status but not receipt_eligibility, so the
+    #                  row fell back to Discarded with Mark Eligible, Discard
+    #                  and Reopen all hidden and Reject the only button left.
+    #                  Recovery is now "restore_discarded" below.
+    #
+    # Listed explicitly rather than as an exclusion so that a NEW category added
+    # later has to opt in deliberately, instead of silently inheriting Reject.
     "reject": (
         "Reject", "x-circle", "hitl:reject",
-        None, "rejectable", False, True, 20,
+        ["needs_remittance", "needs_distribution", "ready_for_oracle",
+         "short_payment", "overpayment", "overpayment_parked",
+         "conflict_exception", "post_failed", "distributed"],
+        "rejectable", False, True, 20,
     ),
     # Reopen (undo a rejection, or un-park an overpayment) — see
     # hitl/actions_registry.py's category gate. Same permission tier as reject.
@@ -137,6 +159,21 @@ ACTIONS: dict[str, tuple] = {
     "discard": (
         "Discard", "trash-2", "hitl:reject",
         None, "discardable", True, True, 51,
+    ),
+    # The way back out of Discard. Deliberately a separate action rather than
+    # widening "reopen": Reopen opens ReopenAndReviewModal, where the SPOC edits
+    # the customer/invoice mapping and previews the resulting bucket -- a
+    # discarded row has no mapping to edit, so that modal would present an empty
+    # review of nothing. This is a plain one-click undo with its own audit
+    # trail, and its own trigger in RowStatusHistory.
+    #
+    # Category gate is `discarded` alone; the server-side guard in
+    # restore_discarded_row() keys on receipt_eligibility instead, so rows
+    # already stranded by the old discard->reject->reopen loop (which read as
+    # category `rejected`) can still be recovered by calling the endpoint.
+    "restore_discarded": (
+        "Restore", "rotate-ccw", "hitl:reject",
+        ["discarded"], None, True, False, 52,
     ),
     # PATCH: replaces "edit_gl_rate" (GL conversion rate only) with a
     # unified "Edit Receipt" action covering account number, OU name,
