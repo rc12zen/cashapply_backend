@@ -282,11 +282,11 @@ def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str
     )
 
     # ── Oracle payload preview ────────────────────────────────────────────────
-    # r.oracle_payload is set by rule_engine/orchestrator.py's Step 4.5 for
-    # EVERY row right after reconciliation — so by the time this endpoint
-    # is hit, it should already be populated for virtually every row. The
-    # fallback preview below only matters if that step somehow never ran
-    # for this row (e.g. data from before this flow existed).
+    # r.oracle_payload is set once a receipt has actually been created for
+    # this row — either via the Analysis History "Create Receipts" bulk
+    # action or as step 1 of Approve (see oracle/receipt_creation.py) — not
+    # automatically at analysis time. The fallback preview below covers
+    # every row that hasn't gone through either of those yet.
     # A distributed PARENT never gets a receipt of its own (see
     # hitl/split_and_map.py's confirm_distribution() docstring) -- only its
     # children do. Building/showing a payload preview here was misleading:
@@ -451,8 +451,9 @@ def build_row_detail(db: Session, record_id: int, user_permission_codes: set[str
             # NEW: the actual "receipt created" output from Oracle — was
             # discarded before (only a few extracted fields were kept).
             # None until create_receipt_for_line_item() has actually run
-            # for this row (i.e. right after Bank Reconciliation, for
-            # every row — see rule_engine/orchestrator.py's Step 4.5).
+            # for this row — via bulk Create Receipts or Approve's
+            # create-if-missing step (see oracle/receipt_creation.py);
+            # no longer automatic at analysis time.
             "receipt_response_raw": r.oracle_response_raw,
             # NEW: raw response(s) from the invoice-mapping (remittance
             # reference) POST(s) — a list, one per matched invoice. None

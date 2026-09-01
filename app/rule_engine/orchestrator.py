@@ -96,7 +96,10 @@ from .shortage_reason import apply_shortage_diagnosis
 from .remittance_lookup import build_remittance_view
 from .fx_service import FxService, get_functional_currency
 from .ou_resolver import resolve_ou_status
-from ..oracle.receipt_creation import create_receipt_for_line_item
+# NOTE: create_receipt_for_line_item is no longer imported/called here —
+# receipt creation moved out of the orchestrator entirely (see the "Step
+# 4.5 REMOVED" comment below). It's now called from hitl/service.py's
+# create_receipts_bulk() and _map_invoice_and_update() instead.
 
 STATEMENT_BUCKET = "bank-statements"
 
@@ -978,126 +981,36 @@ def _run_analysis(run_id: int, selected_files: list[str]) -> None:
                 f"{rule_engine_failed_count} failed out of {total_rows_to_evaluate} row(s).")
 
             # The outer `db` session hasn't seen any of the per-thread
-            # commits above -- refresh its identity map before Step 4.5
-            # queries LineItem rows by run_id (same reasoning as Step 4.5's
-            # own db.expire_all() further down).
+            # commits above -- refresh its identity map before Step 5 reads
+            # LineItem rows by run_id.
             db.expire_all()
 
-            # ── Step 4.5: Create a bare Oracle receipt for EVERY credit row ────
-            # in this run — regardless of category (unidentified,
-            # needs_remittance, ready_for_oracle, conflict_exception, all of
-            # it) — WITH ONE EXCEPTION as of this patch: unidentified (R8,
-            # NO_SIGNAL) rows are HELD until a SPOC decides whether they're
-            # even a real receivable transaction at all (see
-            # LineItem.receipt_eligibility and hitl/service.py's
-            # mark_eligible_for_receipt() / discard_row()). Creating a bare
-            # Oracle receipt for a row with zero extracted signal — which may
-            # turn out to be an internal transfer, a bank fee, garbage
-            # narration, anything — meant every one of those needed a manual
-            # Oracle-side reversal later if it turned out not to be a real
-            # receipt. Holding creation costs nothing (the receipt is created
-            # the moment a SPOC marks it eligible instead) and avoids that
-            # cleanup entirely for the rows that get discarded.
+            # ── Step 4.5 REMOVED ────────────────────────────────────────────
+            # This used to create a bare Oracle receipt for every credit row
+            # automatically, synchronously, right here — before any human
+            # ever reviewed the row, and before any manual correction
+            # (customer mapping, invoice mapping) could happen. Because the
+            # receipt payload (including CustomerAccountNumber) was built
+            # once at that moment and never re-sent to Oracle, a later SPOC
+            # correction never reached the already-created receipt.
             #
-            # Every other category is UNCHANGED — still created automatically,
-            # immediately, exactly as before. This is deliberately narrow: it
-            # is NOT a general eligibility gate, only the one this was asked
-            # for.
-            unidentified_undecided_ids: set[int] = {
-                li.id for li in db.query(LineItem.id).filter(
-                    LineItem.run_id == run_id,
-                    LineItem.rule_id == "R8",
-                    LineItem.receipt_eligibility.is_(None),
-                ).all()
-            }
-            # PATCH (bug fix): needs_distribution rows (R16/R17/R18 -- credit
-            # card / cheque / third-party provider) were NEVER excluded here,
-            # contradicting the original requirement that no receipt should
-            # exist until the multi-customer split is actually resolved (see
-            # the broker-payment PRD discussion this whole feature came
-            # from). A bare receipt was being created automatically for
-            # these the same as any ordinary row, meaning Oracle already had
-            # a receipt sitting there before anyone had decided how the
-            # amount splits across customers. Held back the same way
-            # unidentified rows already are, until the (not-yet-built)
-            # Split & Map screen resolves the row and creates the real
-            # per-customer receipts itself.
-            needs_distribution_ids: set[int] = {
-                li.id for li in db.query(LineItem.id).filter(
-                    LineItem.run_id == run_id,
-                    LineItem.rule_id.in_(["R16", "R17", "R18"]),
-                ).all()
-            }
-            held_back_ids = unidentified_undecided_ids | needs_distribution_ids
-            all_line_item_ids_this_run = [
-                li.id for li in db.query(LineItem.id).filter(LineItem.run_id == run_id).all()
-                if li.id not in held_back_ids
-            ]
-            if held_back_ids:
-                dbg(run_id, "ORACLE", "batch",
-                    f"Step 4.5: holding receipt creation for {len(unidentified_undecided_ids)} "
-                    f"unidentified row(s) pending SPOC eligibility decision, and {len(needs_distribution_ids)} "
-                    f"needs_distribution row(s) pending Split & Map.")
-            total_receipt_rows = len(all_line_item_ids_this_run)
-            max_workers = max(1, get_settings().ORACLE_RECEIPT_MAX_WORKERS)
-            dbg(run_id, "ORACLE", "batch",
-                f"Step 4.5: creating receipts for {total_receipt_rows} row(s) "
-                f"across up to {max_workers} worker thread(s)...")
-
-            def _create_receipt_in_own_session(line_item_id: int) -> bool:
-                """Runs in a worker thread — own session, own commit/rollback.
-                Returns True on a successful receipt creation, False otherwise
-                (including if an exception was raised)."""
-                try:
-                    with session_scope() as thread_db:
-                        li = thread_db.query(LineItem).get(line_item_id)
-                        if li is None:
-                            dbg(run_id, "ORACLE", f"row={line_item_id}", "Row vanished before receipt creation — skipped.")
-                            return False
-                        result = create_receipt_for_line_item(thread_db, li)
-                        if result.get("success"):
-                            dbg(run_id, "ORACLE", f"row={li.id}",
-                                f"Receipt created — StandardReceiptId={li.standard_receipt_id} ReceiptNumber={li.oracle_ref_no}")
-                            return True
-                        dbg(run_id, "ORACLE", f"row={li.id}", f"Receipt creation FAILED — {li.post_message}")
-                        return False
-                except Exception as receipt_exc:
-                    # Mirror the old per-row except-and-continue behavior, but
-                    # in a fresh session (the one above may have already been
-                    # rolled back/closed by session_scope's own except clause).
-                    dbg(run_id, "ORACLE", f"row={line_item_id}", f"Receipt creation RAISED — {receipt_exc}")
-                    try:
-                        with session_scope() as failure_db:
-                            li = failure_db.query(LineItem).get(line_item_id)
-                            if li is not None:
-                                li.oracle_post_status = "failed"
-                                li.post_message = f"Receipt creation raised: {receipt_exc}"
-                    except Exception:
-                        pass  # don't let failure-path bookkeeping mask the original exception
-                    return False
-
-            receipt_success_count = 0
-            receipt_failed_count = 0
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = {
-                    pool.submit(_create_receipt_in_own_session, li_id): li_id
-                    for li_id in all_line_item_ids_this_run
-                }
-                for future in as_completed(futures):
-                    if future.result():
-                        receipt_success_count += 1
-                    else:
-                        receipt_failed_count += 1
-
-            # The outer `db` session above hasn't seen any of the per-thread
-            # commits — refresh its identity map so downstream code (e.g. the
-            # run-summary computed after Step 5) reads the up-to-date rows
-            # rather than stale pre-receipt-creation state.
-            db.expire_all()
-
-            dbg(run_id, "ORACLE", "batch",
-                f"Step 4.5 complete: {receipt_success_count} succeeded, {receipt_failed_count} failed "
-                f"out of {total_receipt_rows} row(s).")
+            # Receipt creation is now explicit and user-triggered, always
+            # with a FRESH payload reflecting current (possibly corrected)
+            # row state, via exactly two entry points:
+            #   1. Analysis History's bulk "Create Receipts" action
+            #      (hitl/service.py::create_receipts_bulk), scoped to
+            #      ready_for_oracle rows only.
+            #   2. Approve (hitl/service.py::_map_invoice_and_update), which
+            #      creates the receipt first if one doesn't exist yet, then
+            #      maps/applies the invoice — same underlying
+            #      create_receipt_for_line_item() call this step used to
+            #      make, just moved to be user-triggered instead of
+            #      automatic.
+            # Both entry points are independently gated to categories a row
+            # can only reach after rule evaluation resolves it (see their
+            # own docstrings) — the old unidentified/needs_distribution
+            # exclusions this step used to compute no longer need a home
+            # here, since nothing auto-creates for ANY row anymore.
 
             # ── Step 5: Mark run complete ─────────────────────────────────────
             run = db.query(AnalysisRun).get(run_id)

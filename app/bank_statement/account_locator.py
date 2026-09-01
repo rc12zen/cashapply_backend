@@ -82,7 +82,25 @@ def match_key(value) -> str:
 # Explicit separators that join several accounts in one cell (e.g. a main +
 # sub-account header like "41678876 & 41678884"). Deliberately does NOT include
 # spaces, so a single grouped account like "0002 0502 4781" stays intact.
-_ACCT_SEP = re.compile(r"\s*(?:&|,|/|\+|\band\b)\s*", re.IGNORECASE)
+#
+# '-' IS a separator, same as '&'. An HSBC UK header cell reads
+# "401310-41678876" -- sort code, hyphen, account number -- and only the second
+# half, 41678876, is the account this file's rows post against. Without the
+# hyphen here, normalize_account() stripped it and the two halves fused into
+# "40131041678876", which then flowed all the way through to Oracle as
+# RemittanceBankAccountNumber: an account number that exists nowhere, on every
+# row of the file. Note the `regex` locator never had this bug -- ACCOUNT_PATTERN
+# matches alnum-only runs, so it already broke on the hyphen. This brings the
+# `cell`/`column` locators into line with it rather than the other way round.
+#
+# Which half a config is FOR is decided once in the wizard, by registering under
+# one of them -- exactly as it already works for '&' cells. parser._row_account()
+# then picks the registered account out of the pair on every row.
+#
+# A grouped account that happens to use hyphens ("4013-1041-6788-76") still
+# survives: none of its four fragments clears _looks_like_account()'s 6-char bar,
+# so split_accounts() falls through to normalizing the whole cell.
+_ACCT_SEP = re.compile(r"\s*(?:&|,|/|\+|-|\band\b)\s*", re.IGNORECASE)
 
 # The ONE pattern the "regex" locator type ever uses: any 6-34 char
 # alphanumeric run containing at least one digit. Covers plain numeric
@@ -107,11 +125,13 @@ def _looks_like_account(n: str) -> bool:
 def split_accounts(value) -> list[str]:
     """Split a cell that may hold several accounts into normalized account tokens.
 
-    Handles main/sub-account headers such as "41678876 & 41678884" by splitting on
-    explicit separators (& , / + 'and') only — never on spaces — then normalizing
-    each piece. If no piece looks like an account (e.g. a lone value with no
-    separator), falls back to the whole normalized cell so single-account files are
-    unaffected. Order-preserving and de-duplicated.
+    Handles main/sub-account headers such as "41678876 & 41678884", and sort-code
+    style pairs such as "401310-41678876", by splitting on explicit separators
+    (& , / + - 'and') only — never on spaces — then normalizing each piece. If no
+    piece looks like an account (e.g. a lone value with no separator, or a grouped
+    account like "4013-1041-6788-76" whose fragments are all too short), falls back
+    to the whole normalized cell so single-account files are unaffected.
+    Order-preserving and de-duplicated.
     """
     if value is None:
         return []

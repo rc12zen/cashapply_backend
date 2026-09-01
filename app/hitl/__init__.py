@@ -12,6 +12,10 @@ from .service import (
     discard_row,
     override_settlement_as_customer_payment,
     edit_gl_rate,
+    edit_receipt_fields,
+    create_receipts_bulk,
+    reverse_receipt_invoice,
+    delete_receipt,
 )
 from .overpayment import park_overpayment, DISPOSITIONS as OVERPAYMENT_DISPOSITIONS
 from .manual_mapping import (
@@ -37,6 +41,10 @@ __all__ = [
     "discard_row",
     "override_settlement_as_customer_payment",
     "edit_gl_rate",
+    "edit_receipt_fields",
+    "create_receipts_bulk",
+    "reverse_receipt_invoice",
+    "delete_receipt",
     "get_mapping_options",
     "get_invoices_for_customer",
     "preview_manual_mapping",

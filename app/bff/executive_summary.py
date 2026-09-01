@@ -4,18 +4,20 @@ app.bff.executive_summary  —  /api/executive-summary/*
 Executive Summary Dashboard.
 
 PATCH NOTE (two-step Oracle receipt flow):
-  A bare Oracle receipt is now created for EVERY credit row during Bank
-  Reconciliation (rule_engine/orchestrator.py's Step 4.5), regardless of
-  category — tracked via LineItem.oracle_post_status. Invoice mapping
-  (attaching remittanceReferences to that receipt) still only happens for
+  A bare Oracle receipt is created explicitly and on demand — via the
+  Analysis History "Create Receipts" bulk action, or as step 1 of Approve
+  (see oracle/receipt_creation.py) — no longer automatically for every
+  credit row during Bank Reconciliation. Receipt creation is tracked via
+  LineItem.oracle_post_status. Invoice mapping (attaching
+  remittanceReferences to that receipt) still only happens for
   ready_for_oracle rows at SPOC-approval time, tracked via the separate
   LineItem.reference_status. "Posted" in this file always means
   reference_status == "success" — a row having a bare receipt
-  (oracle_post_status == "success") is NOT sufficient, since every row
-  gets one of those regardless of whether it's actually been reviewed.
+  (oracle_post_status == "success") is NOT sufficient, since a receipt
+  can exist without the row having actually been reviewed/approved yet.
   Dates in this file (the "Posted Date" column, date_from/date_to filters)
   are reference_added_at (when invoice mapping happened), not
-  oracle_posted_at (when the bare receipt was created — every row, not
+  oracle_posted_at (when the bare receipt was created — which may lag
   meaningful for an audit view of what's actually been posted).
 
 POSTED VIEW  ("Invoice Mapped" conceptually — see PATCH note above)

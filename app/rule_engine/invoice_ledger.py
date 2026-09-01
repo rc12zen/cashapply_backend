@@ -265,3 +265,18 @@ def release_applications(db: Session, line_item) -> None:
         InvoiceApplication.line_item_id == line_item.id,
     ).update({"status": "released", "updated_at": dt.datetime.utcnow()})
     db.flush()
+
+
+def release_application_for_invoice(db: Session, line_item_id: int, invoice_number: str) -> None:
+    """Called by hitl/service.py's reverse_receipt_invoice() — frees ONLY
+    the ledger claim for the ONE invoice that was just unapplied in Oracle
+    (SOAP processUnapplyReceipt), leaving any other invoice still applied
+    on the same row's receipt untouched. Mirrors
+    release_application_for_entry() (which does the same thing keyed on a
+    'distributed' parent's distribution_entry_id instead of a plain
+    line_item_id) — reversal is per-invoice, same granularity."""
+    db.query(InvoiceApplication).filter(
+        InvoiceApplication.line_item_id == line_item_id,
+        InvoiceApplication.invoice_number == invoice_number,
+    ).update({"status": "released", "updated_at": dt.datetime.utcnow()})
+    db.flush()

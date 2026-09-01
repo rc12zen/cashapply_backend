@@ -169,3 +169,92 @@ def resolve_receipt_method(
         ambiguous=ambiguous,
         candidates=ranked,
     )
+
+
+@dataclass
+class ReceiptFieldsValidation:
+    """
+    Non-blocking sanity check for a SPOC-edited account_number / ou_number /
+    receipt_method_name combination against receipt_method_map.json --
+    see hitl/service.py's edit_receipt_fields() ("warn but allow" policy,
+    per product decision: an edited combo that doesn't match a real
+    extract row is surfaced as a warning, kept in the audit trail, and
+    still saved -- never a hard block).
+    """
+    valid: bool
+    reason: Optional[str] = None
+    candidates: list[dict] = field(default_factory=list)
+
+
+def validate_receipt_method_combo(
+    account_number: str | None,
+    ou_number: str | None,
+    receipt_method_name: str | None,
+) -> ReceiptFieldsValidation:
+    """
+    Checks whether (account_number, ou_number, receipt_method_name) is a
+    real row in receipt_method_map.json -- the same ground-truth file
+    resolve_receipt_method() reads. Three ways this comes back
+    valid=False, each with its own reason so the SPOC/audit trail knows
+    exactly what didn't match:
+
+      1. account_number isn't in the extract at all.
+      2. account_number exists, but not under this ou_number.
+      3. account_number+ou_number exists, but receipt_method_name doesn't
+         match any candidate's receipt_method_name for that pair.
+
+    Comparison is case-insensitive on the method name (Oracle extract
+    values are human-typed free text -- e.g. "Cash Receipt Kotak
+    Mahindra170" -- and a SPOC retyping it exactly including case
+    shouldn't be required for a match that's otherwise correct).
+
+    This is advisory only -- callers decide whether valid=False blocks
+    the save or just gets logged/returned as a warning. It never raises.
+    """
+    if not account_number:
+        return ReceiptFieldsValidation(valid=False, reason="No account number given.")
+
+    data = _load_receipt_method_map()
+    accounts: dict = data.get("accounts", {})
+
+    key = str(account_number).strip()
+    candidates = accounts.get(key, [])
+    if not candidates:
+        return ReceiptFieldsValidation(
+            valid=False,
+            reason=f"Account '{account_number}' does not appear in receipt_method_map.json at all.",
+        )
+
+    if ou_number:
+        ou_key = str(ou_number).strip()
+        ou_matches = [c for c in candidates if c.get("ou_number") == ou_key]
+        if not ou_matches:
+            return ReceiptFieldsValidation(
+                valid=False,
+                reason=(
+                    f"Account '{account_number}' exists in receipt_method_map.json, but not "
+                    f"under OU '{ou_number}' -- known OUs for this account: "
+                    f"{sorted({c.get('ou_number') for c in candidates if c.get('ou_number')})}."
+                ),
+                candidates=candidates,
+            )
+        candidates = ou_matches
+
+    if not receipt_method_name:
+        # Nothing to check the method against -- account/OU alone matched.
+        return ReceiptFieldsValidation(valid=True, candidates=candidates)
+
+    method_key = receipt_method_name.strip().lower()
+    method_matches = [c for c in candidates if (c.get("receipt_method_name") or "").strip().lower() == method_key]
+    if not method_matches:
+        return ReceiptFieldsValidation(
+            valid=False,
+            reason=(
+                f"'{receipt_method_name}' is not a known receipt method for account "
+                f"'{account_number}'" + (f" / OU '{ou_number}'" if ou_number else "") +
+                f" -- known methods: {sorted({c.get('receipt_method_name') for c in candidates if c.get('receipt_method_name')})}."
+            ),
+            candidates=candidates,
+        )
+
+    return ReceiptFieldsValidation(valid=True, candidates=method_matches)
