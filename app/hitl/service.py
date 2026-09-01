@@ -37,6 +37,9 @@ from sqlalchemy.orm import Session
 from ..db.models import LineItem, RowStatusHistory
 from ..oracle.fusion_client import OracleFusionClient, build_remittance_reference_payloads
 from ..oracle.receipt_creation import create_receipt_for_line_item
+from ..oracle.receipt_method_resolver import validate_receipt_method_combo
+from ..oracle.soap_client import OracleSoapClient
+from ..rule_engine.fx_service import get_ou_display_name
 from ..bff.metrics import (
     _category_for_row, _settlement_override_category, GROUP_READY_FOR_ORACLE,
     GROUP_SHORT_PAYMENT, GROUP_UNIDENTIFIED, GROUP_NEEDS_DISTRIBUTION,
@@ -46,7 +49,7 @@ from ..bff.metrics import (
 from ..rule_engine.state_machine import CATEGORY_TO_STATE
 from ..rule_engine.invoice_ledger import (
     confirm_applications, release_applications, record_application, check_duplicate,
-    claim_amount_for,
+    claim_amount_for, release_application_for_invoice,
 )
 from ..aging.aging_store import get_aging_map
 
@@ -140,18 +143,25 @@ def _map_invoice_and_update(
     db: Session, r: LineItem, invoice_breakup: list[dict] | None
 ) -> dict:
     """
-    Invoice mapping — step 2 of the two-step Oracle flow. Attaches
-    remittanceReferences to the receipt already created for this row
-    during Bank Reconciliation (rule_engine/orchestrator.py's Step 4.5) —
-    does NOT create a new receipt in the normal case.
-
-    Recovery path: if this row somehow never got a successful receipt
-    (r.oracle_post_status != "success" — e.g. the original bare-receipt
-    POST failed, or this row was created before this flow existed), the
-    receipt is created fresh right here, then the reference is attached
-    to it — both in this one call, so a SPOC approving a row always
-    either fully succeeds or fails clearly, never silently skips the
-    reference step because of a stale receipt-creation failure.
+    Two-step Oracle flow, both steps in this one call:
+      Step 1 — create the receipt now if this row doesn't have one yet
+        (r.oracle_post_status != "success"). Receipts are no longer
+        created automatically during analysis (the orchestrator's old
+        "Step 4.5" was removed — see orchestrator.py's "Step 4.5 REMOVED"
+        comment) — this is now the PRIMARY way most rows get their
+        receipt, not a rare recovery path. Because the payload is built
+        fresh right here (create_receipt_for_line_item ->
+        build_receipt_creation_payload reads the LineItem's CURRENT
+        state), any correction made before Approve — a customer-name
+        correction, a manual invoice mapping — is what actually gets sent
+        to Oracle, not whatever the AI/automatic extraction produced at
+        analysis time.
+      Step 2 — attach remittanceReferences (the invoice application) to
+        that receipt.
+    A row that already has a receipt (e.g. re-approving after a prior
+    reference-mapping failure, or a row remapped after a reversal — see
+    reverse_receipt_invoice()) skips straight to step 2 and reuses the
+    existing receipt, never creating a second one.
     """
     if r.oracle_post_status != "success":
         logger.info("[invoice_mapping] row=%s has no successful receipt yet — retrying creation first", r.id)
@@ -624,10 +634,11 @@ def mark_eligible_for_receipt(db: Session, line_item_id: int, triggered_by: str)
     """
     The SPOC has looked at an Unidentified row and confirmed it IS a real
     receivable transaction (just one the automatic extraction couldn't
-    read) — creates the bare Oracle receipt right now, the same call
-    Step 4.5 would have made automatically for every other category (see
-    rule_engine/orchestrator.py's Step 4.5 docstring for why unidentified
-    rows are held back from that automatic step in the first place).
+    read) — creates the bare Oracle receipt right now, the same
+    create_receipt_for_line_item() call used by the Analysis History
+    "Create Receipts" bulk action and by Approve's create-if-missing step
+    for every other category. Unidentified rows are excluded from both of
+    those paths (see their category gates) until this confirmation happens.
 
     The row's category doesn't change here — it's still R8/NO_SIGNAL, still
     Unidentified, still needs a customer/invoice match via Manual Invoice
@@ -705,31 +716,50 @@ def mark_eligible_for_receipt(db: Session, line_item_id: int, triggered_by: str)
 
 def discard_row(db: Session, line_item_id: int, comment: str | None, triggered_by: str) -> dict:
     """
-    The SPOC has looked at an Unidentified row and judged it is NOT a real
-    receivable transaction at all (garbage narration, an internal transfer,
-    a duplicate bank feed entry, etc.) — moves it to its own terminal
-    `discarded` state WITHOUT ever creating an Oracle receipt for it. See
-    db/models.py's RowState.DISCARDED and bff/metrics.py's GROUP_DISCARDED
-    for why this is deliberately distinct from `rejected` (which implies a
-    receipt/mapping decision existed and was reversed).
+    Moves a row to its own terminal `discarded` state. Two independent
+    eligible situations (see actions_registry.py's _cond_discardable(),
+    which is what makes the button appear/disappear on the frontend for
+    each — this is the server-side enforcement of the same rule):
+
+      Case A (original): the SPOC has looked at an Unidentified row and
+        judged it is NOT a real receivable transaction at all (garbage
+        narration, an internal transfer, a duplicate bank feed entry,
+        etc.) — discarded WITHOUT ever creating an Oracle receipt for it.
+
+      Case B (NEW): the SPOC just explicitly Deleted this row's Oracle
+        receipt (see delete_receipt() above) and chose "Discard" over
+        "Create New Receipt" in the follow-up choice. This row DID have a
+        receipt at some point — see db/models.py's RowState.DISCARDED
+        docstring, updated to note "a discarded row never had a receipt"
+        is no longer a universal invariant; check receipt_deleted_at to
+        tell the two paths apart.
+
+    See db/models.py's RowState.DISCARDED and bff/metrics.py's
+    GROUP_DISCARDED for why this is deliberately distinct from `rejected`
+    (which implies a receipt/mapping decision existed and was reversed).
     """
     r = db.query(LineItem).get(line_item_id)
     if not r:
         return {"error": "not found"}
 
-    guard_error = _guard_unidentified_undecided(r)
-    if guard_error:
-        return guard_error
+    is_post_delete_case = bool(r.receipt_deleted_at) and not r.standard_receipt_id
+    if not is_post_delete_case:
+        guard_error = _guard_unidentified_undecided(r)
+        if guard_error:
+            return guard_error
 
-    r.receipt_eligibility    = "discarded"
-    r.receipt_eligibility_at = dt.datetime.utcnow()
-    r.receipt_eligibility_by = triggered_by
-    r.current_state          = "discarded"
-    r.status                 = "Discarded"
-    r.version                = (r.version or 0) + 1
+    prior_state = r.current_state.value if r.current_state else "unidentified"
+
+    if not is_post_delete_case:
+        r.receipt_eligibility    = "discarded"
+        r.receipt_eligibility_at = dt.datetime.utcnow()
+        r.receipt_eligibility_by = triggered_by
+    r.current_state = "discarded"
+    r.status        = "Discarded"
+    r.version       = (r.version or 0) + 1
 
     db.add(RowStatusHistory(
-        line_item_id=r.id, from_state="unidentified", to_state="discarded",
+        line_item_id=r.id, from_state=prior_state, to_state="discarded",
         trigger="spoc_discard", rule_id=r.rule_id,
         triggered_by=triggered_by, comment=comment,
     ))
@@ -1048,6 +1078,268 @@ def edit_gl_rate(
     }
 
 
+def edit_receipt_fields(
+    db: Session, line_item_id: int, fields: dict, reason: str | None, triggered_by: str,
+) -> dict:
+    """
+    Generalizes edit_gl_rate() above to every field a SPOC can correct on
+    an Oracle receipt: account number, OU name (+ its derived
+    BusinessUnit), receipt method, currency/GL rate (cross-ledger rows
+    only), and both dates (ReceiptDate / AccountingDate). One unified
+    entry point instead of five single-field ones, since these fields are
+    interdependent (account number + OU number together are what
+    resolve_receipt_method() keys off of) and a SPOC fixing one of them
+    is very often fixing more than one at a time (e.g. "wrong bank
+    account AND wrong OU" from one mis-parsed statement line).
+
+    `fields` — any subset of, all optional:
+        account_number       (str)
+        ou_number             (str)  — BusinessUnit is re-derived from this
+                                        via get_ou_display_name(), not sent
+                                        as its own field
+        receipt_method_name  (str)  — stored as an override; skips
+                                        receipt_method_map.json resolution
+                                        on every future payload build for
+                                        this row (see fusion_client.py)
+        new_rate              (float) — cross-ledger rows only; same field
+                                        edit_gl_rate() edits
+        receipt_date          (str, "YYYY-MM-DD")
+        accounting_date       (str, "YYYY-MM-DD")
+
+    VALIDATION — "warn but allow" (product decision): if the resulting
+    account_number/ou_number/receipt_method_name combination isn't a real
+    row in receipt_method_map.json, this does NOT block the save. It logs
+    a warning, records it in the RowStatusHistory comment, and returns it
+    to the caller as `validation_warning` so the SPOC/UI can surface it —
+    the same posture resolve_receipt_method() already takes toward an
+    unmatched/ambiguous account (log, don't block), now applied
+    consistently to a manual edit too.
+
+    Same two-case branch as edit_gl_rate(), and the same guard against
+    editing after invoice mapping has posted:
+
+      CASE A -- receipt already created (standard_receipt_id set) and NOT
+        yet invoice-mapped: PATCHes every changed field directly via
+        OracleFusionClient.patch_standard_receipt(), in one PATCH call
+        covering whichever fields actually changed.
+
+      CASE B -- receipt creation itself FAILED (no standard_receipt_id):
+        applies the edits to the LineItem, then retries receipt creation
+        with a fresh POST (create_receipt_for_line_item) — any of these
+        fields being wrong is a very plausible reason creation failed in
+        the first place.
+
+    Returns {"error": ...} without raising for every rejection case, same
+    contract as edit_gl_rate() — see hitl_routes.py's route for how these
+    map to HTTP status codes.
+    """
+    r = db.query(LineItem).get(line_item_id)
+    if not r:
+        return {"error": "not found"}
+
+    if not r.standard_receipt_id and r.oracle_post_status != "failed":
+        return {
+            "error": "not_editable",
+            "message": (
+                f"Row {r.id} has no Oracle receipt yet, and receipt creation hasn't "
+                f"actually been attempted (or hasn't failed) -- nothing to retry."
+            ),
+        }
+
+    if r.standard_receipt_id and r.reference_status == "success":
+        return {
+            "error": "already_mapped",
+            "message": (
+                f"Row {r.id} already has invoice mapping (remittanceReferences) posted "
+                f"against this receipt -- these fields can no longer be edited here. "
+                f"This needs a reverse-and-recreate correction instead."
+            ),
+        }
+
+    new_account_number      = fields.get("account_number")
+    new_ou_number            = fields.get("ou_number")
+    new_receipt_method_name = fields.get("receipt_method_name")
+    new_rate                 = fields.get("new_rate")
+    new_receipt_date_str     = fields.get("receipt_date")
+    new_accounting_date_str  = fields.get("accounting_date")
+
+    if new_rate is not None and not r.is_cross_ledger:
+        return {
+            "error": "not_cross_ledger",
+            "message": f"Row {r.id} is not a cross-ledger-currency row -- there is no GL rate to edit.",
+        }
+
+    # ── Validate the account/OU/receipt-method combination against the
+    # extract -- warn, never block (see docstring). Checked against the
+    # POST-edit values (falls back to the row's current value for any
+    # field NOT being changed in this call), so e.g. editing only the
+    # receipt method still gets checked against the row's existing
+    # account number and OU.
+    validation_warning = None
+    if new_account_number is not None or new_ou_number is not None or new_receipt_method_name is not None:
+        check_account_number = new_account_number if new_account_number is not None else r.account_number
+        check_ou_number       = new_ou_number if new_ou_number is not None else r.ou_number
+        check_method_name     = (
+            new_receipt_method_name if new_receipt_method_name is not None else r.receipt_method_override
+        )
+        combo = validate_receipt_method_combo(check_account_number, check_ou_number, check_method_name)
+        if not combo.valid:
+            validation_warning = combo.reason
+            logger.warning(
+                "[edit_receipt_fields] row=%s account='%s' ou='%s' method='%s' -- %s "
+                "Saving anyway per the warn-but-allow policy.",
+                r.id, check_account_number, check_ou_number, check_method_name, combo.reason,
+            )
+
+    # ── Apply each changed field, snapshotting the FIRST original value
+    # per field (never overwritten by a later edit of the same field) --
+    # same "keep the true original exactly once" rule gl_rate_original
+    # follows.
+    original_snapshot = dict(r.receipt_fields_original or {})
+    changed: dict[str, tuple] = {}
+
+    if new_account_number is not None and new_account_number != r.account_number:
+        original_snapshot.setdefault("account_number", r.account_number)
+        changed["account_number"] = (r.account_number, new_account_number)
+        r.account_number = new_account_number
+
+    if new_ou_number is not None and new_ou_number != r.ou_number:
+        original_snapshot.setdefault("ou_number", r.ou_number)
+        original_snapshot.setdefault("business_unit", r.business_unit)
+        changed["ou_number"] = (r.ou_number, new_ou_number)
+        r.ou_number = new_ou_number
+        r.business_unit = get_ou_display_name(new_ou_number) or r.business_unit
+
+    if new_receipt_method_name is not None and new_receipt_method_name != (r.receipt_method_override or ""):
+        original_snapshot.setdefault("receipt_method_override", r.receipt_method_override)
+        changed["receipt_method_name"] = (r.receipt_method_override, new_receipt_method_name)
+        r.receipt_method_override = new_receipt_method_name
+
+    if new_rate is not None and new_rate != r.fx_invoice_to_functional:
+        if r.gl_rate_original is None:
+            r.gl_rate_original = r.fx_invoice_to_functional
+        changed["new_rate"] = (r.fx_invoice_to_functional, new_rate)
+        r.fx_invoice_to_functional        = new_rate
+        r.fx_invoice_to_functional_source = "spoc_manual"
+        r.gl_rate_edited_at               = dt.datetime.utcnow()
+        r.gl_rate_edited_by               = triggered_by
+        r.gl_rate_edit_reason             = reason
+
+    if new_receipt_date_str:
+        new_receipt_date = dt.datetime.strptime(new_receipt_date_str, "%Y-%m-%d")
+        current_receipt_date = r.receipt_date_override or r.statement_date
+        if new_receipt_date != current_receipt_date:
+            original_snapshot.setdefault(
+                "receipt_date_override",
+                current_receipt_date.strftime("%Y-%m-%d") if current_receipt_date else None,
+            )
+            changed["receipt_date"] = (
+                current_receipt_date.strftime("%Y-%m-%d") if current_receipt_date else None,
+                new_receipt_date_str,
+            )
+            r.receipt_date_override = new_receipt_date
+
+    if new_accounting_date_str:
+        new_accounting_date = dt.datetime.strptime(new_accounting_date_str, "%Y-%m-%d")
+        if new_accounting_date != r.accounting_date_override:
+            original_snapshot.setdefault(
+                "accounting_date_override",
+                r.accounting_date_override.strftime("%Y-%m-%d") if r.accounting_date_override else None,
+            )
+            changed["accounting_date"] = (
+                r.accounting_date_override.strftime("%Y-%m-%d") if r.accounting_date_override else None,
+                new_accounting_date_str,
+            )
+            r.accounting_date_override = new_accounting_date
+
+    if not changed:
+        return {"error": "no_changes", "message": "No fields were actually changed."}
+
+    r.receipt_fields_original    = original_snapshot
+    r.receipt_fields_edited_at   = dt.datetime.utcnow()
+    r.receipt_fields_edited_by   = triggered_by
+    r.receipt_fields_edit_reason = reason
+
+    change_summary = "; ".join(f"{k}: {old!r} -> {new!r}" for k, (old, new) in changed.items())
+    warning_suffix = f" [WARNING: {validation_warning}]" if validation_warning else ""
+
+    if not r.standard_receipt_id:
+        # -- CASE B: no receipt exists yet -- apply edits and RETRY creation --
+        result = create_receipt_for_line_item(db, r)  # rebuilds the payload fresh — picks up every edit above
+
+        db.add(RowStatusHistory(
+            line_item_id=r.id, from_state="post_failed",
+            to_state=r.current_state.value if r.current_state else None,
+            trigger="spoc_edit_receipt_fields_retry", rule_id=r.rule_id,
+            triggered_by=triggered_by,
+            comment=(
+                f"Receipt fields changed ({change_summary}) and receipt creation retried "
+                f"({'succeeded' if result.get('success') else 'failed again: ' + str(result.get('message'))})"
+                + (f" -- {reason}" if reason else "") + warning_suffix
+            ),
+        ))
+        db.commit()
+
+        if not result.get("success"):
+            return {
+                "error": "retry_failed",
+                "changed": changed,
+                "validation_warning": validation_warning,
+                "message": f"Fields updated, but retrying receipt creation failed again: {result.get('message')}",
+            }
+
+        return {
+            "id": r.id,
+            "success": True,
+            "changed": changed,
+            "validation_warning": validation_warning,
+            "standard_receipt_id": r.standard_receipt_id,
+            "message": f"Fields updated and receipt created successfully ({r.standard_receipt_id}).",
+        }
+
+    # -- CASE A: receipt already exists -- PATCH whichever fields changed --------
+    patch_payload: dict = {}
+    if "account_number" in changed:
+        patch_payload["RemittanceBankAccountNumber"] = r.account_number
+    if "ou_number" in changed:
+        patch_payload["BusinessUnit"] = r.business_unit
+    if "receipt_method_name" in changed:
+        patch_payload["ReceiptMethod"] = r.receipt_method_override
+    if "new_rate" in changed:
+        patch_payload["ConversionRateType"] = "User"
+        patch_payload["ConversionRate"]     = r.fx_invoice_to_functional
+    if "receipt_date" in changed:
+        patch_payload["ReceiptDate"] = new_receipt_date_str
+    if "accounting_date" in changed:
+        patch_payload["AccountingDate"] = new_accounting_date_str
+
+    client = OracleFusionClient()
+    result = client.patch_standard_receipt(r.standard_receipt_id, patch_payload)
+
+    if not result.get("success"):
+        return {
+            "error": "oracle_patch_failed",
+            "message": f"Oracle rejected the field change(s): {result.get('message')}",
+        }
+
+    db.add(RowStatusHistory(
+        line_item_id=r.id, from_state=r.current_state.value if r.current_state else None,
+        to_state=r.current_state.value if r.current_state else None,
+        trigger="spoc_edit_receipt_fields", rule_id=r.rule_id,
+        triggered_by=triggered_by,
+        comment=f"Receipt fields changed ({change_summary})" + (f" -- {reason}" if reason else "") + warning_suffix,
+    ))
+    db.commit()
+
+    return {
+        "id": r.id,
+        "success": True,
+        "changed": changed,
+        "validation_warning": validation_warning,
+        "message": f"Fields updated on Oracle receipt {r.standard_receipt_id}: {change_summary}.",
+    }
+
+
 def get_hitl_history(db: Session) -> dict:
     rows = (
         db.query(RowStatusHistory)
@@ -1155,9 +1447,9 @@ def check_receipt_retry_eligibility_for_run(db: Session, run_id: int) -> dict:
 
 def retry_receipt_creation_bulk_for_run(db: Session, run_id: int, triggered_by: str | None = None) -> dict:
     """
-    Bulk-retries Oracle RECEIPT CREATION (Step 4.5 -- create_receipt_for_
-    line_item, NOT invoice mapping/retry_oracle_post above, which is a
-    separate later stage) for every row in a given run.
+    Bulk-retries Oracle RECEIPT CREATION (create_receipt_for_line_item,
+    NOT invoice mapping/retry_oracle_post above, which is a separate later
+    stage) for every row in a given run.
 
     Deliberately different from retry_oracle_post(): that one only ever
     applies to rows that already passed approval and then failed at the
@@ -1213,9 +1505,9 @@ def retry_receipt_creation_bulk_for_run(db: Session, run_id: int, triggered_by: 
         prior_state = r.current_state
         if res["success"]:
             # Receipt now exists -- state itself doesn't change here (this
-            # function only recreates the bare receipt, same as Step 4.5;
-            # it does NOT re-run rule evaluation or invoice mapping), but
-            # record the transition for the audit trail.
+            # function only recreates the bare receipt; it does NOT re-run
+            # rule evaluation or invoice mapping), but record the
+            # transition for the audit trail.
             db.add(RowStatusHistory(
                 line_item_id=r.id, from_state=prior_state, to_state=prior_state,
                 trigger="retry_bulk_for_run", rule_id=r.rule_id, triggered_by=triggered_by or "spoc_ui",
@@ -1236,4 +1528,322 @@ def retry_receipt_creation_bulk_for_run(db: Session, run_id: int, triggered_by: 
         "succeeded": succeeded_after,
         "failed": len(results) - succeeded_after,
         "results": results,
+    }
+
+
+# ── Receipt lifecycle rework: deferred creation / reversal / delete ──────────
+# See the "Receipt Lifecycle Rework" implementation plan. Receipts are no
+# longer created automatically during analysis (orchestrator.py's old
+# "Step 4.5" was removed) — creation is now explicit, via
+# create_receipts_bulk() below (Analysis History's bulk action) or
+# _map_invoice_and_update()'s step 1 (Approve). This section adds the two
+# NEW capabilities the old flow never had: reversal (per-invoice SOAP
+# unapply, receipt reused) and delete (whole-receipt REST DELETE, only
+# once nothing is actively applied).
+
+def create_receipts_bulk(db: Session, ids: list[int], triggered_by: str | None = None) -> dict:
+    """
+    Analysis History's bulk "Create Receipts" action. For each given row,
+    creates a bare Oracle receipt (create_receipt_for_line_item — the same
+    call _map_invoice_and_update's step 1 makes at Approve time) — but
+    ONLY when the row is currently GROUP_READY_FOR_ORACLE.
+
+    Deliberately STRICTER than, and a SEPARATE gate from, approve_row's
+    3-category gate (ready_for_oracle/short_payment/overpayment) — bulk
+    pre-creation is scoped to the cleanest auto-matched category only;
+    short_payment/overpayment rows still only get their receipt lazily,
+    at Approve time.
+
+    Non-raising per-row, same convention as approve_bulk/
+    retry_receipt_creation_bulk_for_run above — one ineligible or
+    already-created row in a mixed selection doesn't abort the batch.
+    """
+    rows_by_id = {r.id: r for r in db.query(LineItem).filter(LineItem.id.in_(ids)).all()} if ids else {}
+
+    results = []
+    created_count = 0
+    skipped_count = 0
+
+    for line_item_id in ids:
+        r = rows_by_id.get(line_item_id)
+        if not r:
+            results.append({"id": line_item_id, "success": False, "error": "not_found"})
+            skipped_count += 1
+            continue
+
+        category = _category_for_row(r)
+        if category != GROUP_READY_FOR_ORACLE:
+            results.append({
+                "id": r.id, "success": False, "error": "not_eligible",
+                "category": category, "category_label": GROUP_LABELS.get(category, category),
+                "message": (
+                    f"Row {r.id} is in category '{GROUP_LABELS.get(category, category)}' — "
+                    f"bulk receipt creation only applies to 'Ready for Oracle' rows."
+                ),
+            })
+            skipped_count += 1
+            continue
+
+        if r.oracle_post_status == "success":
+            results.append({
+                "id": r.id, "success": True, "error": "already_created",
+                "oracle_ref_no": r.oracle_ref_no, "standard_receipt_id": r.standard_receipt_id,
+                "message": f"Row {r.id} already has a receipt — skipped, not re-created.",
+            })
+            skipped_count += 1
+            continue
+
+        res = create_receipt_for_line_item(db, r)
+        prior_state_value = r.current_state.value if r.current_state else None
+        db.add(RowStatusHistory(
+            line_item_id=r.id, from_state=prior_state_value, to_state=prior_state_value,
+            trigger="bulk_create_receipts", rule_id=r.rule_id,
+            triggered_by=triggered_by or "spoc_ui",
+            comment=("Receipt created (bulk)." if res.get("success")
+                     else f"Receipt creation FAILED (bulk) — {r.post_message}"),
+        ))
+        results.append({
+            "id": r.id, "success": bool(res.get("success")),
+            "oracle_ref_no": r.oracle_ref_no, "standard_receipt_id": r.standard_receipt_id,
+            "message": r.post_message,
+        })
+        if res.get("success"):
+            created_count += 1
+        else:
+            skipped_count += 1
+
+    db.commit()
+    return {"results": results, "created_count": created_count, "skipped_count": skipped_count}
+
+
+def reverse_receipt_invoice(
+    db: Session, line_item_id: int, invoice_number: str,
+    comment: str | None, triggered_by: str,
+    expected_version: int | None = None,
+) -> dict:
+    """
+    Reversal — undoes ONE invoice's application against this row's
+    receipt via Oracle's SOAP processUnapplyReceipt (see
+    oracle/soap_client.py). Operates at the individual-invoice level, not
+    the whole receipt: a row with several applied invoices needs one call
+    per invoice, and only as much is released/reclassified as actually
+    got unapplied in Oracle.
+
+    The receipt itself (standard_receipt_id/oracle_ref_no/
+    oracle_post_status) is NEVER touched here — it stays alive in Oracle
+    for reuse. Only once THIS was the LAST applied invoice on the row does
+    it move to RowState.RECEIPT_REVERSED / GROUP_RECEIPT_REVERSED (see
+    that state's docstring in db/models.py for why). If other invoices
+    remain applied, the row's category/current_state/reference_status are
+    left exactly as they were — it just shows one fewer applied invoice
+    and a larger outstanding amount, and can be reversed again for another
+    of its invoices later.
+
+    Eligibility (mirrored in actions_registry.py's condition for the
+    frontend action — enforced here too since a hidden button is a UI
+    nicety, not enforcement, same reasoning as approve_row's category
+    gate): the given invoice_number must currently be one of this row's
+    matched_invoices AND reference_status must be "success" — i.e.
+    something real is actually applied to unapply. Offering this on a
+    bare/never-mapped/post_failed receipt would send Oracle a call with
+    nothing to reverse.
+    """
+    r = db.query(LineItem).get(line_item_id)
+    if not r:
+        return {"error": "not found"}
+
+    if expected_version is not None and r.version != expected_version:
+        return {
+            "id": r.id,
+            "error": "version_conflict",
+            "message": (
+                f"Row {r.id} was modified by another user since you loaded it "
+                f"(expected version {expected_version}, current version {r.version}). "
+                f"Refresh and try again."
+            ),
+            "current_version": r.version,
+        }
+
+    if not r.standard_receipt_id or r.reference_status != "success":
+        return {
+            "id": r.id,
+            "error": "not_reversible",
+            "message": (
+                f"Row {r.id} has no active Oracle invoice application to reverse "
+                f"(reference_status={r.reference_status!r})."
+            ),
+        }
+
+    matched = list(r.matched_invoices or [])
+    target = next((m for m in matched if m.get("invoice_number") == invoice_number), None)
+    if target is None:
+        return {
+            "id": r.id,
+            "error": "invoice_not_applied",
+            "message": f"Invoice {invoice_number} is not currently applied on row {r.id}.",
+        }
+
+    business_unit = get_ou_display_name(r.ou_number) or r.business_unit
+    client = OracleSoapClient()
+    soap_result = client.unapply_receipt(business_unit, r.oracle_ref_no, invoice_number)
+
+    log_entry = {
+        "invoice_number": invoice_number,
+        "trx_number": invoice_number,  # same value — see soap_client.py's module docstring
+        "success": bool(soap_result.get("success")),
+        "message": soap_result.get("message"),
+        "status_code": soap_result.get("status_code"),
+        "at": dt.datetime.utcnow().isoformat(),
+        "by": triggered_by,
+    }
+    r.unapply_log = (r.unapply_log or []) + [log_entry]
+
+    if not soap_result.get("success"):
+        db.commit()  # persist the unapply_log entry even on failure, for audit/retry visibility
+        return {
+            "id": r.id, "success": False, "error": "unapply_failed",
+            "message": soap_result.get("message"),
+        }
+
+    # Snapshot before removing — row-detail can still show what was
+    # previously applied even after matched_invoices no longer lists it.
+    r.pre_reversal_matched_invoices = (r.pre_reversal_matched_invoices or []) + [target]
+    r.matched_invoices = [m for m in matched if m.get("invoice_number") != invoice_number]
+
+    release_application_for_invoice(db, r.id, invoice_number)
+
+    prior_state_value = r.current_state.value if r.current_state else None
+    fully_reversed = not r.matched_invoices
+    if fully_reversed:
+        # Last applied invoice on this row — move to the pending-remap
+        # bucket. hitl_status MUST be cleared here or
+        # confirm_manual_mapping()'s "hitl_status is not None" guard would
+        # permanently block re-mapping this row.
+        r.reference_status = None
+        r.hitl_status = None
+        r.current_state = "receipt_reversed"
+        r.status = "Receipt Reversed"
+        r.reversed_at = dt.datetime.utcnow()
+        r.reversed_by = triggered_by
+        r.reversal_reason = comment
+    r.version = (r.version or 0) + 1
+
+    db.add(RowStatusHistory(
+        line_item_id=r.id, from_state=prior_state_value,
+        to_state=("receipt_reversed" if fully_reversed else prior_state_value),
+        trigger="spoc_reverse_receipt", rule_id=r.rule_id,
+        triggered_by=triggered_by, comment=comment,
+    ))
+    db.commit()
+
+    return {
+        "id": r.id, "success": True,
+        "invoice_number": invoice_number,
+        "fully_reversed": fully_reversed,
+        "current_state": r.current_state.value if hasattr(r.current_state, "value") else r.current_state,
+        "matched_invoices": r.matched_invoices,
+    }
+
+
+def delete_receipt(
+    db: Session, line_item_id: int, comment: str | None, triggered_by: str,
+    expected_version: int | None = None,
+) -> dict:
+    """
+    Deletes an already-created Oracle receipt entirely (REST DELETE —
+    fusion_client.py's delete_standard_receipt) — a SEPARATE action from
+    reversal (reverse_receipt_invoice above only unapplies one invoice and
+    leaves the receipt intact). Only allowed once the receipt has NO
+    active application — same predicate actions_registry.py's
+    _cond_receipt_editable already uses for edit_receipt — i.e. after a
+    full reversal, or a receipt that was created but never successfully
+    mapped.
+
+    On success, every receipt-creation field is cleared back to its
+    pre-creation (None) state, so the row is a blank slate again for the
+    normal create/approve path to pick up from scratch. The frontend then
+    offers a choice: "Create New Receipt" (no special call needed — the
+    row's next Approve, or the next bulk-create pass if it's back in
+    ready_for_oracle, just creates a fresh receipt normally) or "Discard"
+    (existing discard_row(), whose category gate has been loosened to
+    also accept a row with receipt_deleted_at set — see that function's
+    docstring).
+    """
+    r = db.query(LineItem).get(line_item_id)
+    if not r:
+        return {"error": "not found"}
+
+    if expected_version is not None and r.version != expected_version:
+        return {
+            "id": r.id,
+            "error": "version_conflict",
+            "message": (
+                f"Row {r.id} was modified by another user since you loaded it "
+                f"(expected version {expected_version}, current version {r.version}). "
+                f"Refresh and try again."
+            ),
+            "current_version": r.version,
+        }
+
+    if not r.standard_receipt_id:
+        return {"id": r.id, "error": "no_receipt", "message": f"Row {r.id} has no receipt to delete."}
+    if r.reference_status == "success":
+        return {
+            "id": r.id,
+            "error": "has_active_application",
+            "message": (
+                f"Row {r.id}'s receipt still has an active invoice application — "
+                f"reverse it first before deleting the receipt."
+            ),
+        }
+
+    client = OracleFusionClient()
+    result = client.delete_standard_receipt(r.standard_receipt_id)
+    if not result.get("success"):
+        return {"id": r.id, "success": False, "error": "delete_failed", "message": result.get("message")}
+
+    prior_state_value = r.current_state.value if r.current_state else None
+    deleted_receipt_number = r.oracle_ref_no
+
+    r.standard_receipt_id = None
+    r.oracle_ref_no = None
+    r.oracle_status_code = None
+    r.oracle_post_status = None
+    r.oracle_posted_at = None
+    r.post_message = None
+    r.oracle_payload = None
+    r.oracle_response_raw = None
+    # These described a receipt that no longer exists.
+    r.unapply_log = None
+    r.pre_reversal_matched_invoices = None
+    r.reversed_at = None
+    r.reversed_by = None
+    r.reversal_reason = None
+
+    r.receipt_deleted_at = dt.datetime.utcnow()
+    r.receipt_deleted_by = triggered_by
+    r.receipt_deletion_reason = comment
+
+    # "review_approve" is the same generic human-needs-to-look-at-this
+    # state CATEGORY_TO_STATE already assigns to needs_remittance/
+    # conflict_exception/etc — safe regardless of this row's original
+    # category, and consistent with what a row in that category would
+    # already show today. Display categorization itself (_category_for_row)
+    # falls back to rule_id, not current_state, for every non-special-cased
+    # row, so this doesn't need to reproduce that logic.
+    r.current_state = "review_approve"
+    r.status = "Review & Approve"
+    r.version = (r.version or 0) + 1
+
+    db.add(RowStatusHistory(
+        line_item_id=r.id, from_state=prior_state_value, to_state="review_approve",
+        trigger="spoc_delete_receipt", rule_id=r.rule_id,
+        triggered_by=triggered_by, comment=comment,
+    ))
+    db.commit()
+
+    return {
+        "id": r.id, "success": True,
+        "deleted_receipt_number": deleted_receipt_number,
+        "current_state": r.current_state.value if hasattr(r.current_state, "value") else r.current_state,
     }

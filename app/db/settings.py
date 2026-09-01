@@ -177,6 +177,25 @@ class Settings(BaseSettings):
     ORACLE_OAUTH_USERNAME: str | None = None
     ORACLE_OAUTH_PASSWORD: str | None = None
 
+    # ── Oracle Fusion — receipt reversal (SOAP) / deletion (REST) ───────────
+    # SECURITY: no hardcoded default, same convention as ORACLE_FUSION_BASE_URL
+    # above — real values supplied via .env per environment.
+    #
+    # processUnapplyReceipt is a SOAP service, not part of the REST
+    # /fscmRestApi surface ORACLE_FUSION_BASE_URL points at — it needs its
+    # own endpoint URL (the SOAP binding address for
+    # .../standardReceiptService/commonSe... per the WSDL). Reuses the same
+    # ORACLE_AUTH_MODE/basic/oauth credentials above — no separate auth
+    # config for SOAP.
+    ORACLE_SOAP_RECEIPT_SERVICE_URL: str | None = None
+    ORACLE_SOAP_TIMEOUT_SECONDS: int = 60
+    # DELETE /standardReceipts/{id} was given against API version
+    # 11.13.18.05, not "latest" like ORACLE_FUSION_BASE_URL — kept as a
+    # deliberately separate setting rather than string-replacing "latest"
+    # out of ORACLE_FUSION_BASE_URL, which would be fragile if that value
+    # is ever pointed at a different version segment for other reasons.
+    ORACLE_FUSION_DELETE_BASE_URL: str | None = None
+
     # ── Auth: Microsoft Entra ID (Azure AD) SSO ──────────────────────────────
     AZURE_TENANT_ID: str | None = None
     AZURE_CLIENT_ID: str | None = None          # backend API's App Registration client id (token audience)
@@ -319,13 +338,16 @@ class Settings(BaseSettings):
     # org's rate limits before raising both at the same time.
     AI_BATCH_MAX_CONCURRENCY: int = 4
 
-    # ── Oracle receipt-creation concurrency (Step 4.5) ───────────────────────
-    # ThreadPoolExecutor size for the bare-receipt-creation fan-out in
-    # rule_engine/orchestrator.py. Each worker thread opens its OWN DB
-    # session (SQLAlchemy sessions aren't thread-safe) and makes its own
+    # ── Oracle receipt-creation concurrency ──────────────────────────────────
+    # ThreadPoolExecutor size for any bare-receipt-creation fan-out (e.g. a
+    # future threaded implementation of hitl/service.py's
+    # create_receipts_bulk()). Each worker thread would open its OWN DB
+    # session (SQLAlchemy sessions aren't thread-safe) and make its own
     # Oracle HTTP call, so this is also the ceiling on how many Oracle
-    # standardReceipts POSTs are ever in flight at once for a single run.
-    # Keep this at/under Oracle Fusion's per-client rate limit.
+    # standardReceipts POSTs are ever in flight at once for a single batch.
+    # Keep this at/under Oracle Fusion's per-client rate limit. (Receipt
+    # creation is no longer automatic at analysis time — see
+    # oracle/receipt_creation.py.)
     ORACLE_RECEIPT_MAX_WORKERS: int = 8
 
     # ── Rule-engine evaluation concurrency (Step 4) ──────────────────────────

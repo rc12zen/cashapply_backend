@@ -50,8 +50,11 @@ from ..hitl import (
     get_mapping_options, get_invoices_for_customer,
     preview_manual_mapping, confirm_manual_mapping,
     mark_eligible_for_receipt, discard_row, restore_discarded_row, edit_gl_rate,
+    edit_receipt_fields,
     override_settlement_as_customer_payment,
+    create_receipts_bulk, reverse_receipt_invoice, delete_receipt,
 )
+from ..oracle.receipt_method_resolver import validate_receipt_method_combo
 from ..hitl import reopen_with_edits
 from ..hitl.overpayment import park_overpayment
 from ..hitl.split_and_map import get_distribution_context, preview_distribution, confirm_distribution, get_active_invoices_for_customer
@@ -292,8 +295,8 @@ def mark_eligible(id: int, request: Request, db: Session = Depends(get_db),
     """
     Unidentified rows only — see hitl/service.py's mark_eligible_for_receipt().
     Confirms this row IS a real receivable transaction and creates the bare
-    Oracle receipt right now (Step 4.5 holds it back automatically for
-    unidentified rows — see rule_engine/orchestrator.py).
+    Oracle receipt right now (unidentified rows are excluded from the
+    normal Create Receipts / Approve paths until this confirmation happens).
     """
     result = mark_eligible_for_receipt(db, id, triggered_by=user.email)
     if result.get("error") == "not found":
@@ -409,6 +412,70 @@ def update_gl_rate(id: int, payload: dict, request: Request, db: Session = Depen
     return result
 
 
+@router.put("/receipt-fields/{id}")
+def update_receipt_fields(id: int, payload: dict, request: Request, db: Session = Depends(get_db),
+                           user: User = Depends(require_permission("oracle:post"))):
+    """
+    Unified edit for account number, OU name, receipt method, GL/currency
+    rate, and both dates — see hitl/service.py's edit_receipt_fields()
+    docstring for the exact guard (before invoice mapping only) and the
+    two-case POST-retry / PATCH branch. Same permission tier as
+    Approve/Retry/the old gl-rate-only route — this directly touches an
+    Oracle receipt (or retries creating one).
+
+    Body: any subset of account_number, ou_number, receipt_method_name,
+    new_rate, receipt_date ("YYYY-MM-DD"), accounting_date ("YYYY-MM-DD"),
+    plus an optional `reason`. At least one field must be present.
+    """
+    fields = {
+        k: payload.get(k)
+        for k in ("account_number", "ou_number", "receipt_method_name",
+                   "new_rate", "receipt_date", "accounting_date")
+        if payload.get(k) not in (None, "")
+    }
+    if not fields:
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail="At least one field to edit is required.")
+    if "new_rate" in fields:
+        fields["new_rate"] = float(fields["new_rate"])
+
+    result = edit_receipt_fields(db, id, fields, payload.get("reason"), triggered_by=user.email)
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") in (
+        "not_editable", "not_cross_ledger", "already_mapped",
+        "oracle_patch_failed", "retry_failed", "no_changes",
+    ):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
+
+    log_activity(db, user, action="hitl.edit_receipt_fields", entity_type="LineItem", entity_id=id,
+                 ip_address=_client_ip(request),
+                 metadata={"changed": result.get("changed"), "reason": payload.get("reason"),
+                           "validation_warning": result.get("validation_warning")})
+    db.commit()
+    return result
+
+
+@router.get("/receipt-fields-check/{id}")
+def check_receipt_fields(id: int, account_number: str, ou_number: str | None = None,
+                          receipt_method_name: str | None = None, db: Session = Depends(get_db),
+                          user: User = Depends(require_permission("run:view"))):
+    """
+    Read-only preview for EditReceiptModal — lets the frontend show a
+    live "this combination isn't in receipt_method_map.json" warning
+    as the SPOC edits account number / OU / receipt method, BEFORE they
+    submit. Purely advisory (same "warn but allow" policy the actual
+    save enforces via hitl/service.py's edit_receipt_fields()) — this
+    endpoint never blocks or mutates anything, it only reports what the
+    save-time check would say.
+    """
+    result = validate_receipt_method_combo(account_number, ou_number, receipt_method_name)
+    return {
+        "valid": result.valid,
+        "reason": result.reason,
+        "candidates": result.candidates,
+    }
+
+
 @router.post("/approve-bulk")
 def approve_bulk(payload: dict, request: Request, db: Session = Depends(get_db),
                   user: User = Depends(require_permission("oracle:post"))):
@@ -433,6 +500,85 @@ def approve_bulk(payload: dict, request: Request, db: Session = Depends(get_db),
         "approved_count": len(results) - len(skipped),
         "skipped_count": len(skipped),
     }
+
+
+@router.post("/create-receipts-bulk")
+def create_receipts_bulk_route(payload: dict, request: Request, db: Session = Depends(get_db),
+                                user: User = Depends(require_permission("oracle:post"))):
+    """
+    Analysis History's bulk "Create Receipts" action — see
+    hitl/service.py::create_receipts_bulk() for the ready_for_oracle-only
+    gate. Same "oracle:post" permission as Approve — creating an Oracle
+    receipt is an Oracle-posting action. Non-raising per-row, same
+    convention as /approve-bulk above.
+    """
+    ids = payload.get("ids", [])
+    result = create_receipts_bulk(db, ids, triggered_by=user.email)
+    log_activity(db, user, action="oracle.create_receipts_bulk", entity_type="LineItem",
+                 ip_address=_client_ip(request),
+                 metadata={"ids": ids, "created_count": result["created_count"],
+                           "skipped_count": result["skipped_count"]})
+    db.commit()
+    return result
+
+
+@router.post("/reverse-receipt/{id}")
+def reverse_receipt_route(id: int, payload: dict, request: Request, db: Session = Depends(get_db),
+                           user: User = Depends(require_permission("oracle:post"))):
+    """
+    Unapplies ONE invoice from this row's receipt (SOAP
+    processUnapplyReceipt — see hitl/service.py::reverse_receipt_invoice()).
+    `payload` must include "invoice_number" — reversal is per-invoice, not
+    whole-row. Requires "oracle:post" (same tier as Approve/Delete —
+    touching what's applied against a live Oracle receipt).
+    """
+    invoice_number = payload.get("invoice_number")
+    if not invoice_number:
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail="invoice_number is required.")
+
+    result = reverse_receipt_invoice(
+        db, id, invoice_number, payload.get("comment"),
+        triggered_by=user.email, expected_version=payload.get("expected_version"),
+    )
+    if result.get("error") == "version_conflict":
+        raise AppError(ErrorCode.ROW_VERSION_CONFLICT, detail=result.get("message"))
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") in ("not_reversible", "invoice_not_applied", "unapply_failed"):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
+
+    log_activity(db, user, action="oracle.reverse_receipt_invoice", entity_type="LineItem", entity_id=id,
+                 ip_address=_client_ip(request),
+                 status="success" if result.get("success") else "failure",
+                 metadata={"invoice_number": invoice_number, "fully_reversed": result.get("fully_reversed")})
+    db.commit()
+    return result
+
+
+@router.post("/delete-receipt/{id}")
+def delete_receipt_route(id: int, payload: dict, request: Request, db: Session = Depends(get_db),
+                          user: User = Depends(require_permission("oracle:post"))):
+    """
+    Deletes this row's Oracle receipt entirely (REST DELETE — see
+    hitl/service.py::delete_receipt()). Only allowed once the receipt has
+    no active invoice application. Requires "oracle:post".
+    """
+    result = delete_receipt(
+        db, id, payload.get("comment"),
+        triggered_by=user.email, expected_version=payload.get("expected_version"),
+    )
+    if result.get("error") == "version_conflict":
+        raise AppError(ErrorCode.ROW_VERSION_CONFLICT, detail=result.get("message"))
+    if result.get("error") == "not found":
+        raise AppError(ErrorCode.ROW_NOT_FOUND)
+    if result.get("error") in ("no_receipt", "has_active_application", "delete_failed"):
+        raise AppError(ErrorCode.VALIDATION_FAILED, detail=result.get("message"))
+
+    log_activity(db, user, action="oracle.delete_receipt", entity_type="LineItem", entity_id=id,
+                 ip_address=_client_ip(request),
+                 metadata={"deleted_receipt_number": result.get("deleted_receipt_number")})
+    db.commit()
+    return result
 
 
 @router.get("/history")

@@ -367,6 +367,84 @@ class OracleFusionClient:
             }
 
 
+    def delete_standard_receipt(self, standard_receipt_id: str) -> dict:
+        """
+        Deletes an ALREADY-CREATED receipt entirely via
+            DELETE /standardReceipts/{standard_receipt_id}
+        — a SEPARATE action from reversal (soap_client.py's
+        unapply_receipt, which only undoes an invoice application and
+        leaves the receipt itself intact). Callers (hitl/service.py's
+        delete_receipt()) must only invoke this once the receipt has NO
+        active application left (reference_status != "success") — Oracle
+        itself will likely also reject deleting a receipt that still has
+        live applications, but the app-side gate exists so a confusing
+        Oracle-side rejection isn't the first line of defense.
+
+        Uses a SEPARATE base URL (ORACLE_FUSION_DELETE_BASE_URL) from the
+        one post_standard_receipt/post_remittance_reference/
+        patch_standard_receipt use — the DELETE spec given targets API
+        version 11.13.18.05, not the "latest" version segment
+        ORACLE_FUSION_BASE_URL points at. See settings.py's comment on
+        this setting for why the two aren't just derived from each other.
+
+        Returns the same normalised shape as the other Oracle client
+        methods: { success, status_code, message, raw }. Oracle typically
+        returns 204 No Content on a successful DELETE (no body).
+        """
+        s = self.settings
+        base = s.ORACLE_FUSION_DELETE_BASE_URL
+        if not base:
+            return {
+                "success":     False,
+                "status_code": "not_configured",
+                "message":     "ORACLE_FUSION_DELETE_BASE_URL is not set — cannot delete the receipt.",
+                "raw":         None,
+            }
+        url = f"{base}/standardReceipts/{standard_receipt_id}"
+        auth = (
+            (s.ORACLE_BASIC_USERNAME, s.ORACLE_BASIC_PASSWORD)
+            if s.ORACLE_AUTH_MODE == "basic"
+               and s.ORACLE_BASIC_USERNAME
+               and s.ORACLE_BASIC_PASSWORD
+            else None
+        )
+        headers = {**self._auth_headers(), "Content-Type": "application/json"}
+
+        log_oracle_request(
+            "DELETE", url, headers=headers, auth=auth,
+            tag="oracle.standardReceipts.delete",
+        )
+
+        try:
+            resp = httpx.delete(
+                url, headers=headers, auth=auth, timeout=60,
+            )
+            log_oracle_response(resp, tag="oracle.standardReceipts.delete")
+
+            if resp.status_code in (200, 202, 204):
+                data = resp.json() if resp.content else {}
+                return {
+                    "success":     True,
+                    "status_code": str(resp.status_code),
+                    "message":     "Receipt deleted successfully",
+                    "raw":         data,
+                }
+            return {
+                "success":     False,
+                "status_code": str(resp.status_code),
+                "message":     resp.text[:2000],
+                "raw":         None,
+            }
+        except httpx.HTTPError as e:
+            log_oracle_error(e, tag="oracle.standardReceipts.delete")
+            return {
+                "success":     False,
+                "status_code": "connection_error",
+                "message":     str(e),
+                "raw":         None,
+            }
+
+
 def _build_receipt_number(line_item: LineItem) -> str:
     """
     Generates the Oracle `ReceiptNumber` -- supplied by us, not Oracle.
@@ -467,11 +545,23 @@ def build_receipt_creation_payload(line_item: LineItem) -> dict:
         invoice_currency = credited_currency or functional_currency
 
     credit_amount = float(line_item.credit_amount or 0)
+    # ReceiptDate / AccountingDate -- both normally derived (ReceiptDate
+    # from the parsed statement_date, AccountingDate from today()), but a
+    # SPOC can override either via hitl/service.py's edit_receipt_fields()
+    # (e.g. a failed receipt whose statement_date was mis-parsed, or an
+    # AccountingDate that needs to land in a specific period). The
+    # override columns are None on every row that has never had these
+    # fields edited, so this changes nothing for the common case.
+    receipt_date_source = line_item.receipt_date_override or line_item.statement_date
     statement_date_iso = (
-        line_item.statement_date.strftime("%Y-%m-%d")
-        if line_item.statement_date else None
+        receipt_date_source.strftime("%Y-%m-%d")
+        if receipt_date_source else None
     )
-    accounting_date_iso = dt.date.today().strftime("%Y-%m-%d")
+    accounting_date_iso = (
+        line_item.accounting_date_override.strftime("%Y-%m-%d")
+        if line_item.accounting_date_override
+        else dt.date.today().strftime("%Y-%m-%d")
+    )
 
     # ── Leg 1: convert credit amount → invoice currency ──────────────────────
     # is_cross_currency here is CREDITED vs INVOICE currency (statement_currency
@@ -534,24 +624,35 @@ def build_receipt_creation_payload(line_item: LineItem) -> dict:
         )
 
     # ── ReceiptMethod ──────────────────────────────────────────────────────────
-    receipt_method_result = resolve_receipt_method(
-        account_number=line_item.account_number,
-        ou_number=line_item.ou_number,
-    )
-    receipt_method_name = receipt_method_result.receipt_method_name or "Standard"
-    if not receipt_method_result.matched:
-        logger.warning(
-            "[receipt_payload] row=%s account='%s' not found in receipt_method_map.json -- "
-            "posting with fallback ReceiptMethod='Standard'. Add this account to the extract "
-            "before relying on it.",
-            line_item.id, line_item.account_number,
-        )
-    elif receipt_method_result.ambiguous:
+    # A SPOC-entered override (hitl/service.py's edit_receipt_fields()) wins
+    # outright -- skip the account/OU lookup entirely rather than second-
+    # guessing an explicit correction. Otherwise resolve normally.
+    if line_item.receipt_method_override:
+        receipt_method_name = line_item.receipt_method_override
         logger.info(
-            "[receipt_payload] row=%s account='%s' has multiple candidate receipt methods "
-            "(class='%s' chosen by default priority order) -- confirm this is correct.",
-            line_item.id, line_item.account_number, receipt_method_result.receipt_class,
+            "[receipt_payload] row=%s ReceiptMethod SPOC-overridden to '%s' -- skipping "
+            "receipt_method_map.json resolution.",
+            line_item.id, receipt_method_name,
         )
+    else:
+        receipt_method_result = resolve_receipt_method(
+            account_number=line_item.account_number,
+            ou_number=line_item.ou_number,
+        )
+        receipt_method_name = receipt_method_result.receipt_method_name or "Standard"
+        if not receipt_method_result.matched:
+            logger.warning(
+                "[receipt_payload] row=%s account='%s' not found in receipt_method_map.json -- "
+                "posting with fallback ReceiptMethod='Standard'. Add this account to the extract "
+                "before relying on it.",
+                line_item.id, line_item.account_number,
+            )
+        elif receipt_method_result.ambiguous:
+            logger.info(
+                "[receipt_payload] row=%s account='%s' has multiple candidate receipt methods "
+                "(class='%s' chosen by default priority order) -- confirm this is correct.",
+                line_item.id, line_item.account_number, receipt_method_result.receipt_class,
+            )
 
     # ── BusinessUnit: Oracle expects "NAME(ou)" (e.g. "PUNE(111)") ───────────
     business_unit = get_ou_display_name(line_item.ou_number) or line_item.business_unit

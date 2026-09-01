@@ -119,7 +119,12 @@ ACTIONS: dict[str, tuple] = {
         # which clears the flag; the row then re-surfaces Map Invoice through
         # its own restored category if it needs mapping. ("post_failed" left as
         # a separate known issue — same guard, out of scope for this change.)
-        ["unidentified", "needs_remittance", "conflict_exception", "post_failed"],
+        # "receipt_reversed" added — see hitl/service.py's
+        # reverse_receipt_invoice(). Once a row's last applied invoice is
+        # unapplied, this is exactly the recovery path: re-map via the
+        # same ManualInvoiceMappingCard, applying to the SAME still-live
+        # receipt (never a new one).
+        ["unidentified", "needs_remittance", "conflict_exception", "post_failed", "receipt_reversed"],
         # Was "not_processed". Broadened to also hide this button on an OPEN
         # OVERPAYMENT (R11): those rows get one entry point instead, "Handle
         # Overpayment", whose dialog routes here when the SPOC chooses to apply.
@@ -144,9 +149,16 @@ ACTIONS: dict[str, tuple] = {
         "Mark Eligible for Receipt", "check-circle", "hitl:map",
         ["unidentified"], "receipt_eligibility_undecided", False, False, 50,
     ),
+    # UPDATED: applicable_categories broadened to None (any category) and
+    # condition swapped from "receipt_eligibility_undecided" to the OR'd
+    # "discardable" — see actions_registry.py's _cond_discardable(). Now
+    # also reachable from the post-Delete "Create New Receipt or Discard"
+    # follow-up (hitl/service.py's delete_receipt()), not just an
+    # undecided Unidentified row — the condition function itself still
+    # enforces both cases are mutually exclusive and correct.
     "discard": (
         "Discard", "trash-2", "hitl:reject",
-        ["unidentified"], "receipt_eligibility_undecided", True, True, 51,
+        None, "discardable", True, True, 51,
     ),
     # The way back out of Discard. Deliberately a separate action rather than
     # widening "reopen": Reopen opens ReopenAndReviewModal, where the SPOC edits
@@ -163,9 +175,42 @@ ACTIONS: dict[str, tuple] = {
         "Restore", "rotate-ccw", "hitl:reject",
         ["discarded"], None, True, False, 52,
     ),
-    "edit_gl_rate": (
-        "Edit GL Rate", "edit-3", "oracle:post",
-        None, "gl_rate_editable", False, False, 60,
+    # PATCH: replaces "edit_gl_rate" (GL conversion rate only) with a
+    # unified "Edit Receipt" action covering account number, OU name,
+    # receipt method, GL rate, and both dates — see hitl/service.py's
+    # edit_receipt_fields(). Renaming (rather than reusing the "edit_gl_rate"
+    # code) means seed_actions()'s retirement pass below deactivates the old
+    # row automatically instead of silently leaving a stale duplicate
+    # action active alongside this one.
+    "edit_receipt": (
+        "Edit Receipt", "edit-3", "oracle:post",
+        None, "receipt_editable", False, False, 60,
+    ),
+    # ── Receipt lifecycle rework: reversal / delete ─────────────────────────
+    # Reversal — see hitl/service.py's reverse_receipt_invoice() and
+    # actions_registry.py's _cond_has_reversible_invoice(). Category-
+    # unrestricted on purpose (the stakeholder explicitly wanted this
+    # available on any row with a created receipt that has an active
+    # application, not just "processed") — the condition function is what
+    # actually gates it. confirm_required is False: the frontend opens a
+    # dedicated reason-collecting modal (ReverseReceiptModal), same
+    # pattern as reject/handle_overpayment above, rather than the inline
+    # "Sure?" bar.
+    "reverse_receipt": (
+        "Reverse (Unapply Invoice)", "undo-2", "oracle:post",
+        None, "has_reversible_invoice", False, True, 65,
+    ),
+    # Delete Receipt — see hitl/service.py's delete_receipt() and
+    # actions_registry.py's _cond_receipt_deletable(). Category-
+    # unrestricted; only enabled once the receipt has no active
+    # application (same predicate as receipt_editable, kept as its own
+    # named condition per this file's convention). confirm_required is
+    # False: opens DeleteReceiptChoiceModal, which is itself the
+    # confirmation step (and immediately follows up with Create-New-vs-
+    # Discard on success).
+    "delete_receipt": (
+        "Delete Receipt", "file-x", "oracle:post",
+        None, "receipt_deletable", False, True, 66,
     ),
 }
 

@@ -7,12 +7,19 @@ the row's receipt-creation fields (oracle_ref_no, standard_receipt_id,
 oracle_status_code, oracle_post_status, oracle_posted_at, post_message,
 oracle_payload).
 
-Called from two places:
-  - rule_engine/orchestrator.py's Step 4.5 — once per credit row, for
-    EVERY row in a completed run, regardless of category.
-  - hitl/service.py's invoice-mapping step — as a retry, if a row somehow
-    reaches ready_for_oracle + SPOC approval without ever having a
-    successful receipt (e.g. the original creation attempt failed).
+Receipts are no longer created automatically during analysis (the
+orchestrator's old "Step 4.5" was removed — see orchestrator.py's
+"Step 4.5 REMOVED" comment). Called from exactly two user-triggered
+places instead, always with a payload built fresh off current row state
+(so a customer/mapping correction made after analysis is what actually
+gets sent to Oracle):
+  - hitl/service.py's create_receipts_bulk() — Analysis History's "Create
+    Receipts" bulk action, scoped to ready_for_oracle rows only.
+  - hitl/service.py's _map_invoice_and_update() (called from approve_row())
+    — creates the receipt first if the row doesn't have one yet, THEN maps
+    the invoice. This used to be a rare fallback (for the odd row whose
+    Step-4.5 creation had failed); it's now the PRIMARY way most rows get
+    their receipt, since nothing pre-creates one anymore.
 
 Kept as its own module (not inlined in fusion_client.py) since it owns
 the DB write, whereas fusion_client.py is kept as a pure HTTP client with
@@ -39,8 +46,8 @@ def create_receipt_for_line_item(db: Session, line_item: LineItem) -> dict:
     _build_receipt_number's deterministic scheme — see fusion_client.py).
     Does NOT re-create a receipt that already succeeded — callers should
     check `line_item.oracle_post_status == "success"` first if that
-    matters to them (orchestrator's Step 4.5 only ever calls this once per
-    row per run anyway).
+    matters to them (both current callers already do this before invoking
+    this function — see this module's docstring).
     """
     payload = build_receipt_creation_payload(line_item)
     line_item.oracle_payload = payload

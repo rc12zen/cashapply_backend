@@ -83,16 +83,23 @@ class RowState(str, enum.Enum):
     # and confirms it. See bank_statement/settlement_identifier.py and
     # rule_engine/evaluator.py's R16/R17/R18.
     NEEDS_DISTRIBUTION       = "needs_distribution"
-    # NEW: a SPOC-decided terminal state for unidentified rows that were
-    # reviewed and judged NOT eligible for a receipt at all (garbage
-    # narration, internal transfer, etc.) — distinct from "rejected", which
-    # implies a receipt/mapping decision existed and was reversed. See
-    # LineItem.receipt_eligibility and hitl/service.py's discard_row().
+    # NEW: a SPOC-decided terminal state, originally for unidentified rows
+    # that were reviewed and judged NOT eligible for a receipt at all
+    # (garbage narration, internal transfer, etc.) — distinct from
+    # "rejected", which implies a receipt/mapping decision existed and was
+    # reversed. See LineItem.receipt_eligibility and
+    # hitl/service.py's discard_row().
+    # UPDATED: also reachable now from a row whose receipt was explicitly
+    # Deleted (LineItem.receipt_deleted_at set) and the SPOC then chose
+    # "Discard" over "Create New Receipt" — so "a discarded row never had a
+    # receipt created for it" is NO LONGER a universal invariant for this
+    # state; check receipt_deleted_at to tell the two paths apart.
     DISCARDED                = "discarded"
     # NEW: terminal state for a needs_distribution PARENT row once its
     # Split & Map breakup is confirmed. The parent itself never posts to
-    # Oracle (see rule_engine/orchestrator.py's Step 4.5 -- receipts are
-    # created for the CHILD rows only, one per customer in the breakup).
+    # Oracle -- receipts are created for the CHILD rows only, one per
+    # customer in the breakup (via Create Receipts / Approve, same as any
+    # other row -- see oracle/receipt_creation.py).
     # See hitl/split_and_map.py's confirm_distribution().
     DISTRIBUTED              = "distributed"
     # NEW: terminal-but-reversible state for an overpaid row (R11) whose
@@ -102,6 +109,27 @@ class RowState(str, enum.Enum):
     # still holds the cash unapplied) and from "processed" (no invoice
     # references were ever attached). Reopen restores pre_park_state.
     OVERPAYMENT_PARKED       = "overpayment_parked"
+    # NEW: terminal-but-reversible state for a row whose Oracle receipt HAD
+    # an invoice application that a SPOC has since fully unapplied (SOAP
+    # processUnapplyReceipt, per-invoice — see
+    # hitl/service.py::reverse_receipt_invoice()). A row lands here only
+    # once its LAST applied invoice is unapplied (matched_invoices empty
+    # again) -- while some invoices are still applied and others have been
+    # unapplied, the row stays in its ORIGINAL state/category. The row's
+    # Oracle receipt (standard_receipt_id/oracle_ref_no) is UNCHANGED and
+    # MUST be reused for the eventual re-mapping (via the existing
+    # ManualInvoiceMappingCard -> confirm_manual_mapping() flow) -- never
+    # recreated. A new receipt is only ever created after an explicit
+    # Delete (see receipt_deleted_at below) clears these fields entirely.
+    #
+    # DEPLOYMENT NOTE: this is a new value on a native Postgres ENUM type.
+    # Base.metadata.create_all() does NOT alter an existing enum type -- an
+    # already-deployed DB needs a one-off
+    #   ALTER TYPE rowstate ADD VALUE 'receipt_reversed';
+    # run manually, in each environment, BEFORE this ships. Nothing will
+    # raise a clear error if this step is skipped; rows will just fail to
+    # persist this state.
+    RECEIPT_REVERSED         = "receipt_reversed"
 
 
 class SettlementIdentifierType(str, enum.Enum):
@@ -291,6 +319,43 @@ class LineItem(Base):
     gl_rate_edited_at      = Column(DateTime, nullable=True)
     gl_rate_edited_by      = Column(String, nullable=True)   # SPOC email
     gl_rate_edit_reason    = Column(Text, nullable=True)
+
+    # ── Receipt-field manual edit (post-receipt-creation correction) ─────────
+    # Generalizes the GL-rate-only edit above to the other Oracle
+    # receipt-creation fields a SPOC can correct: account number, OU
+    # number (+derived BusinessUnit), ReceiptMethod, ReceiptDate, and
+    # AccountingDate -- see hitl/service.py's edit_receipt_fields().
+    # Same two-case branch as the GL rate edit (PATCH an already-created
+    # receipt vs. correct-and-retry a failed one), same "before invoice
+    # mapping only" guard.
+    #
+    # account_number / ou_number (and the business_unit this derives) are
+    # mutated DIRECTLY on the columns above -- there's no separate "raw
+    # bank statement value" to preserve once corrected, exactly like the
+    # GL-rate edit overwrites fx_invoice_to_functional in place. Their
+    # pre-edit values are captured once in receipt_fields_original below
+    # for audit purposes instead of a dedicated column each.
+    #
+    # receipt_method_name and the two dates DON'T have an existing raw
+    # column to overwrite (ReceiptMethod is normally resolved fresh every
+    # payload build from receipt_method_map.json; AccountingDate is
+    # normally just today(); ReceiptDate is normally statement_date) --
+    # these three are SPOC overrides layered on top, read by
+    # oracle/fusion_client.py's build_receipt_creation_payload() in
+    # preference to the normal resolution when present.
+    receipt_method_override  = Column(String, nullable=True)
+    receipt_date_override    = Column(DateTime, nullable=True)
+    accounting_date_override = Column(DateTime, nullable=True)
+
+    # First-edit snapshot of whatever fields were actually changed --
+    # {"account_number": "07232560000170", "ou_number": "111", ...} --
+    # populated once per field (never overwritten by a second edit of the
+    # same field), same "keep the ORIGINAL value exactly once" rule
+    # gl_rate_original follows above.
+    receipt_fields_original    = Column(JSON, nullable=True)
+    receipt_fields_edited_at   = Column(DateTime, nullable=True)
+    receipt_fields_edited_by   = Column(String, nullable=True)  # SPOC email
+    receipt_fields_edit_reason = Column(Text, nullable=True)
 
     # ── Problem 2: cross-OU business flag ────────────────────────────────────
     # True when the row reaches ready_to_post / acceptable_short_payment AND
@@ -511,11 +576,15 @@ class LineItem(Base):
 
     # ── Oracle RECEIPT CREATION (step 1 — Bank Reconciliation stage) ─────────
     # PATCH: these fields used to be written once, at SPOC-approval time,
-    # meaning "fully approved AND invoice-mapped". They're now written
-    # much earlier — right after the analysis run categorizes this row,
-    # for EVERY credit row regardless of category — and mean only "a bare
-    # Oracle receipt exists for this row" (see rule_engine/orchestrator.py's
-    # Step 4.5, and oracle/fusion_client.py's build_receipt_creation_payload,
+    # meaning "fully approved AND invoice-mapped". They were later written
+    # much earlier, automatically, right after the analysis run categorized
+    # the row (the old orchestrator "Step 4.5" — removed; see
+    # rule_engine/orchestrator.py's "Step 4.5 REMOVED" comment). Now
+    # written by exactly two USER-TRIGGERED entry points instead
+    # (hitl/service.py's create_receipts_bulk() and
+    # _map_invoice_and_update()) — see oracle/receipt_creation.py's
+    # docstring. Still means only "a bare Oracle receipt exists for this
+    # row" (see oracle/fusion_client.py's build_receipt_creation_payload,
     # which deliberately omits remittanceReferences). standard_receipt_id
     # is Oracle's own numeric StandardReceiptId — required to address the
     # child remittanceReferences collection later at invoice-mapping time.
@@ -543,6 +612,36 @@ class LineItem(Base):
     reference_message    = Column(Text, nullable=True)
     reference_payload    = Column(JSON, nullable=True)       # last remittanceReferences request body sent
     reference_response_raw = Column(JSON, nullable=True)     # raw Oracle response(s) from invoice mapping
+
+    # ── Oracle receipt REVERSAL (SOAP processUnapplyReceipt, per invoice) ────
+    # See hitl/service.py::reverse_receipt_invoice() and
+    # RowState.RECEIPT_REVERSED above. The receipt itself
+    # (standard_receipt_id/oracle_ref_no/oracle_post_status) is NEVER
+    # touched by a reversal — only these fields, matched_invoices, and
+    # reference_status/hitl_status/current_state change.
+    #
+    # NOTE: new nullable columns on an already-deployed DB need a one-off
+    # `ALTER TABLE line_items ADD COLUMN <name> <type>` per column, in each
+    # environment, before this ships — Base.metadata.create_all() only
+    # creates missing TABLES, not missing COLUMNS (same caveat as
+    # aging_source_file_id above).
+    reversed_at           = Column(DateTime, nullable=True)  # set only once the row's LAST applied invoice is unapplied
+    reversed_by           = Column(String, nullable=True)    # SPOC email
+    reversal_reason       = Column(Text, nullable=True)      # comment on whichever unapply call emptied matched_invoices
+    unapply_log           = Column(JSON, nullable=True)      # append-only: [{invoice_number, trx_number, success, message, status_code, at, by}, ...] — one entry per unapply attempt, since reversal is per-invoice and can happen across several calls
+    pre_reversal_matched_invoices = Column(JSON, nullable=True)  # snapshot of matched_invoices taken immediately before an unapplied invoice's entry is removed, so row-detail can still show what was previously applied
+
+    # ── Oracle receipt DELETION (REST DELETE /standardReceipts/{id}) ─────────
+    # A SEPARATE action from reversal above — only removes the receipt
+    # itself (only allowed once it has no active application; see
+    # hitl/service.py::delete_receipt()). On success, ALL of the receipt-
+    # creation fields above (oracle_ref_no, standard_receipt_id,
+    # oracle_post_status, etc.) are cleared back to their pre-creation
+    # (None) state — these three fields are the only trace left that a
+    # receipt ever existed and was deleted.
+    receipt_deleted_at      = Column(DateTime, nullable=True)
+    receipt_deleted_by      = Column(String, nullable=True)
+    receipt_deletion_reason = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=dt.datetime.utcnow)
     updated_at = Column(DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow)

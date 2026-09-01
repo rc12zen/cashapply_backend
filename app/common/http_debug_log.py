@@ -72,6 +72,7 @@ def build_curl_command(
     params: Optional[dict[str, Any]] = None,
     json_body: Optional[dict] = None,
     form_body: Optional[dict] = None,
+    xml_body: Optional[str] = None,
 ) -> str:
     """
     Builds a copy-pasteable curl command equivalent to the given request.
@@ -79,8 +80,13 @@ def build_curl_command(
     replace ***REDACTED*** with the real value from .env to actually run it.
 
     Pass exactly one of json_body (sent as -d '<json>' with a JSON
-    Content-Type) or form_body (sent as -d "k=v&k2=v2", matching
-    application/x-www-form-urlencoded — e.g. the OAuth token endpoint).
+    Content-Type), form_body (sent as -d "k=v&k2=v2", matching
+    application/x-www-form-urlencoded — e.g. the OAuth token endpoint), or
+    xml_body (sent as -d '<xml>' with a text/xml Content-Type — SOAP calls,
+    e.g. processUnapplyReceipt. The caller is expected to already have set
+    an explicit Content-Type header for XML requests, since SOAP servers
+    are often picky about the exact charset suffix — this function does not
+    add one on xml_body's behalf the way it does for json_body).
     """
     headers = headers or {}
     content_type = {"Content-Type": "application/json"} if json_body is not None else {}
@@ -109,6 +115,8 @@ def build_curl_command(
     elif form_body is not None:
         body_str = "&".join(f"{k}={v}" for k, v in form_body.items())
         parts.append(f"-d {_shell_quote_single(body_str)}")
+    elif xml_body is not None:
+        parts.append(f"-d {_shell_quote_single(xml_body)}")
 
     return " \\\n  ".join(parts)
 
@@ -122,12 +130,13 @@ def log_oracle_request(
     params: Optional[dict[str, Any]] = None,
     json_body: Optional[dict] = None,
     form_body: Optional[dict] = None,
+    xml_body: Optional[str] = None,
     tag: str = "oracle",
 ) -> str:
     """Logs the outbound request as a redacted curl command. Returns the curl string."""
     curl_cmd = build_curl_command(
         method, url, headers=headers, auth=auth, params=params,
-        json_body=json_body, form_body=form_body,
+        json_body=json_body, form_body=form_body, xml_body=xml_body,
     )
     logger.info("[%s] REQUEST →\n%s", tag, curl_cmd)
     return curl_cmd
