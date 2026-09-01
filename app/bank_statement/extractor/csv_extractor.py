@@ -47,7 +47,26 @@ _SNIFF_BYTES = 4096
 
 # Tried in order when the recipe says encoding="auto". latin-1 never fails to
 # decode, so it doubles as the last-resort fallback.
-_AUTO_ENCODINGS = ("utf-8", "latin-1")
+#
+# utf-8-sig, NOT utf-8: it is identical to utf-8 on a file with no BOM, and
+# strips the byte-order mark (EF BB BF) when there is one. Plain utf-8 keeps the
+# BOM as a ﻿ character glued to the FIRST cell of the file -- which is
+# invisible in the wizard grid but makes the first column's name a different
+# string from what it appears to be.
+#
+# That split the two read paths. pandas (read_csv, below) strips a BOM on its
+# own, so extraction saw "Account Number"; the Config Builder's raw-preview
+# endpoint reads with a plain csv.reader through resolve_encodings() and saw
+# "﻿Account Number". The wizard offered the BOM'd name, the user picked it,
+# and every locator or field mapping pointed at the first column of a BOM'd CSV
+# resolved to column_found=False -- surfacing as "No account number found with
+# this rule", with a column plainly visible in the preview holding the value.
+# A South African FNB export (SA 513) is one such file.
+#
+# Fixed here rather than by stripping ﻿ at the preview, so the two paths
+# agree at the point they decode instead of one of them cleaning up after the
+# other. See sniff_dialect's note on why the preview shares this module at all.
+_AUTO_ENCODINGS = ("utf-8-sig", "latin-1")
 
 # Characters that cannot serve as a delimiter no matter what the sniffer says:
 # the line terminators (csv.reader raises "bad delimiter value") and the quote

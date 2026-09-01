@@ -34,10 +34,12 @@ import dataclasses
 import datetime as dt
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from ..db.models import SourceFile, User, BankAccount, OrganizationUnit, AccountConfigRecipe
+from ..db.models import (
+    SourceFile, User, BankAccount, BankAccountOU, OrganizationUnit, AccountConfigRecipe,
+)
 from ..deps import get_db
 from ..auth import require_permission
 from ..audit.service import log_activity
@@ -355,6 +357,13 @@ def builder_locate_account(body: LocateAccountRequest, db: Session = Depends(get
             "currency":      entry.get("currency"),
             "ou_number":     entry.get("ou_number"),
             "business_unit": entry.get("business_unit"),
+            # The number as ALREADY REGISTERED, which can differ from `acct` in
+            # leading zeros -- a statement reading "188603500" matches an account
+            # stored as "00188603500" (match_key, above). Saving keeps the stored
+            # form, since that is the one Oracle knows and the one sent as
+            # RemittanceBankAccountNumber, so the wizard needs it to show what the
+            # recipe will actually be attached to rather than the extracted text.
+            "registered_account_number": entry.get("account_number", _k),
         }
 
     # Flag candidates that don't look like real account numbers (e.g. the locator
@@ -446,6 +455,20 @@ def available_ous(db: Session = Depends(get_db),
 
 # ── save a recipe (create account or add a format recipe under an existing one) ──
 
+class AdditionalOU(BaseModel):
+    """One EXTRA Business Unit for an account that receives money for several.
+
+    Same three fields an account assignment carries for its primary OU, and
+    resolved through the same _get_or_create_organization_unit() -- so an OU
+    that has never been onboarded can be created right here, rather than having
+    to exist first. functional_currency is required only when the OU is
+    genuinely new; an existing OU's currency is never overwritten.
+    """
+    ou_number: str
+    business_unit: str = ""
+    functional_currency: str | None = None
+
+
 class AccountAssignment(BaseModel):
     """One account to onboard against the recipe being saved.
 
@@ -461,7 +484,25 @@ class AccountAssignment(BaseModel):
     functional_currency: str | None = None
     bank: str | None = None
     currency: str | None = None
+    # Opt-in "yes, rename this account" for the case where the number matches an
+    # account already on file under a DIFFERENT bank name. Default False, so
+    # onboarding a new statement format for a known account never silently
+    # relabels it -- see _get_or_create_bank_account's rename_bank.
+    rename_bank_account: bool = False
     override_account_validation: bool = False
+    # Business Units BEYOND the primary one above, for an account that receives
+    # money for more than one BU (see db/models.py's BankAccountOU).
+    #
+    # An OU here may be brand new -- it is onboarded on exactly the same terms
+    # as the primary (name + ledger currency, see AdditionalOU), so discovering
+    # mid-save that an account is shared does not mean abandoning the wizard to
+    # go and create the OU on another screen first.
+    #
+    # Previously this could only be set AFTER onboarding, from the Accounts &
+    # OU's page -- so a multi-BU account was always a two-screen job, and was
+    # frequently impossible because the second BU did not exist yet and had no
+    # statement of its own to bring it into being.
+    additional_ous: list[AdditionalOU] = Field(default_factory=list)
 
 
 class SaveRecipeRequest(BaseModel):
@@ -471,12 +512,21 @@ class SaveRecipeRequest(BaseModel):
     recipe: dict                      # account_locator + source + fields + credit_rule + …
     bank: str | None = None
     currency: str | None = None
+    # Single-account counterpart of AccountAssignment.rename_bank_account -- the
+    # wizard's explicit "rename this account" opt-in. See that field's note.
+    rename_bank_account: bool = False
     # OU + Business Unit are now REQUIRED — every account config must be
     # linked to a real OrganizationUnit, never saved "OU unknown". This is
     # what makes OU/BU a relationship (BankAccount.ou_id -> OrganizationUnit)
     # instead of an optional free-text afterthought.
     ou_number: str
     business_unit: str
+    # Business Units BEYOND the primary one, for the single-account save path
+    # (the `accounts` fan-out carries its own per-account list). Must already
+    # (the `accounts` fan-out carries its own per-account list). See
+    # AccountAssignment.additional_ous and _apply_additional_ous -- an OU here
+    # may be new, and an empty list means "unchanged", not "remove them all".
+    additional_ous: list[AdditionalOU] = Field(default_factory=list)
     # Ledger/functional currency for this OU — required for Oracle FX Leg 2
     # resolution (rule_engine/fx_service.py's get_functional_currency()).
     # REQUIRED whenever ou_number is genuinely new (see
@@ -551,22 +601,62 @@ def _get_or_create_organization_unit(db: Session, ou_number: str, business_unit:
 
 def _get_or_create_bank_account(db: Session, acct: str, display_name: str, bank: str | None,
                                   currency: str | None,
-                                  ou: OrganizationUnit) -> tuple[BankAccount, bool, str | None]:
+                                  ou: OrganizationUnit,
+                                  rename_bank: bool = False) -> tuple[BankAccount, bool, str | None]:
     """Returns (bank_account, created, previous_ou_number_if_reassigned).
 
     The third element exists so a fan-out over several accounts can REPORT which
     already-configured accounts had their OU changed by this save. Reassigning an
     existing account's OU is legitimate (it's how a mis-mapped account gets
     corrected) but doing it silently across N accounts at once is not.
+
+    IDENTITY IS THE ACCOUNT NUMBER, LEADING ZEROS IGNORED -- match_key, the same
+    rule the rest of the app uses (detector.py, ingest_service.py's _account_for,
+    and locate-account above). This used to be an EXACT match on account_number
+    AND bank_name, which made it the one place in the system with its own idea of
+    what "the same account" means, and it silently minted duplicates:
+
+      - Leading zeros are not a choice anyone makes, they are an artifact of how
+        each file represents the number. Excel/pandas strip them off a numeric
+        column (see match_key's own comment), so the SAME real account arrives as
+        "00188603500" from one statement and "188603500" from another. Under an
+        exact match the second one became a brand-new account.
+      - bank_name was never an identifier. It is free text a person types, which
+        is why "CITI Bank", "CITI BANK" and "CITI7005" all exist in this database
+        for what is one bank. Requiring it to match exactly meant typing a
+        different label for a known account also forked it.
+
+    That is what happened to 00188603500 (Standard Chartered Bank): onboarding a
+    CSV format for it, typing the bank as "SCB 513", created a second account
+    "188603500" with zero rows, while the statement's parsed rows went to the
+    original via match_key. The file pointed at the empty one, so the run refused
+    with "no pending rows" -- with the rows sitting right there on the original.
+
+    Checked against Oracle's own extract before choosing this rule: of its 95
+    bank accounts, 28 carry leading zeros, NONE collide under match_key, and not
+    one zero-padded account also exists in stripped form. The merge this rule
+    could theoretically cause does not occur in the real data; the split the old
+    rule caused is in the database.
+
+    ON MATCH, THE STORED VALUES WIN. account_number is left exactly as it is, so
+    the canonical form (the one Oracle knows -- "00188603500", not the CSV's
+    "188603500") stays the value we display and send as
+    RemittanceBankAccountNumber. bank_name likewise, unless the caller passes
+    rename_bank=True, which is the wizard's explicit "rename this account"
+    checkbox rather than a silent side-effect of onboarding a new format.
     """
-    existing = (
-        db.query(BankAccount)
-        .filter(BankAccount.account_number == acct, BankAccount.bank_name == (bank or "UNKNOWN"))
-        .first()
+    key = match_key(acct)
+    existing = next(
+        (a for a in db.query(BankAccount)
+                      .filter(BankAccount.account_last4 == last4(acct)).all()
+         if match_key(a.account_number) == key),
+        None,
     )
     if existing:
         existing.display_name = display_name
-        existing.account_last4 = last4(acct)
+        # account_number/account_last4 deliberately NOT rewritten -- see above.
+        if bank and rename_bank:
+            existing.bank_name = bank
         if currency:
             existing.currency = currency
         previous = None
@@ -588,6 +678,58 @@ def _get_or_create_bank_account(db: Session, acct: str, display_name: str, bank:
     db.add(account)
     db.flush()
     return account, True, None
+
+
+def _apply_additional_ous(db: Session, account: BankAccount, additional: list["AdditionalOU"],
+                           primary_ou: OrganizationUnit) -> list[str]:
+    """Attach this account's ADDITIONAL Business Units (BankAccountOU rows).
+
+    Returns the OU numbers actually attached, for the audit entry.
+
+    ONBOARDED ON THE SAME TERMS AS THE PRIMARY OU
+    -----------------------------------------------
+    Each entry carries the same three fields an account assignment does, and is
+    resolved through the SAME _get_or_create_organization_unit() -- so an OU
+    that has never been onboarded can be created here, named and given its
+    ledger currency, exactly as the primary OU is. Requiring it to exist first
+    would just re-create the dead end this whole feature exists to remove, one
+    level down: the wizard is often where someone FIRST discovers the account is
+    shared, and sending them to another screen mid-save to create the OU loses
+    the work in progress.
+
+    functional_currency is still required for a genuinely new OU and ignored for
+    an existing one -- that rule lives in _get_or_create_organization_unit and is
+    not special-cased here.
+
+    EMPTY MEANS "NOT SPECIFIED", NOT "REMOVE THEM ALL"
+    ---------------------------------------------------
+    A blank list leaves whatever is already attached untouched, because the
+    field defaults to [] -- so a routine re-save from the wizard (adding a new
+    format recipe, correcting a column mapping) can never silently strip a
+    multi-BU account back to one BU with nothing in the flow saying so.
+    Removing an additional BU stays the Accounts & OU's page's job, where it is
+    the explicit purpose of the screen rather than a side-effect of saving
+    something else.
+    """
+    seen: dict[str, "AdditionalOU"] = {}
+    for entry in additional or []:
+        number = (entry.ou_number or "").strip()
+        if not number or number == primary_ou.ou_number:
+            continue          # the primary is not an "additional"
+        seen.setdefault(number, entry)
+    if not seen:
+        return []
+
+    existing_links = {link.ou_id for link in account.additional_ou_links}
+    for number in sorted(seen):
+        entry = seen[number]
+        ou = _get_or_create_organization_unit(
+            db, number, (entry.business_unit or "").strip(), entry.functional_currency
+        )
+        if ou.id not in existing_links:
+            db.add(BankAccountOU(bank_account_id=account.id, ou_id=ou.id))
+    db.flush()
+    return sorted(seen)
 
 
 @router.post("/builder/save")
@@ -617,6 +759,8 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
             bank=body.bank,
             currency=body.currency,
             override_account_validation=body.override_account_validation,
+            additional_ous=body.additional_ous,
+            rename_bank_account=body.rename_bank_account,
         )]
 
     # Validate EVERY assignment before writing anything, so a bad entry at
@@ -697,7 +841,8 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
         for a in assignments:
             ou = _get_or_create_organization_unit(db, a.ou_number, a.business_unit, a.functional_currency)
             account, created, previous_ou = _get_or_create_bank_account(
-                db, a.account_number, a.display_name, a.bank, a.currency, ou
+                db, a.account_number, a.display_name, a.bank, a.currency, ou,
+                rename_bank=a.rename_bank_account,
             )
             if previous_ou is not None:
                 ou_changed.append({
@@ -705,6 +850,13 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
                     "from_ou_number": previous_ou,
                     "to_ou_number": ou.ou_number,
                 })
+
+            # Additional Business Units for an account that receives money for
+            # more than one BU. A new OU here is onboarded on the same terms
+            # as the primary (name + ledger currency) -- see _apply_additional_ous.
+            attached_additional = _apply_additional_ous(
+                db, account, a.additional_ous, ou
+            )
 
             existing_versions = (
                 db.query(AccountConfigRecipe)
@@ -733,6 +885,11 @@ def builder_save(body: SaveRecipeRequest, db: Session = Depends(get_db),
                          metadata={"display_name": a.display_name, "format": fmt,
                                    "version": next_version, "ou_number": ou.ou_number,
                                    "business_unit": ou.ou_name,
+                                   # Only present when this save actually
+                                   # attached extra BUs, so an ordinary
+                                   # single-BU save reads exactly as before.
+                                   **({"additional_ou_numbers": attached_additional}
+                                      if attached_additional else {}),
                                    "batch_size": len(assignments)})
 
             saved.append({
