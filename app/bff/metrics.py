@@ -98,6 +98,17 @@ GROUP_DISCARDED           = "discarded"
 # discarded/rejected, but distinct: this row never gets an Oracle receipt
 # itself (its CHILD rows do, one per customer).
 GROUP_DISTRIBUTED         = "distributed"
+# NEW — see LineItem.reversed_at and hitl/service.py's
+# reverse_receipt_invoice(). A row whose LAST applied invoice has been
+# unapplied (SOAP processUnapplyReceipt) — its Oracle receipt is still
+# alive and must be reused, but nothing is currently applied to it.
+# Terminal-but-reversible, same family as GROUP_OVERPAYMENT_PARKED: keyed
+# on current_state, not rule_id/reference_status (both of which get reset
+# to their pre-mapping values on a full reversal). Clears itself
+# automatically once a SPOC re-maps via ManualInvoiceMappingCard (which
+# flips current_state back to review_approve) — no dedicated "exit" logic
+# needed here, same mechanism GROUP_OVERPAYMENT_PARKED's reopen relies on.
+GROUP_RECEIPT_REVERSED    = "receipt_reversed"
 
 # Every group that _category_for_row() can ever return — the single list
 # every aggregation dict below is initialized from, so adding a new group
@@ -109,7 +120,7 @@ ALL_GROUPS: tuple[str, ...] = (
     GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_OVERPAYMENT,
     GROUP_CONFLICT_EXCEPTION,
     GROUP_PROCESSED, GROUP_REJECTED, GROUP_POST_FAILED, GROUP_DISCARDED,
-    GROUP_DISTRIBUTED, GROUP_OVERPAYMENT_PARKED,
+    GROUP_DISTRIBUTED, GROUP_OVERPAYMENT_PARKED, GROUP_RECEIPT_REVERSED,
 )
 
 RULE_ID_TO_GROUP: dict[str, str] = {
@@ -178,6 +189,7 @@ GROUP_LABELS: dict[str, str] = {
     GROUP_POST_FAILED:        "Post Failed",
     GROUP_DISCARDED:          "Discarded",
     GROUP_DISTRIBUTED:        "Distributed",
+    GROUP_RECEIPT_REVERSED:   "Receipt Reversed — Pending Remap",
 }
 
 
@@ -211,12 +223,13 @@ def _category_for_row(r: LineItem) -> str:
     grouping, since a row that's been approved-and-invoice-mapped is
     "processed" regardless of whether it got there via R9a or R9b.
 
-    PATCH: was r.oracle_post_status — that field now only means "a bare
-    receipt was created during Bank Reconciliation" (see
-    rule_engine/orchestrator.py's Step 4.5), which happens for EVERY row
-    regardless of category. Using it here would have made every row
-    "Processed" the instant a run finished, before anyone approved
-    anything. reference_status is the invoice-mapping outcome — set only
+    PATCH: was r.oracle_post_status — that field only means "a bare
+    receipt has been created" (via the Analysis History "Create Receipts"
+    bulk action or as step 1 of Approve — see oracle/receipt_creation.py),
+    which says nothing about whether the row has actually been reviewed.
+    Using it here would have made a row "Processed" the instant a receipt
+    existed, before anyone approved anything. reference_status is the
+    invoice-mapping outcome — set only
     when a SPOC approves a ready_for_oracle row (hitl/service.py) — which
     is what "Processed"/"Posted"/"Invoice Mapped" actually means.
     """
@@ -248,6 +261,14 @@ def _category_for_row(r: LineItem) -> str:
     # forever despite having been explained and closed out.
     if r.current_state and r.current_state.value == "overpayment_parked":
         return GROUP_OVERPAYMENT_PARKED
+    # NEW — see LineItem.reversed_at and hitl/service.py's
+    # reverse_receipt_invoice(). Checked in the same current_state-keyed
+    # tier as the two checks above, before the rule_id fallback — a
+    # reversed row's rule_id/reference_status/receipt_eligibility don't
+    # reliably distinguish it (reference_status was cleared back to None
+    # on full reversal, same as a row that was never mapped at all).
+    if r.current_state and r.current_state.value == "receipt_reversed":
+        return GROUP_RECEIPT_REVERSED
     # NEW — see LineItem.settlement_override_at and hitl/service.py's
     # override_settlement_as_customer_payment(). A settlement identifier
     # match is a pattern match, not always a fact (the same payer name can

@@ -7,11 +7,13 @@ WITHOUT posting anything.
 Why this exists
 ---------------
 An R11 row used to have exactly one action that could actually complete:
-Reject. That was the wrong verb. The money genuinely arrived, Oracle already
-holds a receipt for it (created during Bank Reconciliation, Step 4.5), and
-nothing about the payment was invalid — so recording it as a rejection
-described something that did not happen, and the row either sat in the
-exception queue indefinitely or left a misleading audit trail.
+Reject. That was the wrong verb. The money genuinely arrived and nothing
+about the payment was invalid — so recording it as a rejection described
+something that did not happen, and the row either sat in the exception
+queue indefinitely or left a misleading audit trail. (Whether Oracle
+already holds a receipt for it depends on whether Create Receipts / Approve
+has run for this row yet — receipt creation is no longer automatic; see
+oracle/receipt_creation.py.)
 
 The two routes out, and when each applies
 -----------------------------------------

@@ -105,6 +105,20 @@ def _cond_gl_rate_editable(r: LineItem) -> bool:
     return r.oracle_post_status == "failed"
 
 
+def _cond_receipt_editable(r: LineItem) -> bool:
+    # Edit Receipt (account number / OU / receipt method / rate / dates) —
+    # hitl/service.py's edit_receipt_fields(). Same two eligible
+    # situations as GL rate above, but WITHOUT requiring is_cross_ledger:
+    # account number, OU, receipt method, and dates are correctable
+    # regardless of currency — only the GL conversion rate field inside
+    # that unified edit is itself gated to cross-ledger rows (checked
+    # inside edit_receipt_fields(), not here), since a same-ledger row
+    # genuinely has no rate to edit.
+    if r.standard_receipt_id:
+        return r.reference_status != "success"
+    return r.oracle_post_status == "failed"
+
+
 def _cond_mappable_directly(r: LineItem) -> bool:
     # Map Invoice is offered on its own for every category EXCEPT an open
     # overpayment. An overpaid row has a single entry point — "Handle
@@ -138,6 +152,56 @@ def _cond_settlement_override_eligible(r: LineItem) -> bool:
     return r.settlement_type is not None and r.settlement_override_at is None
 
 
+def _cond_discardable(r: LineItem) -> bool:
+    # Discard — two independent eligible situations, both handled by
+    # hitl/service.py's discard_row() (which loosens its own category gate
+    # to match — see that function's docstring):
+    #   Case A (original): a genuinely undecided Unidentified row — same
+    #           check as receipt_eligibility_undecided above.
+    #   Case B (NEW): a row whose Oracle receipt was just explicitly
+    #           Deleted (see hitl/service.py's delete_receipt()) and the
+    #           SPOC is choosing "Discard" over "Create New Receipt" in
+    #           the post-delete follow-up. receipt_deleted_at is set and
+    #           there's no live receipt (delete_receipt() always clears
+    #           standard_receipt_id on success, so this can't be
+    #           accidentally true for a row that has since had a NEW
+    #           receipt created).
+    if r.receipt_eligibility is None and not r.standard_receipt_id and r.receipt_deleted_at is None:
+        # Mirrors the original unidentified-only case exactly (see
+        # receipt_eligibility_undecided) — kept explicit rather than just
+        # falling through, since receipt_eligibility is only ever set on
+        # unidentified rows in the first place.
+        return True
+    return bool(r.receipt_deleted_at) and not r.standard_receipt_id
+
+
+def _cond_has_reversible_invoice(r: LineItem) -> bool:
+    # Reverse (per-invoice SOAP unapply) — gates whether the row has ANY
+    # invoice worth offering a reversal control for at all. The frontend
+    # renders one Unapply control PER applied invoice (see
+    # components/row-detail's invoice breakdown), not a single row-level
+    # button — this just decides whether that section of the UI has
+    # anything to show. Mirrors hitl/service.py's
+    # reverse_receipt_invoice() eligibility gate: something must actually
+    # be applied (reference_status == "success") for an unapply call to
+    # mean anything to Oracle.
+    return bool(r.matched_invoices) and r.reference_status == "success"
+
+
+def _cond_receipt_deletable(r: LineItem) -> bool:
+    # Delete Receipt — same predicate as receipt_editable (Edit Receipt is
+    # already state-based/category-unrestricted and stays correct for the
+    # new receipt_reversed bucket with zero changes; Delete needs to match
+    # it exactly): a receipt exists and has no active application. Kept as
+    # its own named function (not a reuse of _cond_receipt_editable)
+    # per this file's convention of one condition per business rule, even
+    # when two happen to coincide today (see gl_rate_editable vs
+    # receipt_editable for precedent).
+    if r.standard_receipt_id:
+        return r.reference_status != "success"
+    return False
+
+
 # Fixed, known set of extra eligibility checks an ActionDefinition row can
 # reference by name (condition_key). Deliberately not free-form/evaluated
 # code — see db/models.py's ActionDefinition docstring for why.
@@ -151,10 +215,18 @@ CONDITION_CHECKS = {
     "reference_status_failed": _cond_reference_status_failed,
     "not_processed": _cond_not_already_mapped_terminal,
     "receipt_eligibility_undecided": _cond_receipt_eligibility_undecided,
+    # Kept registered for the same reason "not_rejected" is above: an
+    # un-reseeded DB may still have an "edit_gl_rate" ActionDefinition row
+    # referencing this key by name. The seeded set now uses "edit_receipt"
+    # / "receipt_editable" instead — see scripts/seed_actions.py.
     "gl_rate_editable": _cond_gl_rate_editable,
+    "receipt_editable": _cond_receipt_editable,
     "settlement_override_eligible": _cond_settlement_override_eligible,
     "is_overpayment": _cond_is_overpayment,
     "mappable_directly": _cond_mappable_directly,
+    "discardable": _cond_discardable,
+    "has_reversible_invoice": _cond_has_reversible_invoice,
+    "receipt_deletable": _cond_receipt_deletable,
 }
 
 
