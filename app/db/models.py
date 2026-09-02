@@ -480,6 +480,26 @@ class LineItem(Base):
     # than guessing. Nullable -- None for rows never parked, cleared on reopen.
     pre_park_state = Column(String, nullable=True)
 
+    # NEW -- durable flag for rule_engine/remittance_recheck.py's periodic scan
+    # of overpayment_parked rows with overpayment_disposition == "awaiting_remittance".
+    # Deliberately does NOT reopen the row automatically (a SPOC closed it out
+    # on purpose; a system job shouldn't silently undo that) -- it only
+    # records that a matching remittance now exists, so bff/row_detail.py can
+    # show this durably instead of only computing it live when someone
+    # happens to open the row-detail page (see the old, read-time-only
+    # "remittance_now_available" advisory badge this replaces/backs). Set the
+    # first time the recheck job sees build_remittance_view(...).found=True
+    # for this row; left alone (not re-checked) once set, since re-running
+    # the lookup after that adds nothing until a SPOC actually reopens the
+    # row. Cleared on reopen, same as pre_park_state/overpayment_disposition*.
+    #
+    # NOTE: new nullable columns on an already-deployed DB need a one-off
+    # `ALTER TABLE line_items ADD COLUMN <name> <type>` per column, in each
+    # environment (or run `python scripts/check_schema_drift.py --apply`) --
+    # Base.metadata.create_all() only creates missing TABLES, not missing
+    # COLUMNS (same caveat as reversed_at above).
+    remittance_available_at = Column(DateTime, nullable=True)
+
     # Route A (capped manual mapping, rule R9e) -- how much of the receipt was
     # deliberately LEFT UNAPPLIED in Oracle after posting. Each invoice
     # reference is capped at that invoice's own outstanding_amount (see

@@ -123,6 +123,27 @@ ALL_GROUPS: tuple[str, ...] = (
     GROUP_DISTRIBUTED, GROUP_OVERPAYMENT_PARKED, GROUP_RECEIPT_REVERSED,
 )
 
+# NEW — a cross-cutting worklist tab, not a 15th slice of ALL_GROUPS. Every
+# one of the groups above where a row has genuinely NOT had an Oracle
+# receipt created for it yet, minus GROUP_DISCARDED on request (a discarded
+# row is a closed decision — it never gets a receipt, and showing it here
+# would make this look like an open worklist item). Deliberately excludes:
+#   - GROUP_PROCESSED / GROUP_RECEIPT_REVERSED — a receipt already exists
+#   - GROUP_OVERPAYMENT_PARKED — closed out without posting, terminal
+#   - GROUP_DISTRIBUTED — the parent row itself never gets a receipt (its
+#     children do, one per customer) but the split is already resolved
+# A row still appears in its normal group's own tab too — this is a
+# read-only aggregate view layered on top of _category_for_row(), not a
+# new mutually-exclusive bucket, so it is intentionally NOT part of
+# ALL_GROUPS/_group_counts()/_group_amounts() (those must keep summing to
+# total_rows exactly once per row).
+GROUP_NO_RECEIPT = "no_receipt"
+NO_RECEIPT_GROUPS: tuple[str, ...] = (
+    GROUP_UNIDENTIFIED, GROUP_NEEDS_REMITTANCE, GROUP_NEEDS_DISTRIBUTION,
+    GROUP_READY_FOR_ORACLE, GROUP_SHORT_PAYMENT, GROUP_CONFLICT_EXCEPTION,
+    GROUP_REJECTED, GROUP_POST_FAILED,
+)
+
 RULE_ID_TO_GROUP: dict[str, str] = {
     "R8":  GROUP_UNIDENTIFIED,
     "R7":  GROUP_NEEDS_REMITTANCE,
@@ -190,6 +211,7 @@ GROUP_LABELS: dict[str, str] = {
     GROUP_DISCARDED:          "Discarded",
     GROUP_DISTRIBUTED:        "Distributed",
     GROUP_RECEIPT_REVERSED:   "Receipt Reversed — Pending Remap",
+    GROUP_NO_RECEIPT:         "No Receipt Created",
 }
 
 
@@ -534,6 +556,7 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
     total_needs_distribution = 0
     total_discarded = 0
     total_distributed = 0
+    total_no_receipt = 0
     for r in rows:
         cat = _category_for_row(r)
         if cat == GROUP_UNIDENTIFIED:
@@ -548,6 +571,11 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
             total_discarded += 1
         if cat == GROUP_DISTRIBUTED:
             total_distributed += 1
+        # NEW — see NO_RECEIPT_GROUPS/GROUP_NO_RECEIPT above: the run-list's
+        # own "No Receipt Created" column, same aggregate the run-detail
+        # tab uses, just counted directly off `cat` instead of re-grouping.
+        if cat in NO_RECEIPT_GROUPS:
+            total_no_receipt += 1
     total_identified = len(rows) - total_unidentified
 
     # PATCH: the aging report snapshot this run actually matched against —
@@ -581,6 +609,7 @@ def compute_run_summary_row(db: Session, run: AnalysisRun) -> dict:
         "total_needs_distribution": total_needs_distribution,
         "total_discarded":          total_discarded,
         "total_distributed":        total_distributed,
+        "total_no_receipt":         total_no_receipt,
         # ── Legacy fields — kept for backward compatibility ──────────────────
         "total_matched": matched,
         "total_not_found": not_found,
@@ -623,6 +652,15 @@ def _serialize_line_item_for_tab(r: LineItem, source: str) -> dict:
         "oracle_transaction_ref": r.oracle_ref_no,
         "oracle_post_status": r.oracle_post_status,  # receipt-creation status (step 1)
         "reference_status": r.reference_status,        # invoice-mapping status (step 2)
+        # NEW — the actual "does a receipt exist" fact (Oracle's numeric
+        # StandardReceiptId), truthy only once a bare receipt has really
+        # been created (see hitl/actions_registry.py's _cond_discardable,
+        # which keys off this same field). Exposed so the frontend can
+        # decide Discard-button eligibility/visibility per row without
+        # re-deriving it from oracle_post_status, which only reflects the
+        # LAST attempt and can be "failed" even after a receipt exists from
+        # an earlier one.
+        "standard_receipt_id": r.standard_receipt_id,
         "_source": source,
         "reason_code": r.reason_code,
         "rule_id": r.rule_id,
@@ -675,6 +713,21 @@ def compute_run_summary(db: Session, run_id: int) -> dict:
             "rows": [_serialize_line_item_for_tab(r, SOURCE_FOR_GROUP[group]) for r in rows_by_group[group]],
         }
         for group in rows_by_group
+    }
+
+    # NEW — cross-cutting "No Receipt Created" aggregate tab, built from the
+    # per-group buckets already computed above (not a fresh DB pass). Each
+    # row keeps its normal serialized `category`/`category_label` (its real
+    # group) — this tab just re-lists rows that are still receipt-less
+    # across every one of NO_RECEIPT_GROUPS.
+    no_receipt_rows = [r for g in NO_RECEIPT_GROUPS for r in rows_by_group[g]]
+    metrics[GROUP_NO_RECEIPT] = len(no_receipt_rows)
+    tabs[GROUP_NO_RECEIPT] = {
+        "count": len(no_receipt_rows),
+        "rows": [
+            _serialize_line_item_for_tab(r, SOURCE_FOR_GROUP[_category_for_row(r)])
+            for r in no_receipt_rows
+        ],
     }
 
     return {"metrics": metrics, "tabs": tabs}

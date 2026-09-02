@@ -45,9 +45,56 @@ def find_matching_remittances(db: Session, credit_amount: float, currency: str,
     return candidates
 
 
-def build_remittance_view(db: Session, line_item, aging_customer_hint: str | None) -> dict:
+def _resolve_remittance_customer_to_aging(aging_map, raw_customer_text: str | None,
+                                           ou_number: str | None) -> str | None:
+    """
+    Snap the remittance email's raw, unnormalized AI-extracted payer name
+    (App2's `RemittanceExtraction.raw_customer_text`) onto the aging
+    report's own canonical customer-name spelling, using the SAME
+    fuzzy-match helpers the bank-statement extraction pipeline already uses
+    to resolve ITS customer guess (see extraction/layer_2a_regex.py's
+    aging_map.fuzzy_customer_in_ou() call and layer_2b_ai.py's
+    _validate_ai_output()). Without this, build_remittance_view() was
+    comparing a cleaned-up, aging-canonical name (aging_customer_hint) on
+    one side against a raw, un-normalized email signature string on the
+    other ("Acme Corp." vs "ACME CORPORATION PVT LTD") -- a wording
+    difference alone could push the fuzzy score below CUSTOMER_FUZZY_MIN
+    and raise a false Customer Conflict for the SAME customer.
+
+    Tries the OU-restricted candidate list first (same reasoning as
+    layer_2b_ai.py's in-OU-first strategy: fewer, more relevant candidates
+    means fewer wrong-customer false matches), then falls back to the
+    global customer list. Returns None (not the raw text) when nothing
+    clears the match threshold, so the caller can fall back to the
+    original raw-text comparison rather than silently treating "no aging
+    customer found at all" as an automatic match.
+    """
+    if not raw_customer_text or aging_map is None:
+        return None
+
+    if ou_number:
+        match_row, score = aging_map.fuzzy_customer_in_ou(raw_customer_text, ou_number)
+        if match_row:
+            return match_row.customer_name
+
+    match_row, score = aging_map.fuzzy_customer(raw_customer_text)
+    return match_row.customer_name if match_row else None
+
+
+def build_remittance_view(db: Session, line_item, aging_customer_hint: str | None,
+                           aging_map=None) -> dict:
     """
     Returns the `remittance` sub-dict expected by cashapply_shared.rule_engine.
+
+    `aging_map` is optional (defaults to None, same as before this patch,
+    for any caller that hasn't been updated to pass it) -- when supplied,
+    the remittance email's raw payer name is resolved to the aging
+    report's own canonical spelling before comparing against
+    `aging_customer_hint` (also an aging-canonical name -- see
+    extraction/layer_2b_ai.py's _validate_ai_output()), instead of
+    comparing raw email text against a canonical name directly. See
+    _resolve_remittance_customer_to_aging() above for why that asymmetry
+    caused false-positive Customer Conflicts.
     """
     matches = find_matching_remittances(
         db, float(line_item.credit_amount), line_item.statement_currency,
@@ -76,8 +123,26 @@ def build_remittance_view(db: Session, line_item, aging_customer_hint: str | Non
 
     customer_conflicts = False
     if aging_customer_hint and ext.raw_customer_text:
-        score = fuzz.token_sort_ratio(ext.raw_customer_text.upper(), aging_customer_hint.upper())
-        customer_conflicts = score < CUSTOMER_FUZZY_MIN
+        resolved_remittance_customer = _resolve_remittance_customer_to_aging(
+            aging_map, ext.raw_customer_text, getattr(line_item, "ou_number", None),
+        )
+        if resolved_remittance_customer:
+            # Both sides are now aging-canonical names -- a real identity
+            # comparison, not a wording-similarity guess. Case-insensitive
+            # equality is the right bar here (not another fuzzy score):
+            # both strings came from the SAME aging_map._customer_names
+            # list, so if they refer to the same customer they are the
+            # exact same string, not merely a "close enough" one.
+            customer_conflicts = resolved_remittance_customer.upper() != aging_customer_hint.upper()
+        else:
+            # Couldn't resolve the remittance email's payer name to ANY
+            # aging customer (aging_map missing, or the name just isn't a
+            # fuzzy match for anyone in the report) -- fall back to the
+            # original raw-text-vs-canonical-name comparison so a genuinely
+            # unrecognizable/garbled payer name still raises a conflict
+            # instead of silently passing through unchecked.
+            score = fuzz.token_sort_ratio(ext.raw_customer_text.upper(), aging_customer_hint.upper())
+            customer_conflicts = score < CUSTOMER_FUZZY_MIN
 
     # NEW: this used to be a hardcoded False with a "future grouping step"
     # comment -- now real, now that App2 can actually tell us which

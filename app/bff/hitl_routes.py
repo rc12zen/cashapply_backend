@@ -61,7 +61,7 @@ from ..hitl.distribution_actions import (
     approve_distribution_entry, reject_distribution_entry, reopen_distribution_entry,
     edit_gl_rate_for_distribution_entry,
 )
-from ..rule_engine.remittance_recheck import recheck_needs_remittance_rows
+from ..rule_engine.remittance_recheck import recheck_remittance_dependent_rows
 from ..rule_engine.customer_name_correction import correct_customer_name, get_customer_name_options
 
 router = APIRouter()
@@ -670,13 +670,16 @@ def recheck_remittance(id: int, request: Request, db: Session = Depends(get_db),
                         user: User = Depends(require_permission("hitl:map"))):
     """
     Manual counterpart to the periodic remittance_recheck_worker — lets a
-    SPOC re-check a SINGLE needs_remittance row on demand (e.g. "the
-    customer just told me they sent it, I don't want to wait for the
-    next scheduled sweep") instead of only ever happening automatically
-    on an interval. Same underlying logic either way — see
-    rule_engine/remittance_recheck.py.
+    SPOC re-check a SINGLE row on demand (e.g. "the customer just told me
+    they sent it, I don't want to wait for the next scheduled sweep")
+    instead of only ever happening automatically on an interval. Works for
+    a row currently in needs_remittance, short_payment, OR
+    overpayment_parked (awaiting_remittance disposition only) — see
+    rule_engine/remittance_recheck.py's module docstring for what happens
+    in each case (the first two auto re-classify; parked rows only get
+    flagged, never auto-reopened).
     """
-    result = recheck_needs_remittance_rows(db, only_line_item_id=id)
+    result = recheck_remittance_dependent_rows(db, only_line_item_id=id)
     if result.get("error"):
         raise AppError(ErrorCode.REMITTANCE_RECHECK_FAILED, detail=result["error"])
 

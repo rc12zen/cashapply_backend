@@ -31,7 +31,7 @@ configure_logging()
 from ..db.session import session_scope
 from ..db.settings import get_settings
 from ..common.request_context import set_job_context
-from ..rule_engine.remittance_recheck import recheck_needs_remittance_rows
+from ..rule_engine.remittance_recheck import recheck_remittance_dependent_rows
 
 logger = logging.getLogger("cashapply.remittance_recheck_worker")
 
@@ -42,7 +42,7 @@ def run_once() -> dict:
     # any other background job (see common/request_context.py).
     set_job_context(f"remittance-recheck:{int(time.time())}")
     with session_scope() as db:
-        result = recheck_needs_remittance_rows(db)
+        result = recheck_remittance_dependent_rows(db)
     if result.get("error"):
         logger.warning("[remittance_recheck] %s", result["error"])
     else:

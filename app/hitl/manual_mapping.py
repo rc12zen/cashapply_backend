@@ -55,6 +55,7 @@ from ..aging.aging_map import KIND_CREDIT_MEMO, KIND_UNAPPLIED_RECEIPT
 from ..rule_engine.evaluator import DEFAULT_SHORT_PAYMENT_TOLERANCE_PCT
 from ..rule_engine.fx_service import FxService
 from ..rule_engine.invoice_ledger import check_duplicate, record_application
+from ..rule_engine.remittance_lookup import build_remittance_view
 
 
 def _received_total(r: LineItem, selected_currency: str | None) -> tuple[float | None, dict]:
@@ -723,6 +724,29 @@ def apply_selection(
     r.manually_mapped    = True
     r.manually_mapped_at = dt.datetime.utcnow()
     r.manually_mapped_by = user.email if user else None
+
+    # FIX: r.remittance_extraction_id was never revisited here — it was
+    # frozen at analysis time against whatever customer the ORIGINAL
+    # (possibly wrong) automatic match guessed. Once a SPOC manually
+    # remaps this row to a different customer/invoice, the row-detail
+    # remittance panel (bff/row_detail.py) kept showing that OLD, stale
+    # email — including its sender address — because nothing here ever
+    # re-ran the lookup for the customer actually selected. Recompute it
+    # the same way orchestrator.py does on the automatic path: look up
+    # remittance emails matching this row's amount/currency/date, and
+    # prefer the one whose extracted payer name agrees with the NEWLY
+    # selected customer (preview_selection() already guarantees every
+    # selected invoice belongs to exactly one customer — see its
+    # "different customers" guard above). Ends up None (no email) just as
+    # correctly as it ends up with a real match, if this customer simply
+    # has no matching email in the inbox.
+    new_customer_name = selected[0].get("customer_name") if selected else None
+    # aging_map re-fetched here rather than threaded through from
+    # preview_selection() (which only returns its plain dict result, not
+    # the AgingMap object it used internally) -- aging_store.get_aging_map()
+    # is a cheap in-memory cache read, not a re-parse.
+    remittance_view = build_remittance_view(db, r, new_customer_name, aging_map=aging_store.get_aging_map())
+    r.remittance_extraction_id = remittance_view.get("extraction_id")
 
     history_comment = f"Manually mapped to invoice(s): {', '.join(invoice_numbers)}"
     if is_overpaid:

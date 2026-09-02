@@ -139,7 +139,7 @@ def evaluate_as_customer(db: Session, r: LineItem, customer_name: str, aging_map
     Returns (rule_result, remittance_view) — the caller needs the view too, for
     r.remittance_extraction_id.
     """
-    remittance_view = build_remittance_view(db, r, customer_name)
+    remittance_view = build_remittance_view(db, r, customer_name, aging_map=aging_map)
     ou_status = resolve_ou_status(
         customer_name=customer_name,
         bank_ou_number=r.ou_number,

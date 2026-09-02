@@ -290,7 +290,7 @@ def _build_rule_input(
 
     # ── Remittance (Pass 2 only) ──────────────────────────────────────────────
     remittance_view = (
-        build_remittance_view(db, line_item, payment.customer_name)
+        build_remittance_view(db, line_item, payment.customer_name, aging_map=aging_map)
         if db is not None and line_item is not None
         else {"found": False, "invoices": [], "ambiguous": False,
               "is_cross_currency": False, "remittance_currency": None}
@@ -514,6 +514,18 @@ def _update_line_item_fx(
 
     This is necessary because Pass 1 cannot know invoice_currency (it comes
     from the aging row, which is only resolved during evaluate_row).
+
+    FIX: also back-fills line_item.remittance_extraction_id from
+    rule_input["remittance"]["extraction_id"] — Pass 2's remittance_view
+    (see remittance_lookup.build_remittance_view()) already resolves this
+    for EVERY row where exactly one matching email was found, regardless of
+    which rule_id the row ends up with. Previously this function only ever
+    wrote the FX fields, so the id computed here was silently discarded for
+    any row that didn't separately get it persisted by remittance_recheck.py
+    (R7/needs_remittance rows only) or customer_name_correction.py (SPOC
+    corrections only) — every other row (e.g. R1 CUSTOMER_CONFLICT, R2
+    INVOICE_CUSTOMER_MISMATCH) permanently showed "no remittance email" in
+    row_detail.py even though a real matching email existed from the start.
     """
     cc = rule_input.get("cross_currency") or {}
 
@@ -524,6 +536,9 @@ def _update_line_item_fx(
     line_item.is_cross_ledger                = cc.get("is_cross_ledger", False)
     line_item.fx_invoice_to_functional       = cc.get("fx_invoice_to_functional")
     line_item.fx_invoice_to_functional_source = cc.get("fx_invoice_to_functional_source")
+
+    remittance_view = rule_input.get("remittance") or {}
+    line_item.remittance_extraction_id = remittance_view.get("extraction_id")
 
     db.flush()
 

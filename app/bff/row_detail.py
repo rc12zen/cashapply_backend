@@ -74,11 +74,16 @@ def _build_overpayment(db: Session, r: LineItem) -> dict | None:
       - PARKED                  — plus the recorded disposition and who made it
       - PROCESSED via R9e       — plus how much was deliberately left unapplied
 
-    The remittance_now_available flag is computed HERE, on read, rather than by
-    a background sweep. A parked row waiting on remittance advice was parked
-    pending exactly that document, so the useful moment to check is when someone
-    is looking at the list — no worker, no state changing on its own, and the
-    row still only moves when a human clicks Reopen.
+    UPDATED: remittance_now_available now prefers the DURABLE flag
+    (LineItem.remittance_available_at) that rule_engine/remittance_recheck.py's
+    periodic worker sets once it finds a match for a parked
+    awaiting_remittance row — so this badge survives even if nobody happens
+    to open the row-detail page right when the remittance arrives, not just
+    on read. Falls back to the original live, read-time check
+    (build_remittance_view()) only when that hasn't run/fired yet, so a
+    row still gets an accurate answer immediately after parking rather than
+    waiting for the next scheduled sweep. Either way, the row itself never
+    moves on its own — it still only reopens when a human clicks Reopen.
     """
     is_open_overpayment = r.rule_id == "R11"
     is_parked = bool(r.current_state and r.current_state.value == "overpayment_parked")
@@ -117,16 +122,22 @@ def _build_overpayment(db: Session, r: LineItem) -> dict | None:
     }
 
     if is_parked and r.overpayment_disposition == "awaiting_remittance":
-        # Cheap read-time check: has App2 archived a remittance that matches
-        # this payment since it was parked? build_remittance_view() is the same
-        # matcher the automatic path uses, so a hit here means the row would
-        # genuinely re-evaluate differently if reopened.
-        try:
-            view = build_remittance_view(db, r, r.extracted_customer_name)
-            block["remittance_now_available"] = bool(view and view.get("found"))
-        except Exception:
-            # Advisory badge only — never let it break the detail page.
-            block["remittance_now_available"] = False
+        if r.remittance_available_at is not None:
+            # The periodic recheck worker already found and stamped this —
+            # durable, no need to re-query build_remittance_view() here.
+            block["remittance_now_available"] = True
+            block["remittance_available_since"] = r.remittance_available_at.isoformat()
+        else:
+            # Not yet swept (or swept and found nothing so far) — cheap
+            # read-time check so the badge is still accurate right now,
+            # same matcher the automatic/recheck paths use.
+            try:
+                view = build_remittance_view(db, r, r.extracted_customer_name)
+                block["remittance_now_available"] = bool(view and view.get("found"))
+            except Exception:
+                # Advisory badge only — never let it break the detail page.
+                block["remittance_now_available"] = False
+            block["remittance_available_since"] = None
 
     return block
 
