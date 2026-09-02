@@ -24,13 +24,30 @@ NOT a second independent token cache, which would double IDCS token
 traffic under load (see fusion_client.py's _token_lock/_cached_token
 comment for why that matters).
 
-OPEN RISK (flagged in the implementation plan, not resolvable from the
-given envelope sample alone): the exact `SOAPAction` HTTP header and any
-WS-Security requirements Oracle's SOAP binding expects aren't derivable
-without the real WSDL / a working test call. `_SOAP_ACTION` below is a
-best-guess placeholder built from the given envelope's `typ:` namespace —
-confirm/correct it against Oracle UAT once `ORACLE_SOAP_RECEIPT_SERVICE_URL`
-is supplied, before relying on this in production.
+NAMESPACES / CHANGE OPERATION (2026-09-02): the Oracle team confirmed the
+real (non-truncated) `typ`/`com` namespace URIs and the correct
+`changeOperation` value — the original envelope this module was first
+built from had both wrong: the namespaces were truncated to
+`.../commonSe...` (literally, not a copy-paste artifact) and
+`changeOperation` was sent as `Create`. Oracle's own sample uses `POST` for
+`changeOperation`, and the SOAP fault we were seeing ("Unknown method")
+lines up with that — a request whose element namespaces don't match the
+service's real target namespaces looks to the ADF SOAP binding like it's
+calling an operation it's never heard of, hence "Unknown method" rather
+than a validation error naming a bad field.
+
+SOAPACTION (2026-09-02): confirmed via a working reference call from the
+Oracle team — `SOAPAction: ""` (an explicit empty string, not the header
+omitted entirely). The earlier `_SOAP_ACTION` guess derived from the `com`
+namespace + operation name is wrong; this ADF SOAP binding doesn't use
+that convention. `_SOAP_ACTION` below is now just `""`.
+
+OPEN RISK (still not resolvable from the sample alone): any WS-Security
+requirements. Oracle's confirmed sample used plain HTTP basic auth (same
+as our `ORACLE_AUTH_MODE == "basic"` path) with no `wsse:Security` header,
+which matches what this module already sends (`<soapenv:Header/>` empty),
+so this is likely a non-issue — flagging only because it wasn't explicitly
+ruled out for the OAuth auth mode path.
 """
 from __future__ import annotations
 
@@ -47,20 +64,19 @@ logger = logging.getLogger("cashapply.oracle")
 
 _SOAP_NS = {"soapenv": "http://schemas.xmlsoap.org/soap/envelope/"}
 
-# Best-guess placeholder — see module docstring's "OPEN RISK" note.
-_SOAP_ACTION = (
-    "http://xmlns.oracle.com/apps/financials/receivables/receipts/shared/"
-    "standardReceiptService/commonSe.../processUnapplyReceipt"
-)
+# Confirmed by Oracle's own working reference call (2026-09-02) — this
+# ADF SOAP binding expects an explicit empty SOAPAction, not the header
+# omitted and not a namespace-derived operation URI (the earlier guess).
+_SOAP_ACTION = ""
 
 _ENVELOPE_TEMPLATE = """<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
-                  xmlns:typ="http://xmlns.oracle.com/apps/financials/receivables/receipts/shared/standardReceiptService/commonSe..."
-                  xmlns:com="http://xmlns.oracle.com/apps/financials/receivables/receipts/shared/standardReceiptService/commonSe..."
+                  xmlns:typ="http://xmlns.oracle.com/apps/financials/receivables/receipts/shared/standardReceiptService/commonService/types/"
+                  xmlns:com="http://xmlns.oracle.com/apps/financials/receivables/receipts/shared/standardReceiptService/commonService/"
                   xmlns:typ1="http://xmlns.oracle.com/adf/svc/types/">
    <soapenv:Header/>
    <soapenv:Body>
       <typ:processUnapplyReceipt>
-         <typ:changeOperation>Create</typ:changeOperation>
+         <typ:changeOperation>POST</typ:changeOperation>
          <typ:unapplyReceipt>
             <com:BusinessUnit>{business_unit}</com:BusinessUnit>
             <com:ReceiptNumber>{receipt_number}</com:ReceiptNumber>

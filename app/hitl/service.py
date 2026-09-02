@@ -44,7 +44,7 @@ from ..bff.metrics import (
     _category_for_row, _settlement_override_category, GROUP_READY_FOR_ORACLE,
     GROUP_SHORT_PAYMENT, GROUP_UNIDENTIFIED, GROUP_NEEDS_DISTRIBUTION,
     GROUP_NEEDS_REMITTANCE, GROUP_LABELS, GROUP_OVERPAYMENT,
-    GROUP_OVERPAYMENT_PARKED,
+    GROUP_OVERPAYMENT_PARKED, NO_RECEIPT_GROUPS,
 )
 from ..rule_engine.state_machine import CATEGORY_TO_STATE
 from ..rule_engine.invoice_ledger import (
@@ -587,6 +587,10 @@ def reopen_row(
         r.overpayment_disposition    = None
         r.overpayment_disposition_at = None
         r.overpayment_disposition_by = None
+        # NEW — clear the recheck job's "a remittance showed up" flag too, so
+        # a row that gets parked again later starts clean rather than
+        # showing a stale flag from a previous park cycle.
+        r.remittance_available_at    = None
 
     # Re-stake the ledger claim reject_row() released (idempotent upsert —
     # flips the previously-"released" row back to "pending"; see
@@ -607,16 +611,54 @@ def reopen_row(
 
 
 def _guard_unidentified_undecided(r: LineItem) -> dict | None:
-    """Shared guard for both eligibility actions below — returns an error
+    """Shared guard for mark_eligible_for_receipt() below — returns an error
     dict if this row isn't a genuinely-undecided unidentified row, else
-    None. Both actions only make sense once, on a row that's actually
-    sitting in Unidentified with no prior eligibility decision."""
+    None. That action only makes sense once, on a row that's actually
+    sitting in Unidentified with no prior eligibility decision. (discard_row()
+    used to share this guard too — see _guard_discardable_row() below, which
+    it now uses instead, since Discard was broadened to every no-receipt
+    group, not just Unidentified.)"""
     if _category_for_row(r) != GROUP_UNIDENTIFIED:
         return {
             "error": "not_eligible_for_action",
             "message": (
                 f"Row {r.id} is not in the Unidentified category — this "
                 f"action only applies to rows with no extracted signal at all."
+            ),
+        }
+    if r.receipt_eligibility is not None:
+        return {
+            "error": "already_decided",
+            "message": (
+                f"Row {r.id} already has a recorded eligibility decision "
+                f"('{r.receipt_eligibility}') and cannot be decided again."
+            ),
+        }
+    return None
+
+
+def _guard_discardable_row(r: LineItem) -> dict | None:
+    """
+    Guard for discard_row()'s "no receipt created yet" case (Case A below —
+    the post-delete Case B has its own separate check and never calls this).
+
+    UPDATED: broadened from Unidentified-only to every group where a receipt
+    genuinely hasn't been created yet — see bff/metrics.py's
+    NO_RECEIPT_GROUPS, the exact same taxonomy behind the Analysis History
+    "No Receipt Created" aggregate tab, so a row is discardable here if and
+    only if it would show up in that tab. Mirrors actions_registry.py's
+    _cond_discardable(), which already allowed this broadly (any category,
+    gated on receipt_eligibility/standard_receipt_id/receipt_deleted_at) —
+    this guard was the one place still hard-restricting to Unidentified,
+    which meant the Discard button could render (per _cond_discardable) on
+    e.g. a Conflict/Exception or Rejected row but then fail server-side.
+    """
+    if _category_for_row(r) not in NO_RECEIPT_GROUPS:
+        return {
+            "error": "not_eligible_for_action",
+            "message": (
+                f"Row {r.id} already has a receipt, or is in a resolved "
+                f"category — it can no longer be discarded."
             ),
         }
     if r.receipt_eligibility is not None:
@@ -688,10 +730,15 @@ def discard_row(db: Session, line_item_id: int, comment: str | None, triggered_b
     which is what makes the button appear/disappear on the frontend for
     each — this is the server-side enforcement of the same rule):
 
-      Case A (original): the SPOC has looked at an Unidentified row and
-        judged it is NOT a real receivable transaction at all (garbage
-        narration, an internal transfer, a duplicate bank feed entry,
-        etc.) — discarded WITHOUT ever creating an Oracle receipt for it.
+      Case A (original, broadened): the SPOC has looked at a row that has
+        NOT had an Oracle receipt created for it yet (any of
+        bff/metrics.NO_RECEIPT_GROUPS — Unidentified, Needs Remittance,
+        Needs Distribution, Ready for Oracle, Short Payment, Conflict /
+        Exception, Rejected, Post Failed) and judged it should be
+        discarded — e.g. garbage narration, an internal transfer, a
+        duplicate bank feed entry, etc. — discarded WITHOUT ever creating
+        an Oracle receipt for it. Was Unidentified-only; see
+        _guard_discardable_row() below.
 
       Case B (NEW): the SPOC just explicitly Deleted this row's Oracle
         receipt (see delete_receipt() above) and chose "Discard" over
@@ -711,7 +758,7 @@ def discard_row(db: Session, line_item_id: int, comment: str | None, triggered_b
 
     is_post_delete_case = bool(r.receipt_deleted_at) and not r.standard_receipt_id
     if not is_post_delete_case:
-        guard_error = _guard_unidentified_undecided(r)
+        guard_error = _guard_discardable_row(r)
         if guard_error:
             return guard_error
 
